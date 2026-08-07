@@ -1,25 +1,18 @@
 # 湖南省多站河网短时洪水训练与测试
 
-本项目已经按湖南正式 `_model_dataset` 接口接通，不再把真实训练伪装成 synthetic 流程。它支持多张不同节点数的河网、按事件划分 TRAIN/VALIDATION/TEST、按河网自动选择流量或水位目标，以及 E1–E4 四组神经/物理消融实验。
+支持多张不同节点数的河网、按事件划分 TRAIN/VALIDATION/TEST、按河网自动选择流量或水位目标，以及 E1–E4 四组神经/物理消融实验。
 
-默认任务是用前 24 小时预测未来 1–6 小时。正式训练只读取湖南数据；浙江微调尚未启用。
+默认任务是用前 24 小时预测未来 1–6 小时。
 
 ## 1. 环境
 
-建议使用 Python 3.11 及独立虚拟环境。在 `project` 目录执行：
 
 ```powershell
 python -m pip install -r requirements.txt
 python -m unittest discover -s tests -v
 ```
 
-当前正式 CSV 数据层在 Windows 上要求 `num_workers: 0`，以免多个 worker 复制整省动态张量。TRAIN 与 VALIDATION 会在同一进程共享只读动态张量。
-
-GPU 服务器上 `device: auto` 会自动选择 CUDA。正式配置默认仍保持 `amp: false`；确认服务器 GPU/PyTorch 支持后，可在所用的 `hunan_*.yaml` 中覆盖为 `amp: true`。AMP 的动态 loss-scale 溢出会由 `GradScaler` 跳过该步并降低 scale；FP32 训练遇到非有限梯度仍立即报错。
-
-## 2. 唯一认可的正式目录
-
-默认位置是 `project/_model_dataset`，也可通过 `--dataset-root` 指定绝对路径。
+## 2. 数据目录
 
 ```text
 _model_dataset/
@@ -51,8 +44,6 @@ _model_dataset/
    ├─ rain_source_coverage.csv
    └─ sample_rejection.csv
 ```
-
-任何正式文件缺失、主外键不一致、时间不连续、单位不合法、QC 拒绝记录仍进入样本、或 split 存在冲突时，程序都会终止，不会回退到 synthetic 或静默填补。
 
 ## 3. 表字段契约
 
@@ -302,8 +293,4 @@ python evaluate.py --config configs/hunan_e4.yaml --dataset-root "D:\path\to\_mo
 
 当前 JSON 同时报告全部有效出口标签的微平均和按 `EVENT_ID`/`GRAPH_ID` 等权的窗口宏平均。由于滑动窗口可能重叠，论文定稿前仍应在业务时序定义完成后另做目标时刻去重和完整洪水过程复核。
 
-## 10. 调试模式与浙江数据
 
-`configs/debug_cpu.yaml` 和旧 `e1`–`e4` 配置只用于软件单元测试及 profile，不读取正式湖南数据，也不能作为科研结果。
-
-浙江正式适配器尚未实现。当前版本不会把 synthetic 数据当作浙江微调，也不会让同一个 loader 同时充当训练和验证。待浙江整理为相同目录契约后，再增加独立预训练权重加载、浙江事件级微调 split 和独立 TEST。
