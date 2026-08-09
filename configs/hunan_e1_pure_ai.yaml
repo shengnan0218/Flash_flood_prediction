@@ -1,0 +1,6 @@
+_base_: hunan_e4.yaml
+runoff_mode: pure_lstm
+routing_mode: pure_gnn
+training:
+  checkpoint: outputs/hunan_e1_best.pt
+  log_csv: outputs/hunan_e1_train.csv

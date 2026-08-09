@@ -1,18 +1,25 @@
 # 湖南省多站河网短时洪水训练与测试
 
-支持多张不同节点数的河网、按事件划分 TRAIN/VALIDATION/TEST、按河网自动选择流量或水位目标，以及 E1–E4 四组神经/物理消融实验。
+本项目已经按湖南正式 `_model_dataset` 接口接通，不再把真实训练伪装成 synthetic 流程。它支持多张不同节点数的河网、按事件划分 TRAIN/VALIDATION/TEST、按河网自动选择流量或水位目标，以及 E1–E4 四组神经/物理消融实验。
 
-默认任务是用前 24 小时预测未来 1–6 小时。
+默认任务是用前 24 小时预测未来 1–6 小时。正式训练只读取湖南数据；浙江微调尚未启用。
 
 ## 1. 环境
 
+建议使用 Python 3.11 及独立虚拟环境。在 `project` 目录执行：
 
 ```powershell
 python -m pip install -r requirements.txt
 python -m unittest discover -s tests -v
 ```
 
-## 2. 数据目录
+当前正式 CSV 数据层在 Windows 上要求 `num_workers: 0`，以免多个 worker 复制整省动态张量。TRAIN 与 VALIDATION 会在同一进程共享只读动态张量。
+
+GPU 服务器上 `device: auto` 会自动选择 CUDA。正式配置默认仍保持 `amp: false`；确认服务器 GPU/PyTorch 支持后，可在所用的 `hunan_*.yaml` 中覆盖为 `amp: true`。AMP 的动态 loss-scale 溢出会由 `GradScaler` 跳过该步并降低 scale；FP32 训练遇到非有限梯度仍立即报错。
+
+## 2. 唯一认可的正式目录
+
+默认位置是 `project/_model_dataset`，也可通过 `--dataset-root` 指定绝对路径。
 
 ```text
 _model_dataset/
@@ -44,6 +51,8 @@ _model_dataset/
    ├─ rain_source_coverage.csv
    └─ sample_rejection.csv
 ```
+
+任何正式文件缺失、主外键不一致、时间不连续、单位不合法、QC 拒绝记录仍进入样本、或 split 存在冲突时，程序都会终止，不会回退到 synthetic 或静默填补。
 
 ## 3. 表字段契约
 
@@ -110,7 +119,8 @@ RAIN_MASK,FLOW_MASK,WATER_LEVEL_MASK
 EVENT_ID,GRAPH_ID,BASIN_ID,OUTLET_ID,
 RAIN_START,RAIN_END,HYDRO_START,PEAK_TIME,HYDRO_END,
 SAMPLE_START,SAMPLE_END,EVENT_TYPE,EVENT_GRADE,
-COMPOUND_EVENT,PEAK_COUNT
+COMPOUND_EVENT,PEAK_COUNT,
+SOURCE_RAIN_EVENT_IDS,SOURCE_RAIN_EVENT_COUNT
 ```
 
 主实验只加载 `EVENT_TYPE=HYDRO_FLOOD` 且 `EVENT_GRADE=A/B`。`flood_events_all.csv` 至少应含 `EVENT_ID,GRAPH_ID`，并覆盖 final 表中的全部事件。
@@ -134,7 +144,7 @@ HISTORY_HOURS,FORECAST_HOURS,TARGET_VARIABLE,SPLIT
 时间定义为：
 
 ```text
-历史输入 = [INPUT_START, FORECAST_TIME)，共 HISTORY_HOURS 个整点
+历史输入 = [INPUT_START, FORECAST_TIME]，共 HISTORY_HOURS 个整点
 预测目标 = FORECAST_TIME 后第 1...FORECAST_HOURS 小时
 TARGET_END - FORECAST_TIME = FORECAST_HOURS
 ```
@@ -216,7 +226,7 @@ FLOW/WATER_LEVEL 的 TRAIN 标准差还用于把联合 Q/Z Huber 损失无量纲
 所有列出的 QC 文件必须存在且是带表头的 UTF-8 CSV。
 
 - `event_exclusion.csv` 至少含 `EVENT_ID`；表中事件不得出现在已加载样本。
-- `sample_rejection.csv` 至少含 `SAMPLE_ID`；表中样本不得进入训练或测试。
+- `sample_rejection.csv` 必须包含 `REJECTION_ID,SAMPLE_ID,EVENT_ID,GRAPH_ID,OUTLET_ID,FORECAST_TIME,TARGET_START,TARGET_END,TARGET_VARIABLE,TARGET_COVERAGE,MIN_TARGET_COVERAGE,REASON,SPLIT`。每个 final 事件必须至少拥有一个有效 sample，或在该表中有明确拒绝记录；低于未来目标覆盖率阈值的候选窗口逐窗记录。
 - 其余 coverage/audit 表会检查可读性并在预检报告中给出行数。
 
 `dataset_summary.csv` 必须是带表头 CSV，`source_manifest.json` 必须是有效 JSON，`build_log.txt` 必须是 UTF-8 文本。
@@ -269,6 +279,8 @@ python evaluate.py --config configs/hunan_e4.yaml --dataset-root "D:\path\to\_mo
 
 ## 8. E1–E4 实验
 
+正式配置采用分层继承：`base.yaml` 只保存共享默认值，`hunan_e4.yaml` 在其上覆盖湖南数据契约和 E4 运行参数，E1–E3 再继承 `hunan_e4.yaml` 并仅切换产流/汇流模块。不需要另外的旧 `e1_pure_ai.yaml`–`e4_full_physics.yaml` 文件。
+
 | 配置 | 产流 | 汇流 |
 |---|---|---|
 | `configs/hunan_e1_pure_ai.yaml` | Pure LSTM | Directed GNN |
@@ -293,4 +305,8 @@ python evaluate.py --config configs/hunan_e4.yaml --dataset-root "D:\path\to\_mo
 
 当前 JSON 同时报告全部有效出口标签的微平均和按 `EVENT_ID`/`GRAPH_ID` 等权的窗口宏平均。由于滑动窗口可能重叠，论文定稿前仍应在业务时序定义完成后另做目标时刻去重和完整洪水过程复核。
 
+## 10. 调试模式与浙江数据
 
+`profile_model.py` 和单元测试复用上表四份湖南配置，但只生成内存中的 synthetic fixture 检查结构和吞吐；它们不产生正式科研结果。`base.yaml` 是继承基底，不是湖南正式训练入口。
+
+浙江正式适配器尚未实现。当前版本不会把 synthetic 数据当作浙江微调，也不会让同一个 loader 同时充当训练和验证。待浙江整理为相同目录契约后，再增加独立预训练权重加载、浙江事件级微调 split 和独立 TEST。

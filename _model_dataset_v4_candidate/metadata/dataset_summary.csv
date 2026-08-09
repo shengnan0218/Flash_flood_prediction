@@ -1,0 +1,16 @@
+﻿ITEM,VALUE
+graph_count,35
+node_count,116
+edge_count,81
+event_count,800
+train_event_count,560
+validation_event_count,120
+test_event_count,120
+sample_count,39097
+train_sample_count,28137
+validation_sample_count,5366
+test_sample_count,5594
+rejected_candidate_window_count,1850
+event_without_sample_count,1
+dynamic_row_count,358168
+missing_static_feature_count,0

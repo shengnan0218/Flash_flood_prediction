@@ -1,0 +1,49 @@
+seed: 42
+runoff_mode: water_balance_lstm
+routing_mode: kinematic_wave_gnn
+history_length: 12
+forecast_horizon: 6
+dynamic_dim: 4
+node_static_dim: 3
+edge_static_dim: 2
+hidden_dim: 32
+device: auto
+gpu_id: 0
+batch_size: 4
+gradient_accumulation_steps: 1
+amp: false
+gradient_checkpointing: false
+num_workers: 0
+pin_memory: false
+debug_mode: true
+debug_num_events: 16
+debug_max_batches: 4
+data:
+  mode: synthetic
+  dataset_root: null
+  graph_id: null
+  target_variable: BOTH
+  normalize_dynamic: false
+  strict_validation: true
+  use_observation_masks: false
+  future_rainfall_mode: observed_hindcast
+  train_split: TRAIN
+  validation_split: VALIDATION
+  test_split: TEST
+physical_bounds:
+  width: [2.0, 80.0]
+  manning_n: [0.015, 0.12]
+solver:
+  dx: 1000.0
+  cfl: 0.8
+  maximum_substeps: 64
+  minimum_slope: 1.0e-6
+  minimum_length: 10.0
+  seconds_per_step: 3600.0
+loss_weights: {discharge: 1.0, water_level: 1.0}
+optimizer: {name: adamw, lr: 0.001, weight_decay: 1.0e-5}
+training: {epochs: 5, patience: 5, gradient_clip: 1.0, checkpoint: outputs/best.pt, log_csv: outputs/train.csv}
+transfer_learning:
+  strategy: observation_only
+  stages: [observation_only, observation_and_edge_parameters, full_finetune]
+  full_finetune_lr: 1.0e-5

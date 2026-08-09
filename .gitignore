@@ -1,0 +1,36 @@
+# Local Python environments
+.venv/
+venv/
+env/
+
+# Python caches and test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.ipynb_checkpoints/
+
+# Editors and operating-system metadata
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Historical dataset; v4_candidate is the active dataset and is tracked
+_model_dataset_v1/
+
+# Runtime outputs and model checkpoints
+outputs/*
+!outputs/.gitkeep
+*.pt
+*.pth
+*.ckpt
+events.out.tfevents*
+
+# Local secrets
+.env
+.env.*
+!.env.example

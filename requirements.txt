@@ -2,3 +2,5 @@ torch>=2.2
 PyYAML>=6.0
 pytest>=8.0
 tensorboard>=2.15
+numpy>=1.26
+pandas>=2.2

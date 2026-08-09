@@ -1,0 +1,33 @@
+_base_: base.yaml
+
+# 正式模式。可用 --dataset-root 覆盖；目录必须符合 _model_dataset 契约。
+data:
+  mode: hunan
+  dataset_root: _model_dataset
+  graph_id: null
+  # 按 events/target_variable_by_graph.csv 为每个河网选择 FLOW/WATER_LEVEL。
+  target_variable: AUTO
+  normalize_dynamic: true
+  strict_validation: true
+  use_observation_masks: true
+  # 业务可用默认：目标期不读取实测降雨；将最后一个历史时刻降雨持平外推。
+  future_rainfall_mode: persistence
+  train_split: TRAIN
+  validation_split: VALIDATION
+  test_split: TEST
+
+history_length: 24
+forecast_horizon: 6
+dynamic_dim: 2
+node_static_dim: 10
+edge_static_dim: 2
+batch_size: 16
+num_workers: 0
+pin_memory: false
+debug_mode: false
+training:
+  epochs: 100
+  patience: 15
+  gradient_clip: 1.0
+  checkpoint: outputs/hunan_e4_best.pt
+  log_csv: outputs/hunan_e4_train.csv
