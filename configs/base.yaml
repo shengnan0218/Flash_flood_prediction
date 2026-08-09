@@ -42,7 +42,7 @@ solver:
   minimum_slope: 1.0e-6
   minimum_length: 10.0
   seconds_per_step: 3600.0
-loss_weights: {discharge: 1.0, water_level: 1.0}
+loss_weights: {discharge: 2.0, water_level: 1.0}
 optimizer: {name: adamw, lr: 0.001, weight_decay: 1.0e-5}
 training: {epochs: 5, patience: 5, gradient_clip: 1.0, checkpoint: outputs/best.pt, log_csv: outputs/train.csv}
 transfer_learning:
