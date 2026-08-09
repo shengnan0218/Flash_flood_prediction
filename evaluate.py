@@ -53,6 +53,10 @@ def main() -> None:
         help="默认使用从未参与拟合或早停的 TEST 划分",
     )
     parser.add_argument("--output", help="可选 JSON 指标输出路径")
+    parser.add_argument(
+        "--diagnostics-dir",
+        help="逐事件/图/站诊断目录；默认根据--output或checkpoint自动生成",
+    )
     args = parser.parse_args()
 
     cfg, model, loader, device = setup_evaluation(
@@ -64,7 +68,14 @@ def main() -> None:
     trainer = Trainer(model, cfg, device)
     checkpoint = trainer.load_weights(args.checkpoint)
     validate_checkpoint_config(checkpoint, cfg)
-    metrics = trainer.evaluate(loader, include_group_details=True)
+    formal_evaluation = cfg.get("data", {}).get("mode") == "hunan"
+    metrics = trainer.evaluate(
+        loader,
+        include_group_details=True,
+        include_validation_diagnostics=formal_evaluation,
+        include_diagnostic_details=formal_evaluation,
+    )
+    validation_diagnostics = metrics.pop("_validation_diagnostics", None)
     serialised_metrics = _json_safe(metrics)
     result = {
         "split": args.split,
@@ -74,6 +85,29 @@ def main() -> None:
         "checkpoint": str(Path(args.checkpoint).expanduser().resolve()),
         "metrics": serialised_metrics,
     }
+    if validation_diagnostics is not None:
+        if args.diagnostics_dir:
+            diagnostics_dir = Path(args.diagnostics_dir).expanduser().resolve()
+        elif args.output:
+            output_stem = Path(args.output).expanduser().resolve().with_suffix("")
+            diagnostics_dir = output_stem.with_name(
+                f"{output_stem.name}_diagnostics"
+            )
+        else:
+            checkpoint = Path(args.checkpoint).expanduser().resolve()
+            diagnostics_dir = checkpoint.parent / (
+                f"{checkpoint.stem}_{args.split.lower()}_diagnostics"
+            )
+        written = validation_diagnostics.write(
+            diagnostics_dir,
+            split=args.split,
+            context={
+                "checkpoint": str(Path(args.checkpoint).expanduser().resolve()),
+                "split": args.split,
+            },
+        )
+        result["diagnostics_dir"] = str(diagnostics_dir)
+        result["diagnostic_files"] = written
     if _contains_none(serialised_metrics):
         result["metric_note"] = (
             "null 表示该目标没有有效标签，或该指标因零方差等条件无定义；"

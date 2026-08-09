@@ -24,6 +24,10 @@ from metrics.flood_metrics import (
     regression_metrics,
     valid_target_count,
 )
+from metrics.validation_diagnostics import (
+    ValidationDiagnostics,
+    ValidationDiagnosticsAccumulator,
+)
 
 
 _REGRESSION_SUM_FIELDS = (
@@ -134,6 +138,53 @@ def _finite_macro(
         if math.isfinite(float(report[name]))
     ]
     return (sum(values) / len(values) if values else float("nan"), len(values))
+
+
+def _append_csv_row(path: Path, row: dict[str, Any]) -> None:
+    """Append while extending an existing log header with new trailing fields.
+
+    This keeps resumed pre-diagnostics runs readable: old rows receive empty
+    cells for newly introduced validation summaries instead of being followed
+    by wider rows under a stale header.
+    """
+
+    fieldnames = list(row)
+    if not path.exists() or path.stat().st_size == 0:
+        with path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerow(row)
+        return
+    with path.open("r", newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        if reader.fieldnames is None:
+            raise ValueError(f"训练日志缺少CSV表头: {path}")
+        existing_fields = list(reader.fieldnames)
+        old_rows = list(reader)
+    new_fields = [name for name in fieldnames if name not in existing_fields]
+    if not new_fields:
+        with path.open("a", newline="", encoding="utf-8") as handle:
+            csv.DictWriter(handle, fieldnames=existing_fields).writerow(row)
+        return
+    extended_fields = [*existing_fields, *new_fields]
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", newline="", encoding="utf-8") as handle:
+            descriptor = -1
+            writer = csv.DictWriter(handle, fieldnames=extended_fields)
+            writer.writeheader()
+            writer.writerows(old_rows)
+            writer.writerow(row)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary_path.unlink(missing_ok=True)
 
 
 class Trainer:
@@ -396,6 +447,8 @@ class Trainer:
         *,
         include_group_metrics: bool = False,
         include_group_details: bool = False,
+        include_validation_diagnostics: bool = False,
+        include_diagnostic_details: bool = False,
     ) -> dict[str, Any]:
         """Evaluate physical-unit metrics.
 
@@ -408,6 +461,14 @@ class Trainer:
 
         self.model.eval()
         collect_group_metrics = include_group_metrics or include_group_details
+        collect_validation_diagnostics = (
+            include_validation_diagnostics or include_diagnostic_details
+        )
+        diagnostic_accumulator = (
+            ValidationDiagnosticsAccumulator()
+            if collect_validation_diagnostics
+            else None
+        )
         q_total = 0.0
         z_total = 0.0
         q_count_total = 0
@@ -440,6 +501,8 @@ class Trainer:
             q_count_total += q_count
             z_count_total += z_count
             batch_count += 1
+            if diagnostic_accumulator is not None:
+                diagnostic_accumulator.add_batch(batch, out)
 
             batch_size = int(out["q"].shape[0])
             group_ids: dict[str, tuple[str, ...] | None] = {
@@ -599,6 +662,13 @@ class Trainer:
 
         if include_group_details and window_group_metrics:
             result["window_group_metrics"] = window_group_metrics
+        if diagnostic_accumulator is not None:
+            validation_diagnostics = diagnostic_accumulator.finalize()
+            result.update(validation_diagnostics.summary_metrics)
+            if include_diagnostic_details:
+                # Private transport used by fit/evaluate entry points.  It is
+                # removed before CSV/JSON metric logging and never checkpointed.
+                result["_validation_diagnostics"] = validation_diagnostics
         return result
 
     @staticmethod
@@ -902,9 +972,25 @@ class Trainer:
                 **self.train_epoch(train_loader, epoch),
             }
             row["epoch_seconds"] = time.perf_counter() - tick
+            validation_diagnostics: ValidationDiagnostics | None = None
+            validation_summary: dict[str, float | int] = {}
             if val_loader is not None:
+                formal_validation = self.cfg.get("data", {}).get("mode") == "hunan"
+                validation_metrics = self.evaluate(
+                    val_loader,
+                    include_validation_diagnostics=formal_validation,
+                    include_diagnostic_details=formal_validation,
+                )
+                validation_diagnostics = validation_metrics.pop(
+                    "_validation_diagnostics", None
+                )
+                if validation_diagnostics is not None:
+                    validation_summary = {
+                        key: validation_metrics.pop(key)
+                        for key in validation_diagnostics.summary_metrics
+                    }
                 row.update(
-                    {f"val_{key}": value for key, value in self.evaluate(val_loader).items()}
+                    {f"val_{key}": value for key, value in validation_metrics.items()}
                 )
             score = float(row.get("val_loss", row["loss"]))
             if not math.isfinite(score):
@@ -915,13 +1001,13 @@ class Trainer:
                 else 0
             )
             row["peak_gpu_bytes"] = peak
+            # Preserve the historical column order and append only new fields.
+            row.update(
+                {f"val_{key}": value for key, value in validation_summary.items()}
+            )
             history.append(row)
             print(row)
-            with log.open("a", newline="", encoding="utf-8") as file:
-                writer = csv.DictWriter(file, fieldnames=row.keys())
-                if file.tell() == 0:
-                    writer.writeheader()
-                writer.writerow(row)
+            _append_csv_row(log, row)
 
             improved = score < self.best
             if improved:
@@ -937,6 +1023,20 @@ class Trainer:
             self.save_checkpoint(last_path, epoch, row, kind="last")
             if improved:
                 self.save_checkpoint(checkpoint_path, epoch, row, kind="best")
+                if validation_diagnostics is not None:
+                    diagnostics_dir = checkpoint_path.parent / (
+                        f"{checkpoint_path.stem}_validation_diagnostics"
+                    )
+                    validation_diagnostics.write(
+                        diagnostics_dir,
+                        split="VALIDATION",
+                        context={
+                            "epoch": epoch,
+                            "checkpoint": str(checkpoint_path.resolve()),
+                            "selection_metric": "val_loss",
+                            "selection_metric_value": score,
+                        },
+                    )
             if self.stale >= patience:
                 break
         return history

@@ -153,6 +153,11 @@ class _Event:
     graph_id: str
     basin_id: str
     outlet_id: str
+    rain_start: datetime
+    rain_end: datetime
+    hydro_start: datetime
+    hydro_end: datetime | None
+    peak_time: datetime
     sample_start: datetime
     sample_end: datetime
     event_type: str
@@ -268,6 +273,12 @@ def _parse_datetime(value: str, name: str, context: str) -> datetime:
     if parsed.tzinfo is not None:
         parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
     return parsed
+
+
+def _format_datetime(value: datetime | None) -> str:
+    """Return one stable, timezone-free ISO representation for batch metadata."""
+
+    return "" if value is None else value.isoformat(sep=" ")
 
 
 def _normalise_split(value: str, context: str = "split") -> str:
@@ -968,16 +979,25 @@ class HunanGraphEventDataset(Dataset[GraphEventBatch]):
                     f"{context}: COMPOUND_EVENT必须等于(SOURCE_RAIN_EVENT_COUNT>1)"
                 )
             events[event_id] = _Event(
-                event_id,
-                graph_id,
-                basin_id,
-                outlet_id,
-                sample_start,
-                sample_end,
-                _required_text(row["EVENT_TYPE"], "EVENT_TYPE", context).upper(),
-                _required_text(row["EVENT_GRADE"], "EVENT_GRADE", context).upper(),
-                peak_time,
-                peak_time.year,
+                event_id=event_id,
+                graph_id=graph_id,
+                basin_id=basin_id,
+                outlet_id=outlet_id,
+                rain_start=rain_start,
+                rain_end=rain_end,
+                hydro_start=hydro_start,
+                hydro_end=hydro_end,
+                peak_time=peak_time,
+                sample_start=sample_start,
+                sample_end=sample_end,
+                event_type=_required_text(
+                    row["EVENT_TYPE"], "EVENT_TYPE", context
+                ).upper(),
+                event_grade=_required_text(
+                    row["EVENT_GRADE"], "EVENT_GRADE", context
+                ).upper(),
+                split_time=peak_time,
+                event_year=peak_time.year,
             )
         if not events:
             raise ValueError(f"flood_events_final.csv没有事件记录: {path}")
@@ -1286,6 +1306,7 @@ class HunanGraphEventDataset(Dataset[GraphEventBatch]):
 
     def __getitem__(self, index: int) -> GraphEventBatch:
         sample = self._samples[index]
+        event = self._events[sample.event_id]
         graph = self._graphs[sample.graph_id]
         dynamic = self._dynamic[sample.graph_id]
         history_indices, future_indices = self._window_indices(sample)
@@ -1393,6 +1414,15 @@ class HunanGraphEventDataset(Dataset[GraphEventBatch]):
             sample_id=sample.sample_id,
             event_id=sample.event_id,
             graph_id=sample.graph_id,
+            target_station_id=sample.outlet_id,
+            forecast_time=_format_datetime(sample.forecast_time),
+            event_rain_start=_format_datetime(event.rain_start),
+            event_rain_end=_format_datetime(event.rain_end),
+            event_hydro_start=_format_datetime(event.hydro_start),
+            event_hydro_end=_format_datetime(event.hydro_end),
+            event_peak_time=_format_datetime(event.peak_time),
+            event_sample_start=_format_datetime(event.sample_start),
+            event_sample_end=_format_datetime(event.sample_end),
         )
 
 
@@ -1420,7 +1450,20 @@ def collate_hunan_graph_events(items: list[GraphEventBatch]) -> GraphEventBatch:
         "node_area_km2",
         "station_ids",
     }
-    metadata_names = {"sample_id", "event_id", "graph_id"}
+    metadata_names = {
+        "sample_id",
+        "event_id",
+        "graph_id",
+        "target_station_id",
+        "forecast_time",
+        "event_rain_start",
+        "event_rain_end",
+        "event_hydro_start",
+        "event_hydro_end",
+        "event_peak_time",
+        "event_sample_start",
+        "event_sample_end",
+    }
     kwargs: dict[str, Any] = {}
     for name in GraphEventBatch.__dataclass_fields__:
         values = [getattr(item, name) for item in items]

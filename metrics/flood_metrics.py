@@ -167,18 +167,20 @@ def masked_regression_sums(
     }
 
 
-def regression_metrics(sums: dict[str, float | int]) -> dict[str, float | int]:
-    """Convert mergeable sums into MAE/RMSE/bias/NSE/KGE metrics."""
+def _regression_report(
+    sums: dict[str, float | int],
+) -> tuple[dict[str, float | int], dict[str, str]]:
+    """Return metrics and explicit definition statuses from the same rules."""
 
     count = int(sums["count"])
     if count == 0:
-        return {
-            "valid_count": 0,
-            "mae": float("nan"),
-            "rmse": float("nan"),
-            "bias": float("nan"),
-            "nse": float("nan"),
-            "kge": float("nan"),
+        metrics: dict[str, float | int] = {
+            name: float("nan") for name in ("mae", "rmse", "bias", "nse", "kge")
+        }
+        metrics["valid_count"] = 0
+        return metrics, {
+            "nse": "NO_VALID_OBSERVATIONS",
+            "kge": "NO_VALID_OBSERVATIONS",
         }
     n = float(count)
     prediction_mean = float(sums["prediction"]) / n
@@ -206,7 +208,7 @@ def regression_metrics(sums: dict[str, float | int]) -> dict[str, float | int]:
         )
     else:
         kge = float("nan")
-    return {
+    metrics = {
         "valid_count": count,
         "mae": float(sums["absolute_error"]) / n,
         "rmse": math.sqrt(float(sums["squared_error"]) / n),
@@ -214,6 +216,35 @@ def regression_metrics(sums: dict[str, float | int]) -> dict[str, float | int]:
         "nse": nse,
         "kge": kge,
     }
+    if target_variance <= 0:
+        nse_status = (
+            "INSUFFICIENT_VALID_COUNT" if count < 2 else "ZERO_OBS_VARIANCE"
+        )
+    else:
+        nse_status = "DEFINED"
+    if count < 2:
+        kge_status = "INSUFFICIENT_VALID_COUNT"
+    elif target_variance <= 0:
+        kge_status = "ZERO_OBS_VARIANCE"
+    elif prediction_variance <= 0:
+        kge_status = "ZERO_PRED_VARIANCE"
+    elif target_mean == 0:
+        kge_status = "ZERO_OBS_MEAN"
+    else:
+        kge_status = "DEFINED"
+    return metrics, {"nse": nse_status, "kge": kge_status}
+
+
+def regression_metrics(sums: dict[str, float | int]) -> dict[str, float | int]:
+    """Convert mergeable sums into MAE/RMSE/bias/NSE/KGE metrics."""
+
+    return _regression_report(sums)[0]
+
+
+def regression_metric_status(sums: dict[str, float | int]) -> dict[str, str]:
+    """Explain why NSE/KGE are defined or safely reported as ``NaN``."""
+
+    return _regression_report(sums)[1]
 
 
 def hydrograph_sample_sums(

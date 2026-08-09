@@ -40,6 +40,18 @@ class GraphEventBatch:
     sample_id: str | tuple[str, ...] | None = None
     event_id: str | tuple[str, ...] | None = None
     graph_id: str | tuple[str, ...] | None = None
+    # Formal evaluation metadata.  These values never enter ``forward``;
+    # they make validation diagnostics traceable to the authoritative event
+    # and forecast-window tables without re-reading CSVs inside the trainer.
+    target_station_id: str | tuple[str, ...] | None = None
+    forecast_time: str | tuple[str, ...] | None = None
+    event_rain_start: str | tuple[str, ...] | None = None
+    event_rain_end: str | tuple[str, ...] | None = None
+    event_hydro_start: str | tuple[str, ...] | None = None
+    event_hydro_end: str | tuple[str, ...] | None = None
+    event_peak_time: str | tuple[str, ...] | None = None
+    event_sample_start: str | tuple[str, ...] | None = None
+    event_sample_end: str | tuple[str, ...] | None = None
 
     def to(self, device: torch.device) -> "GraphEventBatch":
         return GraphEventBatch(

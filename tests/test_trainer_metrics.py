@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import math
 import tempfile
 import unittest
@@ -11,6 +12,7 @@ from torch.utils.data import DataLoader
 
 from metrics import horizon_metrics, masked_huber
 from trainers import Trainer
+from trainers.trainer import _append_csv_row
 
 
 @dataclass
@@ -107,6 +109,22 @@ def config(directory: Path, accumulation: int = 1) -> dict:
 
 
 class TestTrainerMetrics(unittest.TestCase):
+    def test_training_csv_appends_new_diagnostic_columns_on_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "train.csv"
+            _append_csv_row(path, {"epoch": 0, "loss": 1.0})
+            _append_csv_row(
+                path,
+                {"epoch": 1, "loss": 0.8, "val_delta_z_mae": 0.2},
+            )
+            with path.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(
+                list(rows[0]), ["epoch", "loss", "val_delta_z_mae"]
+            )
+            self.assertEqual(rows[0]["val_delta_z_mae"], "")
+            self.assertEqual(rows[1]["val_delta_z_mae"], "0.2")
+
     def test_formal_loss_is_dimensionless_by_train_standard_deviation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             cfg = config(Path(directory))

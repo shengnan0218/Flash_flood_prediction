@@ -217,6 +217,8 @@ FLOW/WATER_LEVEL 的 TRAIN 标准差还用于把联合 Q/Z Huber 损失无量纲
 
 正式 `evaluate.py` 还输出基于现有滑动窗口的 `EVENT_ID`/`GRAPH_ID` 等权宏平均，并在 `window_group_metrics` 中保留逐事件、逐河网明细。字段名刻意包含 `window`：同一目标时刻若出现在多个预测窗口中仍会重复计入，不能把这些值解释为去重后的完整洪水过程指标。NSE/KGE 等无定义的组不会进入对应宏平均，实际参与组数写在 `*_defined_count`。
 
+训练验证和独立评估还会生成去重后的真实事件/河网/水位站诊断。真实事件按正式 `EVENT_ID` 聚合；同一事件、站点和目标时刻只保留最短预见期（最新起报）的预测。逐站 ΔZ 使用该 sample 历史窗内、截至 `FORECAST_TIME` 最后一个有效实测水位为基准，不读取未来真实水位做校正。完整口径、字段与输出目录见 [docs/validation_diagnostics.md](docs/validation_diagnostics.md)。
+
 当前数据契约没有权威预警阈值、连续业务发报记录或平水负事件，因此暂不计算高流量分层 NSE/KGE、POD/CSI/HSS/F1/FAR 和有效预见期；在补齐业务定义前不会用任意分位数冒充业务阈值。
 
 `source_manifest.json` 应记录数据构建版本、源文件及动态文件校验和。checkpoint 会绑定站点顺序、目标映射和核心契约文件 SHA-256；数据重建后不匹配会拒绝评估，防止站点参数错配。
@@ -271,6 +273,12 @@ python train_hunan.py --config configs/hunan_e4.yaml --dataset-root "D:\path\to\
 
 ```powershell
 python evaluate.py --config configs/hunan_e4.yaml --dataset-root "D:\path\to\_model_dataset" --checkpoint outputs/hunan_e4_best.pt --output outputs/hunan_e4_test.json
+```
+
+需要对 best checkpoint 重跑验证集详细诊断时：
+
+```powershell
+python evaluate.py --config configs/hunan_e4.yaml --dataset-root "D:\path\to\_model_dataset" --checkpoint outputs/hunan_e4_best.pt --split VALIDATION --output outputs/hunan_e4_validation.json
 ```
 
 训练只用 TRAIN 拟合、VALIDATION 选最佳 checkpoint；TEST 不参与拟合和早停。评估只加载模型权重，不恢复 optimizer。未训练河网、站点映射、核心数据契约、求解器积分契约或物理参数边界发生变化都会被拒绝。
