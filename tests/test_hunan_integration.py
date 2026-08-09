@@ -490,7 +490,7 @@ class TestHunanFormalIntegration(unittest.TestCase):
             physical_cfg = deepcopy(raw_cfg)
             physical_cfg["runoff_mode"] = "water_balance_lstm"
             physical_cfg["routing_mode"] = "kinematic_wave_gnn"
-            physical_cfg["solver"]["maximum_substeps"] = 256
+            self.assertEqual(physical_cfg["solver"]["maximum_substeps"], 64)
             physical = HybridFloodModel(physical_cfg, train_loader.dataset.num_stations)
             physical_batch = batches[0]
             physical_output = physical(physical_batch)

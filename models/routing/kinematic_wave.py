@@ -182,35 +182,40 @@ class KinematicWaveGNN(nn.Module):
                     destinations = destination[edge_ids]
                     inflow = node_q[:, sources]
 
-                    # Estimate CFL from the provisional full-step wet area.  A
-                    # dry reach receiving a flood pulse must not be classified
-                    # as having near-zero celerity merely because old storage=0.
-                    # CFL selection is a discrete control decision, not a
-                    # differentiable model output.  Detaching it also avoids
-                    # retaining references to routing state that is advanced
-                    # below.
-                    provisional = (
-                        volume[:, edge_ids].detach() + inflow.detach() * dt
-                    )
-                    provisional_area = (
-                        provisional / length[edge_ids]
-                    ).clamp_min(1.0e-8)
-                    celerity = (
-                        exponent
-                        * alpha[edge_ids]
-                        * provisional_area.pow(exponent - 1.0)
-                    )
-                    cell_length = torch.minimum(
-                        length[edge_ids],
-                        torch.full_like(length[edge_ids], dx),
-                    )
-                    cfl_ratio = celerity * dt / cell_length / cfl_limit
-                    required = torch.ceil(cfl_ratio.amax()).to(torch.int64)
-                    substeps = max(1, int(required.detach().cpu()))
+                    # Estimate CFL from the larger of the currently stored wet
+                    # area and the equilibrium area implied by the incoming
+                    # discharge, Q = alpha * A ** (5/3).  Treating Qin * dt as
+                    # full-step storage assumes an hour of inflow with no
+                    # outflow and can grossly overestimate flood celerity.
+                    # Substep selection is a discrete control decision; the
+                    # actual capacity/outflow update below remains differentiable.
+                    with torch.no_grad():
+                        current_area = (
+                            volume[:, edge_ids] / length[edge_ids]
+                        ).clamp_min(0.0)
+                        equilibrium_area = (
+                            inflow / alpha[edge_ids]
+                        ).clamp_min(0.0).pow(1.0 / exponent)
+                        cfl_area = torch.maximum(
+                            current_area, equilibrium_area
+                        ).clamp_min(1.0e-8)
+                        celerity = (
+                            exponent
+                            * alpha[edge_ids]
+                            * cfl_area.pow(exponent - 1.0)
+                        )
+                        cell_length = torch.minimum(
+                            length[edge_ids],
+                            torch.full_like(length[edge_ids], dx),
+                        )
+                        cfl_ratio = celerity * dt / cell_length / cfl_limit
+                        required = torch.ceil(cfl_ratio.amax()).to(torch.int64)
+                        substeps = max(1, int(required.cpu()))
                     if substeps > maximum_substeps:
                         raise RuntimeError(
                             f"CFL需要{substeps}个子步，超过maximum_substeps="
-                            f"{maximum_substeps}；请减小时间步或增加dx/上限"
+                            f"{maximum_substeps}；该上限仅用于异常保护，请检查"
+                            "输入流量、河道几何、物理参数或时空离散，禁止仅提高上限绕过"
                         )
                     maximum_used = max(maximum_used, substeps)
                     sub_dt = dt / substeps
