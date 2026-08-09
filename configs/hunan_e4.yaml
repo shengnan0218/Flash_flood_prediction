@@ -29,5 +29,5 @@ training:
   epochs: 100
   patience: 15
   gradient_clip: 1.0
-  checkpoint: outputs/hunan_e4_best.pt
-  log_csv: outputs/hunan_e4_train.csv
+  checkpoint: outputs/hunan_e4_diagnostics_best.pt
+  log_csv: outputs/hunan_e4_diagnostics_train.csv
