@@ -14,7 +14,9 @@ class TestLearnedChannelWidth(unittest.TestCase):
         self.solver = {
             "dx": 1000.0,
             "cfl": 0.8,
-            "maximum_substeps": 128,
+            "integration_scheme": "backward_euler",
+            "implicit_iterations": 8,
+            "implicit_residual_tolerance": 1.0e-5,
             "minimum_slope": 1.0e-6,
             "minimum_length": 10.0,
             "seconds_per_step": 3600.0,

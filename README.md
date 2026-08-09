@@ -273,7 +273,7 @@ python train_hunan.py --config configs/hunan_e4.yaml --dataset-root "D:\path\to\
 python evaluate.py --config configs/hunan_e4.yaml --dataset-root "D:\path\to\_model_dataset" --checkpoint outputs/hunan_e4_best.pt --output outputs/hunan_e4_test.json
 ```
 
-训练只用 TRAIN 拟合、VALIDATION 选最佳 checkpoint；TEST 不参与拟合和早停。评估只加载模型权重，不恢复 optimizer。未训练河网、站点映射变化或核心数据契约变化都会被拒绝。
+训练只用 TRAIN 拟合、VALIDATION 选最佳 checkpoint；TEST 不参与拟合和早停。评估只加载模型权重，不恢复 optimizer。未训练河网、站点映射、核心数据契约、求解器积分契约或物理参数边界发生变化都会被拒绝。
 
 默认配置也指向 `project/_model_dataset`，若数据放在该处可省略 `--dataset-root`。
 
@@ -296,7 +296,7 @@ python evaluate.py --config configs/hunan_e4.yaml --dataset-root "D:\path\to\_mo
 - 全省站点使用稳定的全局 `station_index`，Q–Z 观测参数不会因河网节点数不同而错位。
 - 对数静态面积只用于神经特征，水量换算单独使用反变换后的 `node_area_km2`。
 - 历史 Q/Z/降雨 mask 会作为模型输入；缺测 0 与真实 0 可区分。
-- 运动波使用 CFL 自适应子步、守恒蓄量和直接上游汇入；超过上限会报错，不会静默降低精度。
+- 运动波使用可微后向 Euler 单调非线性求解、守恒蓄量和直接上游汇入；CFL 仅报告显式方法所需的等价子步数，不再控制积分或中止短河段高流量样本。非有限值或隐式方程残差超限仍会明确报错。
 - 数据没有实测河宽时，运动波根据河长、坡降及边两端节点属性学习有界的 `effective width`；Manning n 同样是有界可学习参数。二者是由路由目标校准的等效水力参数，不应表述为实测河宽或实测糙率。
 - 水位观测头对非负 Q 和河道蓄量结构单调，并按全局站点索引取参数。
 - 物理库容从每个样本窗口开始 warm-up；默认 24 小时。慢响应流域应通过实验加长 HISTORY_HOURS。

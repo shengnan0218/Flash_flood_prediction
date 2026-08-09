@@ -478,6 +478,14 @@ class TestHunanFormalIntegration(unittest.TestCase):
             remapped_cfg["_runtime"]["data_contract"]["station_ids"].reverse()
             with self.assertRaisesRegex(ValueError, "data_contract.station_ids"):
                 validate_checkpoint_config(checkpoint, remapped_cfg)
+            changed_solver_cfg = deepcopy(eval_cfg)
+            changed_solver_cfg["solver"]["implicit_iterations"] += 1
+            with self.assertRaisesRegex(ValueError, "solver"):
+                validate_checkpoint_config(checkpoint, changed_solver_cfg)
+            changed_bounds_cfg = deepcopy(eval_cfg)
+            changed_bounds_cfg["physical_bounds"]["width"][1] += 1.0
+            with self.assertRaisesRegex(ValueError, "physical_bounds"):
+                validate_checkpoint_config(checkpoint, changed_bounds_cfg)
             metrics = eval_trainer.evaluate(test_loader)
             self.assertEqual(metrics["q_valid_count"], 2)
             self.assertEqual(metrics["z_valid_count"], 2)
@@ -490,13 +498,22 @@ class TestHunanFormalIntegration(unittest.TestCase):
             physical_cfg = deepcopy(raw_cfg)
             physical_cfg["runoff_mode"] = "water_balance_lstm"
             physical_cfg["routing_mode"] = "kinematic_wave_gnn"
-            self.assertEqual(physical_cfg["solver"]["maximum_substeps"], 64)
+            self.assertEqual(
+                physical_cfg["solver"]["integration_scheme"], "backward_euler"
+            )
+            self.assertEqual(physical_cfg["solver"]["implicit_iterations"], 8)
             physical = HybridFloodModel(physical_cfg, train_loader.dataset.num_stations)
             physical_batch = batches[0]
             physical_output = physical(physical_batch)
             self.assertTrue(torch.isfinite(physical_output["q"]).all())
             diagnostics = physical_output["diagnostics"]
             self.assertIn("node_channel_storage", diagnostics)
+            self.assertIn("explicit_equivalent_substeps", diagnostics)
+            self.assertIn("implicit_relative_residual", diagnostics)
+            self.assertLessEqual(
+                diagnostics["implicit_relative_residual"].max().item(),
+                physical_cfg["solver"]["implicit_residual_tolerance"],
+            )
             self.assertLess(
                 diagnostics["routing_mass_balance_residual"].abs().max().item(),
                 0.1,

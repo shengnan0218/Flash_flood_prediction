@@ -302,7 +302,7 @@ class Trainer:
         q_count_total = 0
         z_count_total = 0
         batch_times: list[float] = []
-        substeps: list[float] = []
+        explicit_equivalent_substeps: list[float] = []
         batch_count = 0
 
         for group in self._batch_groups(loader, accumulation):
@@ -351,9 +351,13 @@ class Trainer:
                     z_count_total += z_count
                     batch_count += 1
                     batch_times.append(time.perf_counter() - tick)
-                    diagnostic = out.get("diagnostics", {}).get("substeps")
+                    diagnostic = out.get("diagnostics", {}).get(
+                        "explicit_equivalent_substeps"
+                    )
                     if isinstance(diagnostic, torch.Tensor) and diagnostic.numel():
-                        substeps.append(float(diagnostic.float().mean().item()))
+                        explicit_equivalent_substeps.append(
+                            float(diagnostic.float().mean().item())
+                        )
 
                 self.scaler.unscale_(self.optimizer)
                 self._clip_gradients()
@@ -363,8 +367,8 @@ class Trainer:
             except torch.OutOfMemoryError as exc:
                 self.optimizer.zero_grad(set_to_none=True)
                 raise RuntimeError(
-                    "CUDA显存不足：请降低batch_size、history_length、solver cells(dx相关)"
-                    "或maximum_substeps；配置不会被静默修改"
+                    "CUDA显存不足：请降低batch_size、history_length或hidden_dim；"
+                    "配置不会被静默修改"
                 ) from exc
 
         if batch_count == 0:
@@ -375,8 +379,11 @@ class Trainer:
         result.update(
             {
                 "batch_seconds": sum(batch_times) / len(batch_times),
-                "wave_mean_substeps": (
-                    sum(substeps) / len(substeps) if substeps else float("nan")
+                "wave_mean_explicit_equivalent_substeps": (
+                    sum(explicit_equivalent_substeps)
+                    / len(explicit_equivalent_substeps)
+                    if explicit_equivalent_substeps
+                    else float("nan")
                 ),
             }
         )

@@ -41,7 +41,9 @@ class TinyModel(torch.nn.Module):
         return {
             "q": prediction,
             "z": prediction,
-            "diagnostics": {"substeps": torch.ones(1)},
+            "diagnostics": {
+                "explicit_equivalent_substeps": torch.ones(1)
+            },
         }
 
 

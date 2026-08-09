@@ -236,7 +236,9 @@ def validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
         {
             "dx",
             "cfl",
-            "maximum_substeps",
+            "integration_scheme",
+            "implicit_iterations",
+            "implicit_residual_tolerance",
             "minimum_slope",
             "minimum_length",
             "seconds_per_step",
@@ -247,7 +249,11 @@ def validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
     _number(solver, "cfl", strictly=True)
     if solver["cfl"] > 1:
         raise ConfigError("solver.cfl 必须在 (0, 1] 范围内")
-    _int(solver, "maximum_substeps", 1)
+    _enum(solver, "integration_scheme", {"backward_euler"})
+    _int(solver, "implicit_iterations", 1)
+    _number(solver, "implicit_residual_tolerance", strictly=True)
+    if solver["implicit_residual_tolerance"] > 1:
+        raise ConfigError("solver.implicit_residual_tolerance 必须在 (0, 1] 范围内")
     if data["mode"] == "hunan" and solver["seconds_per_step"] != 3600:
         raise ConfigError("湖南逐时正式数据要求 solver.seconds_per_step=3600")
 

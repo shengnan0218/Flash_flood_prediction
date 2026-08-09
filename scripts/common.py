@@ -348,6 +348,8 @@ def validate_checkpoint_config(
         "node_static_dim",
         "edge_static_dim",
         "hidden_dim",
+        "solver",
+        "physical_bounds",
     )
     mismatches = [key for key in keys if saved.get(key) != cfg.get(key)]
     saved_data = saved.get("data")
