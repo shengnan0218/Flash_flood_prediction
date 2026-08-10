@@ -1,0 +1,43 @@
+{
+  "deduplication_rule": "Within each EVENT_ID/station/target timestamp, retain the prediction with the shortest lead_hours (latest issue time); ties use lexical SAMPLE_ID.",
+  "delta_z_baseline_rule": "For each retained forecast point, subtract the latest valid observed water level at the target station within that sample's history window, never later than FORECAST_TIME, from both observation and prediction.",
+  "relative_q_denominator_rule": "Relative peak/volume error is defined only when observed peak or mean valid discharge is >= 1 m3/s.",
+  "total_q_sse": 1155997.3908826052,
+  "window_weighted_total_q_sse": 5991344.1901539825,
+  "q_valid_forecast_points_before_dedup": 16038,
+  "q_unique_event_time_points": 2994,
+  "q_duplicate_weight_factor": 5.356713426853707,
+  "top_1_event_sse_fraction": 0.26100487444266124,
+  "top_5_event_sse_fraction": 0.6382992882144297,
+  "top_10_event_sse_fraction": 0.8242716437397929,
+  "top_20_event_sse_fraction": 0.9316528885607457,
+  "worst_graph_by_q_nse": {
+    "GRAPH_ID": "B020",
+    "q_nse": -27.690757420639567
+  },
+  "median_graph_q_nse": -0.4770568746458852,
+  "median_graph_q_kge": 0.18116711708251326,
+  "median_station_z_nse": -29.457359991418368,
+  "median_station_z_kge": -1.5549381783977831,
+  "delta_z_overall_metrics": {
+    "valid_count": 3159,
+    "mae": 2.6319865459749012,
+    "rmse": 11.97043196763633,
+    "bias": -1.50903715087138,
+    "nse": -19278.8524910234,
+    "nse_status": "DEFINED",
+    "skipped_missing_baseline_count": 0
+  },
+  "counts": {
+    "q_events": 62,
+    "q_graphs": 14,
+    "z_stations": 16,
+    "delta_z_stations": 16,
+    "z_unique_event_time_points": 3159,
+    "delta_z_valid_points": 3159
+  },
+  "run_context": {
+    "checkpoint": "/home/zheda/Flash_flood_prediction/outputs/hunan_e4_diagnostics_best.pt",
+    "split": "TEST"
+  }
+}
