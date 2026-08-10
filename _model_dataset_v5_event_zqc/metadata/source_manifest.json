@@ -1,0 +1,87 @@
+{
+  "dataset_contract_version": "5-event-zqc",
+  "builder_revision": "2026-08-10-hydro-missing-token-fix-v1",
+  "hydro_numeric_missing_tokens": [
+    "NULL_OR_BLANK",
+    "-",
+    "NaN_CASE_INSENSITIVE"
+  ],
+  "generator_script": {
+    "path": "E:\\FSN-PostDoc\\other-projects\\Flash flood prediction\\Hunan\\Arcgis\\MERIT_workflow\\16_build_model_dataset_v3_FINAL_STRICT_MISSING_FIX.py",
+    "size_bytes": 175733,
+    "modified_time": "2026-08-10T09:34:30.606926441",
+    "sha256": "cb8aa377a78d947323bb8245fa70a5e2b48996633fa3616946d90f1f63ef5ca1"
+  },
+  "project_root": "E:\\FSN-PostDoc\\other-projects\\Flash flood prediction\\Hunan",
+  "workflow_dir": "E:\\FSN-PostDoc\\other-projects\\Flash flood prediction\\Hunan\\Arcgis\\MERIT_workflow",
+  "hydro_dir": "E:\\FSN-PostDoc\\other-projects\\Flash flood prediction\\Hunan\\归档_正确解压\\河道",
+  "rain_dir": "E:\\FSN-PostDoc\\other-projects\\Flash flood prediction\\Hunan\\Arcgis\\MERIT_workflow\\11_node_rain",
+  "events_csv": {
+    "path": "E:\\FSN-PostDoc\\other-projects\\Flash flood prediction\\Hunan\\Arcgis\\MERIT_workflow\\13_final_flood_events\\final_flood_events.csv",
+    "size_bytes": 449417,
+    "modified_time": "2026-08-06T10:55:08.302719355",
+    "sha256": "8e312c89be4276b2aed0119bf8ba21330de5423472589b41a4dc585fcad50038"
+  },
+  "edges_csv": {
+    "path": "E:\\FSN-PostDoc\\other-projects\\Flash flood prediction\\Hunan\\Arcgis\\MERIT_workflow\\06_topology\\edges.csv",
+    "size_bytes": 9408,
+    "modified_time": "2026-08-06T07:41:39.465510845",
+    "sha256": "5a53ca5d02ff77cdb96cb5bdfc61a634ffde1bac0aeec5e3a57719324b4592bf"
+  },
+  "node_static_csv": {
+    "path": "E:\\FSN-PostDoc\\other-projects\\Flash flood prediction\\Hunan\\Arcgis\\MERIT_workflow\\15_static_attributes_ccam_py3\\node_static_attributes_final.csv",
+    "size_bytes": 52075,
+    "modified_time": "2026-08-07T07:19:13.233702898",
+    "sha256": "d77233b0fe2851b351d181a8fc370b767523d7e64f214f765050357f04cec015"
+  },
+  "edge_static_csv": {
+    "path": "E:\\FSN-PostDoc\\other-projects\\Flash flood prediction\\Hunan\\Arcgis\\MERIT_workflow\\14_static_attributes_dem_cisc_py3\\edge_static_attributes_dem.csv",
+    "size_bytes": 12238,
+    "modified_time": "2026-08-07T08:06:53.178554296",
+    "sha256": "9ae849738604fd54f64f609ff628d78236da61a6242fa5623eab1d455b1ff72e"
+  },
+  "missing_node_static_features": [],
+  "event_merge_summary": {
+    "event_count_before_merge": 797,
+    "event_count_after_merge": 797,
+    "event_reduction_count": 0,
+    "merged_component_count": 0,
+    "must_merge_pair_count": 0,
+    "provisional_cross_split_pair_count": 0,
+    "event_reduction_by_graph": {}
+  },
+  "event_time_contract_repaired_event_ids": [
+    "B033_F0004"
+  ],
+  "water_level_reference_excluded_event_ids": [
+    "B016_F0013",
+    "B016_F0014"
+  ],
+  "no_valid_target_sample_excluded_event_ids": [
+    "B019_F0028"
+  ],
+  "parameters": {
+    "project_root": ".",
+    "workflow_dir": "",
+    "hydro_data": "",
+    "node_rain_dir": "",
+    "events_csv": "",
+    "edges_csv": "",
+    "node_static_csv": "",
+    "edge_static_csv": "",
+    "output_dir": ".\\project\\_model_dataset_v5_event_zqc",
+    "event_types": "HYDRO_FLOOD",
+    "event_grades": "A,B",
+    "history_hours": 24,
+    "forecast_hours": 6,
+    "sample_step_hours": 1,
+    "train_fraction": 0.7,
+    "validation_fraction": 0.15,
+    "target_variable": "AUTO",
+    "min_flow_target_coverage": 0.7,
+    "min_target_coverage": 0.8,
+    "water_level_reference_shift_policy": "EXCLUDE_EVENT",
+    "allow_missing_static": false,
+    "overwrite": true
+  }
+}
