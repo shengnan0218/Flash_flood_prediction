@@ -9,9 +9,11 @@ from pathlib import Path
 import tempfile
 import unittest
 
+import pandas as pd
 import torch
 import yaml
 
+from audit_model_dataset import recompute_normalization
 from config import load_config, validate_config
 from models import HybridFloodModel
 from scripts.common import (
@@ -338,13 +340,14 @@ def build_formal_fixture(root: Path) -> None:
     (metadata / "feature_schema.json").write_text(
         json.dumps(feature_schema, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+    events_for_stats = pd.DataFrame(event_rows)
+    split_lookup = {row["EVENT_ID"]: row["SPLIT"] for row in split_rows}
+    events_for_stats["SPLIT"] = events_for_stats["EVENT_ID"].map(split_lookup)
     normalization = {
         "computed_from_split": "TRAIN",
-        "features": {
-            "RAIN_MM": {"mean": 1.5, "std": 1.0, "min": 0.0, "max": 4.0},
-            "FLOW": {"mean": 13.0, "std": 4.0, "min": 0.0, "max": 30.0},
-            "WATER_LEVEL": {"mean": 1.8, "std": 0.5, "min": 0.0, "max": 4.0},
-        },
+        **recompute_normalization(
+            root, events_for_stats, pd.DataFrame(sample_rows)
+        ),
     }
     (metadata / "normalization_stats.json").write_text(
         json.dumps(normalization, ensure_ascii=False, indent=2), encoding="utf-8"

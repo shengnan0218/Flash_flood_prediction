@@ -1,0 +1,55 @@
+{
+  "dataset_root": "_model_dataset_v4_candidate",
+  "event": {
+    "event_count_before": 800,
+    "event_count_after_provisional_merge": 786,
+    "provisional_merge_note": "Counts describe deterministic connected components of MUST_MERGE evidence; the repository does not contain the authoritative upstream event builder, so no EVENT_ID or split artifact was rewritten.",
+    "event_split_counts_before": {
+      "TRAIN": 560,
+      "VALIDATION": 120,
+      "TEST": 120
+    },
+    "event_split_counts_after_provisional_merge": {
+      "TRAIN": 550,
+      "VALIDATION": 120,
+      "TEST": 116
+    },
+    "overlapping_event_pair_count": 26,
+    "must_merge_pair_count": 15,
+    "cross_split_leakage_pair_count": 0,
+    "review_pair_count": 11,
+    "merged_component_count": 13,
+    "event_reduction_by_graph": {
+      "B007": 3,
+      "B008": 2,
+      "B010": 1,
+      "B015": 2,
+      "B020": 1,
+      "B021": 1,
+      "B025": 1,
+      "B031": 2,
+      "B032": 1
+    }
+  },
+  "water_level": {
+    "water_level_station_count": 19,
+    "water_level_station_split_row_count": 53,
+    "water_level_fail_station_count": 1,
+    "water_level_fail_stations": [
+      "611G3160"
+    ],
+    "water_level_review_row_count": 45,
+    "normalization_computed_from_split": "TRAIN",
+    "normalization_water_level_range": [
+      0.31,
+      1175.29
+    ],
+    "reference_shift_rule": "TRAIN event median Tukey outer fences (Q1-3*IQR, Q3+3*IQR); FAIL only when the entire event min/max range lies outside a fence.",
+    "jump_rule": "Hourly absolute changes are compared with the station TRAIN Tukey upper outer fence; non-consecutive timestamps are not differenced."
+  },
+  "strict_failure_counts": {
+    "must_merge": 15,
+    "cross_split_leakage": 0,
+    "water_level_fail_stations": 1
+  }
+}

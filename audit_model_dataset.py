@@ -98,7 +98,14 @@ def recompute_normalization(root: Path, events: pd.DataFrame, samples: pd.DataFr
         "RAIN_MM": [], "FLOW": [], "WATER_LEVEL": [],
     }
     for graph_id, group in train_samples.groupby("GRAPH_ID"):
-        path = root / "dynamic" / f"graph_{graph_id}_hourly.csv"
+        basin_ids = events.loc[
+            events["GRAPH_ID"].astype(str).eq(str(graph_id)), "BASIN_ID"
+        ].astype(str).unique()
+        if len(basin_ids) != 1:
+            raise ValueError(
+                f"GRAPH_ID={graph_id}必须唯一映射到BASIN_ID，实际={basin_ids.tolist()}"
+            )
+        path = root / "dynamic" / f"graph_{basin_ids[0]}_hourly.csv"
         frame = read_csv(path)
         frame["TIMESTAMP"] = pd.to_datetime(frame["TIMESTAMP"])
         intervals = merge_intervals(list(zip(group["INPUT_START"], group["FORECAST_TIME"])))
@@ -159,7 +166,8 @@ def audit(root: Path) -> dict[str, Any]:
     ):
         events[column] = pd.to_datetime(events[column], errors="coerce")
     for column in ("INPUT_START", "FORECAST_TIME", "TARGET_START", "TARGET_END"):
-        samples[column] = pd.to_datetime(samples[column], errors="coerce")
+        if column in samples:
+            samples[column] = pd.to_datetime(samples[column], errors="coerce")
 
     valid_negative_rows = 0
     negative_by_station: dict[str, int] = {}

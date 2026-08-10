@@ -15,7 +15,12 @@ WORKFLOW = HUNAN_ROOT / "Arcgis" / "MERIT_workflow"
 
 
 def _load_script(name: str, filename: str):
-    spec = importlib.util.spec_from_file_location(name, WORKFLOW / filename)
+    path = WORKFLOW / filename
+    if not path.is_file():
+        raise unittest.SkipTest(
+            f"仓库未包含上游MERIT workflow脚本，跳过外部集成测试: {path}"
+        )
+    spec = importlib.util.spec_from_file_location(name, path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"无法加载脚本: {filename}")
     module = importlib.util.module_from_spec(spec)

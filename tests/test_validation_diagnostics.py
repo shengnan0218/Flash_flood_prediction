@@ -104,6 +104,11 @@ class TestValidationDiagnostics(unittest.TestCase):
         self.assertEqual(event["predicted_volume"], 8 * 3600)
         self.assertEqual(event["q_sse"], 13)
         self.assertEqual(len(diagnostics.q_by_graph), 2)
+        worst_graph = next(
+            row for row in diagnostics.q_by_graph if row["GRAPH_ID"] == "G2"
+        )
+        self.assertEqual(worst_graph["q_sse_rank"], 1)
+        self.assertAlmostEqual(worst_graph["q_sse_fraction_of_total"], 500 / 513)
         self.assertAlmostEqual(diagnostics.summary["total_q_sse"], 513)
         self.assertAlmostEqual(
             diagnostics.summary["top_1_event_sse_fraction"], 500 / 513
@@ -112,6 +117,11 @@ class TestValidationDiagnostics(unittest.TestCase):
             diagnostics.q_top20_sse_events[0]["cumulative_sse_fraction"],
             500 / 513,
         )
+        self.assertAlmostEqual(
+            diagnostics.summary["top_1_graph_sse_fraction"], 500 / 513
+        )
+        self.assertEqual(diagnostics.summary["total_graph_count"], 2)
+        self.assertIn("positive_nse_graph_fraction", diagnostics.summary)
 
     def test_zero_variance_nse_kge_are_nan_with_reasons(self) -> None:
         target = torch.tensor([2.0, 2.0, 2.0])
@@ -147,6 +157,10 @@ class TestValidationDiagnostics(unittest.TestCase):
         self.assertEqual(len(diagnostics.z_by_station), 1)
         self.assertEqual(diagnostics.z_by_station[0]["station_id"], "ZS")
         self.assertEqual(len(diagnostics.delta_z_by_station), 1)
+        self.assertEqual(
+            diagnostics.summary["z_station_metrics"]["mae"]["station_count"], 1
+        )
+        self.assertIn("Pooled absolute-Z", diagnostics.summary["pooled_absolute_z_interpretation"])
         self.assertAlmostEqual(
             diagnostics.summary_metrics["delta_z_station_mae_median"],
             (0.5 + 1.0 + 0.5) / 3,

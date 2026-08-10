@@ -233,6 +233,22 @@ FLOW/WATER_LEVEL 的 TRAIN 标准差还用于把联合 Q/Z Huber 损失无量纲
 
 `dataset_summary.csv` 必须是带表头 CSV，`source_manifest.json` 必须是有效 JSON，`build_log.txt` 必须是 UTF-8 文本。
 
+训练前还必须运行确定性事件/水位审计：
+
+```powershell
+python audit_dataset_quality.py --dataset-root "D:\path\to\_model_dataset"
+```
+
+它只生成证据，不重写事件、split 或样本：
+
+- `qc/event_hydrograph_overlap.csv`：同一图/出口的相邻或时间重叠事件对。只有“共享有效目标时刻且共享同一实测峰时”，或正式 hydro window 确实重叠时，才标记 `MUST_MERGE`；仅样本时段重叠但峰不同标记 `REVIEW`。同一连续过程跨 split 标记 `CROSS_SPLIT_LEAKAGE`。
+- `qc/water_level_station_audit.csv`：按目标站和 split 输出物理水位范围、TRAIN 站级范围、TRAIN 全局 normalization 范围、逐时跳变和站内基准一致性。TRAIN 事件中若整场水位范围落在站级事件中位数 Tukey outer fence 之外，判为基准断裂并标记 `FAIL`，不自动删除站点或事件。
+- `qc/dataset_quality_audit_summary.json`：合并连通组、预计事件数变化、各 split 预计数量和严格失败计数。
+
+`validate_dataset.py` 会重新计算这些审计，不会只信任已有 QC 文件。`strict_validation=true` 时，只要存在 `MUST_MERGE`、`CROSS_SPLIT_LEAKAGE`、TRAIN 水位基准断裂，或 normalization 与 TRAIN 输入窗口重算不一致，就会终止。可用 `--qc-output-dir` 在失败前保留本次审计证据。
+
+当前仓库中的 `source_manifest.json` 指向仓库外的 `16_build_model_dataset_v3.py`，因此仓库只能审计并阻止问题数据训练，不能安全地在评价阶段伪造事件合并。修复必须回到该上游构建步骤；合并后同时重建 final/all events、split、sample index、normalization、summary、QC 和 manifest。
+
 ## 6. 未来降雨策略
 
 物理预测的目标期需要一个明确的降雨假设，项目不会悄悄读取未来实测值。
@@ -248,7 +264,7 @@ FLOW/WATER_LEVEL 的 TRAIN 标准差还用于把联合 Q/Z Huber 损失无量纲
 先做只读预检：
 
 ```powershell
-python validate_dataset.py --config configs/hunan_e4.yaml --dataset-root "D:\path\to\_model_dataset" --output outputs/dataset_validation.json
+python validate_dataset.py --config configs/hunan_e4.yaml --dataset-root "D:\path\to\_model_dataset" --qc-output-dir "D:\path\to\_model_dataset\qc" --output outputs/dataset_validation.json
 ```
 
 报告必须显示 `"status": "VALID"` 才进入训练。
@@ -258,6 +274,17 @@ python validate_dataset.py --config configs/hunan_e4.yaml --dataset-root "D:\pat
 ```powershell
 python train_hunan.py --config configs/hunan_e4.yaml --dataset-root "D:\path\to\_model_dataset"
 ```
+
+事件与水位修复后的下一次全新 E4 使用
+`configs/hunan_e4_event_zqc_v1.yaml`。它只继承现有正式 E4 并改用新的
+checkpoint/log 名，不会覆盖 `hunan_e4_diagnostics_*`：
+
+```powershell
+python train_hunan.py --config configs/hunan_e4_event_zqc_v1.yaml --dataset-root "D:\path\to\_model_dataset_v5_event_zqc"
+```
+
+必须先确认同一新数据目录的 validator 输出 `status=VALID`；不要用旧 best
+checkpoint 评估重建后的事件定义。
 
 若同名 log/checkpoint 已存在，全新训练会拒绝覆盖。确认要从头重跑时显式增加 `--overwrite`；续训不要使用该参数。
 

@@ -277,6 +277,7 @@ class ValidationDiagnostics:
 _EMPTY_TABLE_FIELDS = {
     "q_by_graph.csv": [
         "GRAPH_ID", "q_nse", "q_kge", "q_mae", "q_rmse", "q_bias",
+        "q_sse", "q_sse_fraction_of_total", "q_sse_rank",
         "valid_count", "event_count",
     ],
     "q_by_event.csv": [
@@ -424,6 +425,21 @@ class ValidationDiagnosticsAccumulator:
         z_by_station = self._z_station_rows(z_unique, delta=False)
         delta_by_station = self._z_station_rows(z_unique, delta=True)
         q_total_sse = sum(float(row["q_sse"]) for row in q_by_event)
+        graph_sse_order = sorted(
+            q_by_graph,
+            key=lambda row: (-float(row["q_sse"]), str(row["GRAPH_ID"])),
+        )
+        graph_sse_rank = {
+            str(row["GRAPH_ID"]): rank
+            for rank, row in enumerate(graph_sse_order, 1)
+        }
+        for row in q_by_graph:
+            row["q_sse_fraction_of_total"] = (
+                float(row["q_sse"]) / q_total_sse
+                if q_total_sse > 0
+                else float("nan")
+            )
+            row["q_sse_rank"] = graph_sse_rank[str(row["GRAPH_ID"])]
         error_top = sorted(
             q_by_event,
             key=lambda row: (float(row["q_rmse"]), float(row["q_sse"])),
@@ -519,6 +535,46 @@ class ValidationDiagnosticsAccumulator:
             "median_graph_q_kge": summary_metrics["q_graph_kge_median"],
             "median_station_z_nse": summary_metrics["z_station_nse_median"],
             "median_station_z_kge": summary_metrics["z_station_kge_median"],
+            "z_station_metrics": {
+                "nse": self._quartiles(z_by_station, "z_nse"),
+                "kge": self._quartiles(z_by_station, "z_kge"),
+                "mae": self._quartiles(z_by_station, "z_mae"),
+            },
+            "delta_z_station_metrics": {
+                "nse": self._quartiles(delta_by_station, "delta_z_nse"),
+                "mae": self._quartiles(delta_by_station, "delta_z_mae"),
+                "rmse": self._quartiles(delta_by_station, "delta_z_rmse"),
+                "bias": self._quartiles(delta_by_station, "delta_z_bias"),
+            },
+            "pooled_absolute_z_interpretation": (
+                "Pooled absolute-Z NSE/KGE mixes station datum differences and must not "
+                "be used alone as the primary multi-station water-level conclusion; "
+                "report station distributions and delta-Z together."
+            ),
+            "top_1_graph_sse_fraction": self._top_sse_fraction(
+                q_by_graph, q_total_sse, 1
+            ),
+            "top_3_graph_sse_fraction": self._top_sse_fraction(
+                q_by_graph, q_total_sse, 3
+            ),
+            "top_5_graph_sse_fraction": self._top_sse_fraction(
+                q_by_graph, q_total_sse, 5
+            ),
+            "positive_nse_graph_count": sum(
+                math.isfinite(float(row["q_nse"])) and float(row["q_nse"]) > 0
+                for row in q_by_graph
+            ),
+            "total_graph_count": len(q_by_graph),
+            "positive_nse_graph_fraction": (
+                sum(
+                    math.isfinite(float(row["q_nse"]))
+                    and float(row["q_nse"]) > 0
+                    for row in q_by_graph
+                )
+                / len(q_by_graph)
+                if q_by_graph
+                else float("nan")
+            ),
             "delta_z_overall_metrics": {
                 **{
                     name: value
@@ -554,6 +610,18 @@ class ValidationDiagnosticsAccumulator:
             return float("nan")
         ordered = sorted((float(row["q_sse"]) for row in rows), reverse=True)
         return sum(ordered[:count]) / total
+
+    @staticmethod
+    def _quartiles(rows: list[dict[str, Any]], field: str) -> dict[str, Any]:
+        return {
+            "p25": _quantile((row[field] for row in rows), 0.25),
+            "median": _quantile((row[field] for row in rows), 0.5),
+            "p75": _quantile((row[field] for row in rows), 0.75),
+            "defined_count": sum(
+                math.isfinite(float(row[field])) for row in rows
+            ),
+            "station_count": len(rows),
+        }
 
     @staticmethod
     def _worst_graph(rows: list[dict[str, Any]]) -> dict[str, Any] | None:

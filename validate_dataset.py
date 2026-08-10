@@ -7,6 +7,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from audit_model_dataset import audit as audit_structural_dataset
+from dataset_quality import build_dataset_quality_audit, enforce_strict_quality
 from scripts.common import setup_evaluation, setup_training
 
 
@@ -24,6 +26,7 @@ def validate_dataset(
     *,
     dataset_root: str | Path | None = None,
     graph_id: str | None = None,
+    qc_output_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     """Validate every split and return a JSON-safe dataset summary."""
 
@@ -41,6 +44,22 @@ def validate_dataset(
         key: sorted(value)
         for key, value in train_dataset.target_variables_by_graph.items()
     }
+    resolved_root = Path(cfg["data"]["dataset_root"]).expanduser().resolve()
+    quality_audit = build_dataset_quality_audit(resolved_root)
+    written_quality_files = (
+        quality_audit.write(qc_output_dir) if qc_output_dir is not None else {}
+    )
+    structural_audit = audit_structural_dataset(resolved_root)
+    normalization_audit = structural_audit["normalization"]
+    if normalization_audit.get("computed_from_split") != "TRAIN":
+        raise ValueError("normalization_stats.json必须声明computed_from_split=TRAIN")
+    if not normalization_audit.get("matches"):
+        raise ValueError(
+            "normalization_stats.json与TRAIN输入窗口重算结果不一致: "
+            f"{normalization_audit.get('mismatches', [])[:10]}"
+        )
+    if bool(cfg.get("data", {}).get("strict_validation", True)):
+        enforce_strict_quality(quality_audit)
     result: dict[str, Any] = {
         "dataset_root": cfg["data"]["dataset_root"],
         "history_hours": cfg["history_length"],
@@ -56,6 +75,9 @@ def validate_dataset(
         "validation": _dataset_summary(validation_dataset),
         "metadata_qc_files": dict(train_dataset.artifact_status),
         "qc_row_counts": dict(train_dataset.qc_status["row_counts"]),
+        "dataset_quality_audit": quality_audit.summary,
+        "quality_qc_files_written": written_quality_files,
+        "normalization_recompute_audit": normalization_audit,
     }
 
     # Release the shared TRAIN/VALIDATION hourly tensors before reading TEST.
@@ -105,9 +127,19 @@ def main() -> None:
     parser.add_argument("--dataset-root", help="覆盖 _model_dataset 根目录")
     parser.add_argument("--graph-id", help="可选：只校验一个GRAPH_ID")
     parser.add_argument("--output", help="可选JSON报告路径")
+    parser.add_argument(
+        "--qc-output-dir",
+        help=(
+            "可选：原子写出event_hydrograph_overlap.csv、"
+            "water_level_station_audit.csv及summary；strict失败时仍会保留审计证据"
+        ),
+    )
     args = parser.parse_args()
     result = validate_dataset(
-        args.config, dataset_root=args.dataset_root, graph_id=args.graph_id
+        args.config,
+        dataset_root=args.dataset_root,
+        graph_id=args.graph_id,
+        qc_output_dir=args.qc_output_dir,
     )
     text = json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False)
     if args.output:

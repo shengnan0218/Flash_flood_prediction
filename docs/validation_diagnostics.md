@@ -41,6 +41,30 @@ Q is at least 1 m³/s. Relative volume error is defined only when mean observed
 Q over the valid integrated hours is at least 1 m³/s. Otherwise the value is
 `NaN` and the status column explains why.
 
+This shortest-lead rule removes only sliding-window duplication *inside one
+formal EVENT_ID*. It deliberately does not hide duplication across different
+EVENT_ID values. Before training, `audit_dataset_quality.py` compares every
+temporally adjacent or overlapping pair in the same `GRAPH_ID` and target
+station. A pair is `MUST_MERGE` only when at least one of these deterministic
+conditions holds:
+
+1. the two events share valid target timestamps and their independently
+   evaluated observed peaks occur at exactly the same timestamp; or
+2. both official hydro windows are complete and overlap.
+
+Shared target timestamps with different observed peaks are `REVIEW`, not an
+automatic merge. A non-overlapping hydro gap no longer than the configured
+forecast horizon is also `REVIEW`. If `MUST_MERGE` evidence crosses split, the
+status becomes `CROSS_SPLIT_LEAKAGE`. Strict validation rejects both failure
+statuses. The audit never merges merely because EVENT_ID values are adjacent
+or peak values happen to be equal at different times.
+
+The current repository does not contain the authoritative upstream event
+builder named by `metadata/source_manifest.json`. Consequently the audit
+reports provisional connected-component counts but does not rewrite EVENT_ID,
+split, sample, normalization, or checkpoint artifacts. Those must be rebuilt
+together by the upstream data pipeline.
+
 ## Delta-Z baseline (no future leakage)
 
 For every retained Z forecast point, the baseline is the latest valid observed
@@ -58,6 +82,27 @@ Both values use the same known-at-issue baseline:
 No target-period observation is used to shift or calibrate a prediction. The
 baseline timestamp is asserted not to exceed `FORECAST_TIME`.
 
+## Water-level datum and range QC
+
+`qc/water_level_station_audit.csv` uses unique target timestamps rather than
+window-weighted repetitions. For each target station and split it reports the
+physical-unit distribution, station TRAIN range, global TRAIN normalization
+range, out-of-range counts, and consecutive-hour changes. Non-consecutive
+observations are never differenced.
+
+The jump threshold is the station TRAIN Tukey upper outer fence
+`Q3 + 3*IQR` of absolute consecutive-hour changes. Station datum consistency
+is checked across TRAIN events: an event is a reference-shift failure only if
+its entire min/max range lies outside the Tukey outer fences of TRAIN event
+median levels. The table records the exact event IDs; no station is silently
+excluded.
+
+Input Q/Z histories are standardized with TRAIN-only global statistics, but
+formal Q/Z targets and model outputs remain in physical m³/s and metres.
+Trainer loss divides prediction and target errors by TRAIN standard deviation;
+it does not inverse-transform evaluation values. Therefore a station datum
+break is a data problem, not an evaluation rescaling problem.
+
 ## Output files
 
 Best-validation diagnostics are overwritten only when the best checkpoint
@@ -66,7 +111,8 @@ evaluation writes to the explicit `--diagnostics-dir`, or to a deterministic
 directory derived from `--output`/checkpoint.
 
 - `validation_q_by_graph.csv`: Q NSE/KGE/MAE/RMSE/bias/SSE, validity reasons,
-  valid point count, and event count for each `GRAPH_ID`.
+  valid point count, event count, total-SSE fraction, and SSE rank for each
+  `GRAPH_ID`.
 - `validation_q_by_event.csv`: official event provenance, evaluated period,
   peak magnitude/time errors, volume errors, Q regression metrics and SSE.
 - `validation_q_top20_error_events.csv`: event `q_rmse` descending.
@@ -75,7 +121,8 @@ directory derived from `--output`/checkpoint.
 - `validation_z_by_station.csv`: absolute Z metrics by target station.
 - `validation_delta_z_by_station.csv`: causal delta-Z metrics by target station.
 - `validation_diagnostics_summary.json`: SSE concentration, worst/median graph
-  Q, median station Z, overall delta-Z, point counts, and exact rules.
+  Q, positive-NSE graph fraction, top-1/3/5 graph SSE fractions, station Z and
+  delta-Z p25/median/p75, overall delta-Z, point counts, and exact rules.
 
 NSE is `NaN` for no observations, fewer than two usable points, or zero observed
 variance. KGE is additionally `NaN` for zero prediction variance or zero
@@ -87,3 +134,8 @@ Per-epoch training CSVs receive only compact appended summary fields such as
 `val_z_station_nse_median`, `val_z_station_kge_median`,
 `val_delta_z_mae`, and `val_delta_z_station_nse_median`. Existing columns,
 including H1-H6 and sample peak/timing/volume metrics, are unchanged.
+
+Pooled absolute-Z metrics remain available for compatibility, but they mix
+between-station datum differences with within-station flood variation. They
+must not be the sole multi-station water-level conclusion. Report the full
+station table and station distribution summaries together with causal delta-Z.
