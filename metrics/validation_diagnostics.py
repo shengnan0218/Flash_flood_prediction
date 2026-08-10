@@ -35,6 +35,11 @@ DELTA_Z_BASELINE_RULE = (
     "level at the target station within that sample's history window, never later "
     "than FORECAST_TIME, from both observation and prediction."
 )
+Z_SLOPE_RULE = (
+    "Use the exact training first-difference contract: forecast hour 1 subtracts "
+    "the latest valid observed history Z; later hours subtract the preceding "
+    "forecast-hour value, and both adjacent target masks must be valid."
+)
 RELATIVE_Q_MIN_M3_S = 1.0
 HOURLY_VOLUME_SECONDS = 3600.0
 
@@ -60,6 +65,8 @@ class ForecastPoint:
     event_sample_end: str
     baseline_value: float | None = None
     baseline_time: datetime | None = None
+    slope_observed: float | None = None
+    slope_predicted: float | None = None
     candidate_count: int = 1
 
 
@@ -223,6 +230,7 @@ class ValidationDiagnostics:
     q_top20_sse_events: list[dict[str, Any]]
     z_by_station: list[dict[str, Any]]
     delta_z_by_station: list[dict[str, Any]]
+    z_slope_by_station: list[dict[str, Any]]
 
     def write(
         self,
@@ -243,6 +251,7 @@ class ValidationDiagnostics:
             f"{prefix}_q_top20_sse_events.csv": self.q_top20_sse_events,
             f"{prefix}_z_by_station.csv": self.z_by_station,
             f"{prefix}_delta_z_by_station.csv": self.delta_z_by_station,
+            f"{prefix}_z_slope_by_station.csv": self.z_slope_by_station,
         }
         written: dict[str, str] = {}
         for filename, rows in tables.items():
@@ -297,6 +306,10 @@ _EMPTY_TABLE_FIELDS = {
     "delta_z_by_station.csv": [
         "station_id", "delta_z_nse", "delta_z_mae", "delta_z_rmse",
         "delta_z_bias", "valid_count", "event_count",
+    ],
+    "z_slope_by_station.csv": [
+        "station_id", "z_slope_nse", "z_slope_kge", "z_slope_mae",
+        "z_slope_rmse", "z_slope_bias", "valid_count", "event_count",
     ],
 }
 
@@ -406,6 +419,26 @@ class ValidationDiagnosticsAccumulator:
                     baseline_value, baseline_time = (
                         baseline if baseline is not None else (None, None)
                     )
+                    slope_observed: float | None = None
+                    slope_predicted: float | None = None
+                    if horizon == 0 and baseline_value is not None:
+                        slope_observed = float(
+                            z_target[sample_index, horizon, node_index]
+                        ) - float(baseline_value)
+                        slope_predicted = float(
+                            z_prediction[sample_index, horizon, node_index]
+                        ) - float(baseline_value)
+                    elif horizon > 0 and bool(
+                        z_mask[sample_index, horizon - 1, node_index]
+                    ):
+                        slope_observed = float(
+                            z_target[sample_index, horizon, node_index]
+                            - z_target[sample_index, horizon - 1, node_index]
+                        )
+                        slope_predicted = float(
+                            z_prediction[sample_index, horizon, node_index]
+                            - z_prediction[sample_index, horizon - 1, node_index]
+                        )
                     self.z_points.append(
                         ForecastPoint(
                             variable="Z",
@@ -413,6 +446,8 @@ class ValidationDiagnosticsAccumulator:
                             predicted=float(z_prediction[sample_index, horizon, node_index]),
                             baseline_value=baseline_value,
                             baseline_time=baseline_time,
+                            slope_observed=slope_observed,
+                            slope_predicted=slope_predicted,
                             **common,
                         )
                     )
@@ -424,6 +459,7 @@ class ValidationDiagnosticsAccumulator:
         q_by_graph = self._q_graph_rows(q_unique)
         z_by_station = self._z_station_rows(z_unique, delta=False)
         delta_by_station = self._z_station_rows(z_unique, delta=True)
+        z_slope_by_station = self._z_slope_station_rows(z_unique)
         q_total_sse = sum(float(row["q_sse"]) for row in q_by_event)
         graph_sse_order = sorted(
             q_by_graph,
@@ -476,6 +512,14 @@ class ValidationDiagnosticsAccumulator:
         summary_metrics: dict[str, float | int] = {
             "q_graph_nse_median": _quantile((row["q_nse"] for row in q_by_graph), 0.5),
             "q_graph_kge_median": _quantile((row["q_kge"] for row in q_by_graph), 0.5),
+            "q_event_absolute_relative_peak_error_median": _quantile(
+                (abs(float(row["relative_peak_error"])) for row in q_by_event),
+                0.5,
+            ),
+            "q_event_absolute_relative_volume_error_median": _quantile(
+                (abs(float(row["relative_volume_error"])) for row in q_by_event),
+                0.5,
+            ),
             "z_station_nse_median": _quantile((row["z_nse"] for row in z_by_station), 0.5),
             "z_station_kge_median": _quantile((row["z_kge"] for row in z_by_station), 0.5),
             "z_station_mae_median": _quantile((row["z_mae"] for row in z_by_station), 0.5),
@@ -507,6 +551,16 @@ class ValidationDiagnosticsAccumulator:
                 math.isfinite(float(row["delta_z_nse"]))
                 for row in delta_by_station
             ),
+            "z_slope_station_mae_median": _quantile(
+                (row["z_slope_mae"] for row in z_slope_by_station), 0.5
+            ),
+            "z_slope_station_rmse_median": _quantile(
+                (row["z_slope_rmse"] for row in z_slope_by_station), 0.5
+            ),
+            "z_slope_station_bias_median": _quantile(
+                (row["z_slope_bias"] for row in z_slope_by_station), 0.5
+            ),
+            "z_slope_station_valid_count": len(z_slope_by_station),
         }
         raw_q_sums = _regression_sums_from_values(
             (point.predicted for point in self.q_points),
@@ -515,6 +569,7 @@ class ValidationDiagnosticsAccumulator:
         summary = {
             "deduplication_rule": DEDUPLICATION_RULE,
             "delta_z_baseline_rule": DELTA_Z_BASELINE_RULE,
+            "z_slope_rule": Z_SLOPE_RULE,
             "relative_q_denominator_rule": (
                 f"Relative peak/volume error is defined only when observed peak "
                 f"or mean valid discharge is >= {RELATIVE_Q_MIN_M3_S:g} m3/s."
@@ -545,6 +600,13 @@ class ValidationDiagnosticsAccumulator:
                 "mae": self._quartiles(delta_by_station, "delta_z_mae"),
                 "rmse": self._quartiles(delta_by_station, "delta_z_rmse"),
                 "bias": self._quartiles(delta_by_station, "delta_z_bias"),
+            },
+            "z_slope_station_metrics": {
+                "nse": self._quartiles(z_slope_by_station, "z_slope_nse"),
+                "kge": self._quartiles(z_slope_by_station, "z_slope_kge"),
+                "mae": self._quartiles(z_slope_by_station, "z_slope_mae"),
+                "rmse": self._quartiles(z_slope_by_station, "z_slope_rmse"),
+                "bias": self._quartiles(z_slope_by_station, "z_slope_bias"),
             },
             "pooled_absolute_z_interpretation": (
                 "Pooled absolute-Z NSE/KGE mixes station datum differences and must not "
@@ -589,6 +651,7 @@ class ValidationDiagnosticsAccumulator:
                 "q_graphs": len(q_by_graph),
                 "z_stations": len(z_by_station),
                 "delta_z_stations": len(delta_by_station),
+                "z_slope_stations": len(z_slope_by_station),
                 "z_unique_event_time_points": len(z_unique),
                 "delta_z_valid_points": len(delta_points),
             },
@@ -602,6 +665,7 @@ class ValidationDiagnosticsAccumulator:
             q_top20_sse,
             z_by_station,
             delta_by_station,
+            z_slope_by_station,
         )
 
     @staticmethod
@@ -787,4 +851,43 @@ class ValidationDiagnosticsAccumulator:
                 row["skipped_missing_baseline_count"] = len(station_points) - len(usable)
                 row["baseline_rule"] = "latest_valid_history_z_at_or_before_forecast_time"
             rows.append(row)
+        return rows
+
+    def _z_slope_station_rows(
+        self, points: list[ForecastPoint]
+    ) -> list[dict[str, Any]]:
+        """Report station-level true first-difference Z metrics."""
+
+        rows: list[dict[str, Any]] = []
+        grouped = _group_points(points, lambda point: point.station_id)
+        for station_id, station_points in sorted(grouped.items()):
+            usable = [
+                point
+                for point in station_points
+                if point.slope_observed is not None
+                and point.slope_predicted is not None
+            ]
+            if not usable:
+                continue
+            sums = _regression_sums_from_values(
+                (float(point.slope_predicted) for point in usable),
+                (float(point.slope_observed) for point in usable),
+            )
+            rows.append(
+                {
+                    "station_id": station_id,
+                    "graph_ids": ";".join(
+                        sorted({point.graph_id for point in usable})
+                    ),
+                    **_metric_fields(sums, "z_slope"),
+                    "valid_count": int(sums["count"]),
+                    "event_count": len({point.event_id for point in usable}),
+                    "skipped_invalid_difference_count": len(station_points)
+                    - len(usable),
+                    "aggregation_rule": (
+                        "shortest_lead_unique_event_station_target_time"
+                    ),
+                    "slope_rule": "causal_forecast_first_difference",
+                }
+            )
         return rows

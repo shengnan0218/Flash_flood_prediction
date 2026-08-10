@@ -11,15 +11,15 @@ import time
 import warnings
 from collections.abc import Iterable, Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import torch
 
 from data.device import device_report
+from losses import FloodMultitaskLoss
 from metrics.flood_metrics import (
     hydrograph_sample_sums,
     horizon_metric_stats,
-    masked_huber_stats,
     masked_regression_sums,
     regression_metrics,
     valid_target_count,
@@ -28,6 +28,7 @@ from metrics.validation_diagnostics import (
     ValidationDiagnostics,
     ValidationDiagnosticsAccumulator,
 )
+from metrics.validation_selection import validation_selection_score
 
 
 _REGRESSION_SUM_FIELDS = (
@@ -201,6 +202,7 @@ class Trainer:
         self.optimizer = torch.optim.AdamW(
             trainable, lr=opt["lr"], weight_decay=opt["weight_decay"]
         )
+        self.loss_engine = FloodMultitaskLoss(cfg)
         self.amp = bool(cfg["amp"] and device.type == "cuda")
         # torch.amp.GradScaler was not exported until PyTorch 2.3.  Keep the
         # supported >=2.2 environment usable without changing checkpoint format.
@@ -208,104 +210,69 @@ class Trainer:
             self.scaler = torch.amp.GradScaler("cuda", enabled=self.amp)
         else:  # pragma: no cover - exercised only by older supported PyTorch
             self.scaler = torch.cuda.amp.GradScaler(enabled=self.amp)
-        self.best = float("inf")
+        self.selection_mode = str(
+            cfg.get("validation_selection", {}).get("mode", "val_loss")
+        )
+        if self.selection_mode not in {"val_loss", "composite"}:
+            raise ValueError(
+                "validation_selection.mode必须是val_loss/composite，"
+                f"实际={self.selection_mode!r}"
+            )
+        self.best = (
+            float("-inf") if self.selection_mode == "composite" else float("inf")
+        )
         self.start_epoch = 0
         self.stale = 0
         self.last_epoch = -1
         self.last_metrics: dict[str, float | int] = {}
         self._train_loader_rng_state: torch.Tensor | None = None
 
-    def _loss_sums(
-        self, out: dict[str, Any], batch: Any
-    ) -> tuple[torch.Tensor, int, torch.Tensor, int]:
-        runtime_scales = self.cfg.get("_runtime", {}).get("loss_scales", {})
-        q_scale = float(runtime_scales.get("discharge", 1.0))
-        z_scale = float(runtime_scales.get("water_level", 1.0))
-        if (
-            not math.isfinite(q_scale)
-            or not math.isfinite(z_scale)
-            or q_scale <= 0
-            or z_scale <= 0
-        ):
+    @property
+    def selection_metric_name(self) -> str:
+        return (
+            "validation_selection_score"
+            if self.selection_mode == "composite"
+            else "val_loss"
+        )
+
+    @property
+    def selection_direction(self) -> str:
+        return "maximize" if self.selection_mode == "composite" else "minimize"
+
+    def _selection_report(
+        self,
+        row: dict[str, float | int],
+        validation_summary: dict[str, float | int],
+    ) -> dict[str, float]:
+        if self.selection_mode == "val_loss":
+            value = float(row.get("val_loss", row["loss"]))
+            if not math.isfinite(value):
+                raise FloatingPointError("val_loss早停指标出现NaN/Inf")
+            return {}
+        if not validation_summary:
             raise ValueError(
-                "TRAIN目标标准差必须为有限正数，"
-                f"实际discharge={q_scale}, water_level={z_scale}"
+                "composite selection要求正式VALIDATION diagnostics，不能在无诊断时回退val_loss"
             )
-        q_sum, q_count = masked_huber_stats(
-            out["q"] / q_scale,
-            batch.q_target / q_scale,
-            batch.q_target_mask,
+        return validation_selection_score(
+            validation_summary,
+            self.cfg.get("_runtime", {}).get("loss_scales", {}),
+            self.cfg["validation_selection"],
         )
-        z_sum, z_count = masked_huber_stats(
-            out["z"] / z_scale,
-            batch.z_target / z_scale,
-            batch.z_target_mask,
-        )
-        return q_sum, q_count, z_sum, z_count
-
-    def _loss_weights(self) -> tuple[float, float]:
-        values = (
-            float(self.cfg["loss_weights"]["discharge"]),
-            float(self.cfg["loss_weights"]["water_level"]),
-        )
-        if any(not math.isfinite(value) or value < 0 for value in values):
-            raise ValueError(f"loss_weights必须是有限非负数，实际为{values}")
-        return values
-
-    def _weighted_loss(
-        self,
-        q_sum: torch.Tensor,
-        q_count: int,
-        z_sum: torch.Tensor,
-        z_count: int,
-    ) -> torch.Tensor:
-        if q_count + z_count == 0:
-            raise ValueError("当前batch没有任何有效Q/Z监督目标")
-        q_weight, z_weight = self._loss_weights()
-        loss = (q_sum + z_sum) * 0.0
-        if q_count:
-            loss = loss + q_weight * q_sum / q_count
-        if z_count:
-            loss = loss + z_weight * z_sum / z_count
-        return loss
-
-    def _reported_losses(
-        self,
-        q_sum: float,
-        q_count: int,
-        z_sum: float,
-        z_count: int,
-    ) -> dict[str, float | int]:
-        if q_count + z_count == 0:
-            raise ValueError("数据中没有任何有效Q/Z监督目标")
-        q_loss = q_sum / q_count if q_count else float("nan")
-        z_loss = z_sum / z_count if z_count else float("nan")
-        q_weight, z_weight = self._loss_weights()
-        total = 0.0
-        if q_count:
-            total += q_weight * q_loss
-        if z_count:
-            total += z_weight * z_loss
-        return {
-            "loss": total,
-            "q_loss": q_loss,
-            "z_loss": z_loss,
-            "q_valid_count": q_count,
-            "z_valid_count": z_count,
-        }
 
     def _loss(
         self, out: dict[str, Any], batch: Any
     ) -> tuple[torch.Tensor, dict[str, float | int]]:
         """Backwards-compatible per-batch mean loss helper."""
 
-        q_sum, q_count, z_sum, z_count = self._loss_sums(out, batch)
-        loss = self._weighted_loss(q_sum, q_count, z_sum, z_count)
-        parts = self._reported_losses(
-            float(q_sum.detach().item()),
-            q_count,
-            float(z_sum.detach().item()),
-            z_count,
+        statistics = self.loss_engine.batch_statistics(out, batch)
+        loss = self.loss_engine.combine(statistics)
+        parts = self.loss_engine.report(
+            {
+                name: (float(term.numerator.detach().item()), term.denominator)
+                for name, term in statistics.items()
+            },
+            q_valid_count=valid_target_count(batch.q_target, batch.q_target_mask),
+            z_valid_count=valid_target_count(batch.z_target, batch.z_target_mask),
         )
         parts.pop("loss")
         return loss, parts
@@ -348,10 +315,9 @@ class Trainer:
         if accumulation < 1:
             raise ValueError("gradient_accumulation_steps必须>=1")
 
-        q_total = 0.0
-        z_total = 0.0
-        q_count_total = 0
-        z_count_total = 0
+        loss_totals = {name: [0.0, 0] for name in self.loss_engine.coefficients()}
+        q_valid_total = 0
+        z_valid_total = 0
         batch_times: list[float] = []
         explicit_equivalent_substeps: list[float] = []
         batch_count = 0
@@ -360,17 +326,15 @@ class Trainer:
             # Knowing the complete group's denominators before forward passes
             # makes accumulation exactly valid-element weighted and also gives a
             # short final group the correct (not 1/accumulation) scale.
-            q_group_count = sum(
-                valid_target_count(batch.q_target, batch.q_target_mask)
-                for batch in group
-            )
-            z_group_count = sum(
-                valid_target_count(batch.z_target, batch.z_target_mask)
-                for batch in group
-            )
-            if q_group_count + z_group_count == 0:
+            batch_denominators = [
+                self.loss_engine.denominators(batch) for batch in group
+            ]
+            group_denominators = {
+                name: sum(values[name] for values in batch_denominators)
+                for name in self.loss_engine.coefficients()
+            }
+            if not any(group_denominators.values()):
                 raise ValueError("一个梯度累积组内没有任何有效Q/Z监督目标")
-            q_weight, z_weight = self._loss_weights()
 
             try:
                 for batch in group:
@@ -382,24 +346,23 @@ class Trainer:
                         enabled=self.amp,
                     ):
                         out = self.model(batch)
-                        q_sum, q_count, z_sum, z_count = self._loss_sums(out, batch)
-                        contribution = (q_sum + z_sum) * 0.0
-                        if q_group_count:
-                            contribution = (
-                                contribution + q_weight * q_sum / q_group_count
-                            )
-                        if z_group_count:
-                            contribution = (
-                                contribution + z_weight * z_sum / z_group_count
-                            )
+                        statistics = self.loss_engine.batch_statistics(out, batch)
+                        contribution = self.loss_engine.combine(
+                            statistics, group_denominators
+                        )
                     if not torch.isfinite(contribution.detach()).all():
                         raise FloatingPointError("训练损失出现NaN/Inf")
                     self.scaler.scale(contribution).backward()
 
-                    q_total += float(q_sum.detach().item())
-                    z_total += float(z_sum.detach().item())
-                    q_count_total += q_count
-                    z_count_total += z_count
+                    for name, term in statistics.items():
+                        loss_totals[name][0] += float(term.numerator.detach().item())
+                        loss_totals[name][1] += term.denominator
+                    q_valid_total += valid_target_count(
+                        batch.q_target, batch.q_target_mask
+                    )
+                    z_valid_total += valid_target_count(
+                        batch.z_target, batch.z_target_mask
+                    )
                     batch_count += 1
                     batch_times.append(time.perf_counter() - tick)
                     diagnostic = out.get("diagnostics", {}).get(
@@ -424,8 +387,10 @@ class Trainer:
 
         if batch_count == 0:
             raise ValueError("训练DataLoader为空（或debug_max_batches=0）")
-        result = self._reported_losses(
-            q_total, q_count_total, z_total, z_count_total
+        result = self.loss_engine.report(
+            {name: (float(value), int(count)) for name, (value, count) in loss_totals.items()},
+            q_valid_count=q_valid_total,
+            z_valid_count=z_valid_total,
         )
         result.update(
             {
@@ -469,10 +434,9 @@ class Trainer:
             if collect_validation_diagnostics
             else None
         )
-        q_total = 0.0
-        z_total = 0.0
-        q_count_total = 0
-        z_count_total = 0
+        loss_totals = {name: [0.0, 0] for name in self.loss_engine.coefficients()}
+        q_valid_total = 0
+        z_valid_total = 0
         metric_totals: dict[str, list[float | int]] = {}
         regression_totals = {
             prefix: _empty_regression_sums() for prefix in ("q", "z")
@@ -495,11 +459,12 @@ class Trainer:
         for batch in loader:
             batch = batch.to(self.device)
             out = self.model(batch)
-            q_sum, q_count, z_sum, z_count = self._loss_sums(out, batch)
-            q_total += float(q_sum.item())
-            z_total += float(z_sum.item())
-            q_count_total += q_count
-            z_count_total += z_count
+            statistics = self.loss_engine.batch_statistics(out, batch)
+            for name, term in statistics.items():
+                loss_totals[name][0] += float(term.numerator.item())
+                loss_totals[name][1] += term.denominator
+            q_valid_total += valid_target_count(batch.q_target, batch.q_target_mask)
+            z_valid_total += valid_target_count(batch.z_target, batch.z_target_mask)
             batch_count += 1
             if diagnostic_accumulator is not None:
                 diagnostic_accumulator.add_batch(batch, out)
@@ -575,8 +540,10 @@ class Trainer:
 
         if batch_count == 0:
             raise ValueError("评估DataLoader为空")
-        result = self._reported_losses(
-            q_total, q_count_total, z_total, z_count_total
+        result = self.loss_engine.report(
+            {name: (float(value), int(count)) for name, (value, count) in loss_totals.items()},
+            q_valid_count=q_valid_total,
+            z_valid_count=z_valid_total,
         )
         result.update(
             {
@@ -781,13 +748,15 @@ class Trainer:
         self.last_epoch = int(epoch)
         self.last_metrics = dict(metrics)
         payload = {
-            "format_version": 2,
+            "format_version": 3,
             "checkpoint_kind": kind,
             "model": self.model.state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "scaler": self.scaler.state_dict(),
             "epoch": self.last_epoch,
             "best": self.best,
+            "selection_metric": self.selection_metric_name,
+            "selection_direction": self.selection_direction,
             "stale": self.stale,
             "last_epoch": self.last_epoch,
             "last_metrics": self.last_metrics,
@@ -889,8 +858,24 @@ class Trainer:
         self.start_epoch = self.last_epoch + 1
         metrics = checkpoint.get("last_metrics", checkpoint.get("metrics", {}))
         self.last_metrics = dict(metrics) if isinstance(metrics, dict) else {}
+        saved_metric = checkpoint.get("selection_metric")
+        saved_direction = checkpoint.get("selection_direction")
+        if saved_metric is not None and saved_metric != self.selection_metric_name:
+            raise ValueError(
+                "checkpoint选择指标与当前配置不一致: "
+                f"saved={saved_metric}, current={self.selection_metric_name}"
+            )
+        if saved_direction is not None and saved_direction != self.selection_direction:
+            raise ValueError(
+                "checkpoint选择方向与当前配置不一致: "
+                f"saved={saved_direction}, current={self.selection_direction}"
+            )
+        default_best = (
+            float("-inf") if self.selection_mode == "composite" else float("inf")
+        )
         fallback_best = self.last_metrics.get(
-            "val_loss", self.last_metrics.get("loss", float("inf"))
+            self.selection_metric_name,
+            self.last_metrics.get("loss", default_best),
         )
         self.best = float(checkpoint.get("best", fallback_best))
         self.stale = int(checkpoint.get("stale", 0))
@@ -929,6 +914,7 @@ class Trainer:
         val_loader: Iterable[Any] | None = None,
         *,
         overwrite: bool = False,
+        epoch_callback: Callable[[int, dict[str, float | int]], None] | None = None,
     ) -> list[dict[str, float | int]]:
         history: list[dict[str, float | int]] = []
         log = Path(self.cfg["training"]["log_csv"])
@@ -992,9 +978,12 @@ class Trainer:
                 row.update(
                     {f"val_{key}": value for key, value in validation_metrics.items()}
                 )
-            score = float(row.get("val_loss", row["loss"]))
+            row.update(self._selection_report(row, validation_summary))
+            score = float(row.get(self.selection_metric_name, row["loss"]))
             if not math.isfinite(score):
-                raise FloatingPointError("早停指标出现NaN/Inf")
+                raise FloatingPointError(
+                    f"{self.selection_metric_name}早停指标出现NaN/Inf"
+                )
             peak = (
                 torch.cuda.max_memory_allocated(self.device)
                 if self.device.type == "cuda"
@@ -1008,8 +997,14 @@ class Trainer:
             history.append(row)
             print(row)
             _append_csv_row(log, row)
+            if epoch_callback is not None:
+                epoch_callback(epoch, row)
 
-            improved = score < self.best
+            improved = (
+                score > self.best
+                if self.selection_direction == "maximize"
+                else score < self.best
+            )
             if improved:
                 self.best = score
                 self.stale = 0
@@ -1033,7 +1028,7 @@ class Trainer:
                         context={
                             "epoch": epoch,
                             "checkpoint": str(checkpoint_path.resolve()),
-                            "selection_metric": "val_loss",
+                            "selection_metric": self.selection_metric_name,
                             "selection_metric_value": score,
                         },
                     )

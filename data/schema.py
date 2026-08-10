@@ -52,6 +52,9 @@ class GraphEventBatch:
     event_peak_time: str | tuple[str, ...] | None = None
     event_sample_start: str | tuple[str, ...] | None = None
     event_sample_end: str | tuple[str, ...] | None = None
+    # TRAIN-only graph -> event -> window balancing weight.  This is consumed
+    # by the discharge loss and never enters model.forward computations.
+    sample_weight: Tensor | None = None
 
     def to(self, device: torch.device) -> "GraphEventBatch":
         return GraphEventBatch(
@@ -179,6 +182,12 @@ def validate_batch(x: GraphEventBatch, expected: dict[str, int] | None = None) -
             raise ValueError("node_area_km2必须全部为有限正数（单位km²）")
     if x.station_ids is not None and len(x.station_ids) != nodes:
         raise ValueError("station_ids数量必须与节点数一致")
+    if x.sample_weight is not None:
+        _require_shape("sample_weight", tuple(x.sample_weight.shape), (batch_size,))
+        if not torch.is_floating_point(x.sample_weight):
+            raise ValueError("sample_weight必须是浮点Tensor")
+        if not torch.isfinite(x.sample_weight).all() or (x.sample_weight <= 0).any():
+            raise ValueError("sample_weight必须全部为有限正数")
 
     if x.node_mask is not None:
         _require_bool("node_mask", x.node_mask)

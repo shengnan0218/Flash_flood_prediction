@@ -58,7 +58,20 @@ def _runtime_config(
     dataset_root: str | Path | None = None,
     graph_id: str | None = None,
 ) -> dict[str, Any]:
-    cfg = deepcopy(load_config(config_path))
+    return _runtime_config_from_mapping(
+        load_config(config_path), dataset_root=dataset_root, graph_id=graph_id
+    )
+
+
+def _runtime_config_from_mapping(
+    source: dict[str, Any],
+    *,
+    dataset_root: str | Path | None = None,
+    graph_id: str | None = None,
+) -> dict[str, Any]:
+    """Resolve one already-validated config without writing a temporary YAML."""
+
+    cfg = deepcopy(source)
     if dataset_root is not None:
         root = Path(dataset_root).expanduser()
         cfg["data"]["dataset_root"] = str(root.resolve())
@@ -289,6 +302,40 @@ def setup_training(
 ) -> tuple[dict[str, Any], HybridFloodModel, Any, Any, torch.device]:
     """Build independent TRAIN and VALIDATION loaders plus one model."""
     cfg = _runtime_config(config_path, dataset_root, graph_id)
+    seed_everything(cfg["seed"])
+    dynamic_cache: dict = {}
+    train_loader = _make_loader(
+        cfg, cfg["data"]["train_split"], shuffle=True, dynamic_cache=dynamic_cache
+    )
+    validation_loader = _make_loader(
+        cfg,
+        cfg["data"]["validation_split"],
+        shuffle=False,
+        dynamic_cache=dynamic_cache,
+    )
+    _ensure_matching_graph(train_loader, validation_loader)
+    nodes = _dataset_nodes(train_loader)
+    if _dataset_nodes(validation_loader) != nodes:
+        raise ValueError("TRAIN 与 VALIDATION 的节点数不一致")
+    cfg["_runtime"] = _runtime_metadata(train_loader, cfg["data"]["mode"])
+    model = HybridFloodModel(cfg, nodes)
+    device = resolve_device(cfg["device"], cfg["gpu_id"])
+    return cfg, model, train_loader, validation_loader, device
+
+
+def setup_training_from_config(
+    source: dict[str, Any],
+    *,
+    dataset_root: str | Path | None = None,
+    graph_id: str | None = None,
+) -> tuple[dict[str, Any], HybridFloodModel, Any, Any, torch.device]:
+    """Build TRAIN/VALIDATION only from an in-memory HPO trial config."""
+
+    cfg = _runtime_config_from_mapping(
+        validate_config(deepcopy(source)),
+        dataset_root=dataset_root,
+        graph_id=graph_id,
+    )
     seed_everything(cfg["seed"])
     dynamic_cache: dict = {}
     train_loader = _make_loader(

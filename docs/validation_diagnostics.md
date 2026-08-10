@@ -4,7 +4,8 @@
 
 This diagnostic layer is evaluation-only. It does not change model forward,
 loss/backpropagation, Q:Z weights, optimizer, data split, event construction,
-physics, or checkpoint selection.
+or physics. Legacy configs only report it; the explicit multitask config uses
+its compact robust summaries to compute checkpoint selection.
 
 The authoritative mapping is:
 
@@ -120,6 +121,8 @@ directory derived from `--output`/checkpoint.
   and cumulative fractions of total deduplicated event SSE.
 - `validation_z_by_station.csv`: absolute Z metrics by target station.
 - `validation_delta_z_by_station.csv`: causal delta-Z metrics by target station.
+- `validation_z_slope_by_station.csv`: 与训练完全同定义的 causal first-difference
+  Z MAE/RMSE/bias/NSE/KGE；它与 baseline-relative delta-Z 明确分开。
 - `validation_diagnostics_summary.json`: SSE concentration, worst/median graph
   Q, positive-NSE graph fraction, top-1/3/5 graph SSE fractions, station Z and
   delta-Z p25/median/p75, overall delta-Z, point counts, and exact rules.
@@ -134,6 +137,9 @@ Per-epoch training CSVs receive only compact appended summary fields such as
 `val_z_station_nse_median`, `val_z_station_kge_median`,
 `val_delta_z_mae`, and `val_delta_z_station_nse_median`. Existing columns,
 including H1-H6 and sample peak/timing/volume metrics, are unchanged.
+
+多目标配置还记录 `val_z_slope_station_mae_median` 及六个 bounded selection
+components。完整 selection 公式见 `multitask_training_and_hpo.md`。
 
 Pooled absolute-Z metrics remain available for compatibility, but they mix
 between-station datum differences with within-station flood variation. They

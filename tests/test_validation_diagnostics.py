@@ -36,6 +36,8 @@ def point(
     sample: str | None = None,
     variable: str = "Q",
     baseline: float | None = None,
+    slope_observed: float | None = None,
+    slope_predicted: float | None = None,
 ) -> ForecastPoint:
     target_time = START + timedelta(hours=hour)
     forecast_time = target_time - timedelta(hours=lead)
@@ -59,6 +61,8 @@ def point(
         event_sample_end="2024-06-02 00:00:00",
         baseline_value=baseline,
         baseline_time=forecast_time if baseline is not None else None,
+        slope_observed=slope_observed,
+        slope_predicted=slope_predicted,
     )
 
 
@@ -142,14 +146,17 @@ class TestValidationDiagnostics(unittest.TestCase):
             point(
                 graph="G1", event="E1", station="ZS", hour=1,
                 observed=101, predicted=100.5, variable="Z", baseline=100,
+                slope_observed=1, slope_predicted=0.5,
             ),
             point(
                 graph="G1", event="E1", station="ZS", hour=2,
                 observed=103, predicted=102, variable="Z", baseline=101,
+                slope_observed=2, slope_predicted=1,
             ),
             point(
                 graph="G1", event="E1", station="ZS", hour=3,
                 observed=102, predicted=102.5, variable="Z", baseline=101.5,
+                slope_observed=0.5, slope_predicted=1,
             ),
         ]
         diagnostics = accumulator.finalize()
@@ -157,6 +164,11 @@ class TestValidationDiagnostics(unittest.TestCase):
         self.assertEqual(len(diagnostics.z_by_station), 1)
         self.assertEqual(diagnostics.z_by_station[0]["station_id"], "ZS")
         self.assertEqual(len(diagnostics.delta_z_by_station), 1)
+        self.assertEqual(len(diagnostics.z_slope_by_station), 1)
+        self.assertAlmostEqual(
+            diagnostics.summary_metrics["z_slope_station_mae_median"],
+            (0.5 + 1.0 + 0.5) / 3,
+        )
         self.assertEqual(
             diagnostics.summary["z_station_metrics"]["mae"]["station_count"], 1
         )
@@ -231,6 +243,7 @@ class TestValidationDiagnostics(unittest.TestCase):
                 "validation_q_top20_sse_events.csv",
                 "validation_z_by_station.csv",
                 "validation_delta_z_by_station.csv",
+                "validation_z_slope_by_station.csv",
                 "validation_diagnostics_summary.json",
             }
             self.assertEqual(set(written), expected)

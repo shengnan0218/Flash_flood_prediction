@@ -8,6 +8,7 @@ graph, so static tensors never get silently mixed across catchments.
 from __future__ import annotations
 
 import csv
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
@@ -191,6 +192,58 @@ class _DynamicGraph:
     rainfall_mask: torch.Tensor
     flow_mask: torch.Tensor
     water_level_mask: torch.Tensor
+
+
+def event_graph_balancing_weights(
+    graph_ids: Sequence[str], event_ids: Sequence[str]
+) -> tuple[float, ...]:
+    """Return mean-one graph/event/window balancing weights.
+
+    The unnormalised weight for a sample from event ``e`` in graph ``g`` is
+
+    ``1 / (N_graphs * N_events_in_graph[g] * N_samples_in_event[g, e])``.
+
+    Consequently every graph has equal total mass, every event within one
+    graph has equal total mass, and additional sliding windows only divide an
+    event's fixed mass.  Multiplication by the number of samples makes the
+    returned TRAIN mean exactly one without changing those ratios.
+    """
+
+    if len(graph_ids) != len(event_ids) or not graph_ids:
+        raise ValueError("graph_ids/event_ids必须等长且非空")
+    if any(not isinstance(value, str) or not value.strip() for value in graph_ids):
+        raise ValueError("graph_ids必须全部为非空字符串")
+    if any(not isinstance(value, str) or not value.strip() for value in event_ids):
+        raise ValueError("event_ids必须全部为非空字符串")
+    event_graphs: dict[str, set[str]] = {}
+    for graph_id, event_id in zip(graph_ids, event_ids):
+        event_graphs.setdefault(event_id, set()).add(graph_id)
+    conflicts = {
+        event_id: sorted(graphs)
+        for event_id, graphs in event_graphs.items()
+        if len(graphs) != 1
+    }
+    if conflicts:
+        raise ValueError(f"EVENT_ID跨越多个GRAPH_ID: {conflicts}")
+    graph_events: dict[str, set[str]] = {}
+    event_samples = Counter(zip(graph_ids, event_ids))
+    for graph_id, event_id in zip(graph_ids, event_ids):
+        graph_events.setdefault(graph_id, set()).add(event_id)
+    graph_count = len(graph_events)
+    sample_count = len(graph_ids)
+    weights = tuple(
+        sample_count
+        / (
+            graph_count
+            * len(graph_events[graph_id])
+            * event_samples[(graph_id, event_id)]
+        )
+        for graph_id, event_id in zip(graph_ids, event_ids)
+    )
+    mean = sum(weights) / sample_count
+    if not math.isclose(mean, 1.0, rel_tol=1.0e-12, abs_tol=1.0e-12):
+        raise AssertionError(f"sample weight归一化失败，mean={mean}")
+    return weights
 
 
 def _read_csv(path: Path, required: Sequence[str]) -> list[dict[str, str]]:
@@ -419,6 +472,14 @@ class HunanGraphEventDataset(Dataset[GraphEventBatch]):
         event_splits = self._load_splits()
         self.event_split_by_id = dict(event_splits)
         self._samples = self._load_samples(event_splits, history_hours, forecast_hours)
+        self.sample_weights = (
+            event_graph_balancing_weights(
+                [sample.graph_id for sample in self._samples],
+                [sample.event_id for sample in self._samples],
+            )
+            if self.split == "TRAIN"
+            else tuple(1.0 for _ in self._samples)
+        )
         used_graphs = tuple(dict.fromkeys(sample.graph_id for sample in self._samples))
         self.graph_ids = used_graphs
         self.graph_node_counts = {gid: len(self._graphs[gid].nodes) for gid in used_graphs}
@@ -1423,6 +1484,7 @@ class HunanGraphEventDataset(Dataset[GraphEventBatch]):
             event_peak_time=_format_datetime(event.peak_time),
             event_sample_start=_format_datetime(event.sample_start),
             event_sample_end=_format_datetime(event.sample_end),
+            sample_weight=torch.tensor(self.sample_weights[index], dtype=torch.float32),
         )
 
 

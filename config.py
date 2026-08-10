@@ -37,6 +37,9 @@ _ROOT_KEYS = {
     "physical_bounds",
     "solver",
     "loss_weights",
+    "loss",
+    "validation_selection",
+    "hyperparameter_optimization",
     "optimizer",
     "training",
     "transfer_learning",
@@ -274,6 +277,161 @@ def validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
         weights["discharge"] <= 0 or weights["water_level"] <= 0
     ):
         raise ConfigError("target_variable=AUTO/BOTH 时两个 loss weight 都必须大于 0")
+
+    loss = _mapping(
+        cfg,
+        "loss",
+        {
+            "mode",
+            "discharge_weight",
+            "water_level_weight",
+            "q_point_weight",
+            "q_peak_weight",
+            "q_volume_weight",
+            "z_level_weight",
+            "z_slope_weight",
+        },
+    )
+    _enum(loss, "mode", {"legacy", "multitask"})
+    for key in (
+        "discharge_weight",
+        "water_level_weight",
+        "q_point_weight",
+        "q_peak_weight",
+        "q_volume_weight",
+        "z_level_weight",
+        "z_slope_weight",
+    ):
+        _number(loss, key)
+    if loss["mode"] == "multitask":
+        fixed = {
+            "discharge_weight": 2.0,
+            "water_level_weight": 1.0,
+            "q_point_weight": 1.0,
+            "z_level_weight": 1.0,
+        }
+        changed = {
+            key: loss[key]
+            for key, expected in fixed.items()
+            if float(loss[key]) != expected
+        }
+        if changed:
+            raise ConfigError(
+                "multitask固定要求Q:Z=2:1且q_point/z_level权重为1，"
+                f"不符合项={changed}"
+            )
+
+    selection = _mapping(
+        cfg,
+        "validation_selection",
+        {
+            "mode",
+            "q_nse_weight",
+            "q_kge_weight",
+            "q_peak_weight",
+            "q_volume_weight",
+            "z_level_weight",
+            "z_slope_weight",
+            "efficiency_clip_min",
+            "efficiency_clip_max",
+        },
+    )
+    _enum(selection, "mode", {"val_loss", "composite"})
+    selection_weight_names = (
+        "q_nse_weight",
+        "q_kge_weight",
+        "q_peak_weight",
+        "q_volume_weight",
+        "z_level_weight",
+        "z_slope_weight",
+    )
+    for key in selection_weight_names:
+        _number(selection, key)
+    total_selection_weight = sum(float(selection[key]) for key in selection_weight_names)
+    if not math.isclose(total_selection_weight, 1.0, rel_tol=0.0, abs_tol=1.0e-12):
+        raise ConfigError(
+            "validation_selection六项权重之和必须为1，"
+            f"实际={total_selection_weight}"
+        )
+    for key in ("efficiency_clip_min", "efficiency_clip_max"):
+        value = selection[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+            raise ConfigError(f"validation_selection.{key}必须是有限数值")
+    if selection["efficiency_clip_min"] >= selection["efficiency_clip_max"]:
+        raise ConfigError("validation_selection efficiency clip要求min < max")
+    if loss["mode"] == "multitask" and selection["mode"] != "composite":
+        raise ConfigError("multitask loss必须使用composite validation selection")
+
+    hpo = _mapping(
+        cfg,
+        "hyperparameter_optimization",
+        {
+            "enabled",
+            "n_trials",
+            "output_dir",
+            "sampler",
+            "pruner",
+            "search_space",
+        },
+    )
+    _bool(hpo, "enabled")
+    _int(hpo, "n_trials", 1)
+    if not isinstance(hpo["output_dir"], str) or not hpo["output_dir"].strip():
+        raise ConfigError("hyperparameter_optimization.output_dir必须是非空路径")
+    sampler = _mapping(hpo, "sampler", {"name", "seed"})
+    _enum(sampler, "name", {"tpe"})
+    _int(sampler, "seed")
+    pruner = _mapping(
+        hpo,
+        "pruner",
+        {"name", "n_startup_trials", "n_warmup_steps", "interval_steps"},
+    )
+    _enum(pruner, "name", {"median"})
+    _int(pruner, "n_startup_trials")
+    _int(pruner, "n_warmup_steps")
+    _int(pruner, "interval_steps", 1)
+    search_space = _mapping(
+        hpo,
+        "search_space",
+        {
+            "learning_rate",
+            "weight_decay",
+            "hidden_dim",
+            "q_peak_weight",
+            "q_volume_weight",
+            "z_slope_weight",
+        },
+    )
+    for key in (
+        "learning_rate",
+        "weight_decay",
+        "q_peak_weight",
+        "q_volume_weight",
+        "z_slope_weight",
+    ):
+        spec = _mapping(search_space, key, {"type", "low", "high"})
+        _enum(spec, "type", {"log_float"})
+        _number(spec, "low", strictly=True)
+        _number(spec, "high", strictly=True)
+        if spec["low"] >= spec["high"]:
+            raise ConfigError(f"search_space.{key}要求low < high")
+    hidden_space = _mapping(search_space, "hidden_dim", {"type", "choices"})
+    _enum(hidden_space, "type", {"categorical"})
+    choices = hidden_space["choices"]
+    if (
+        not isinstance(choices, list)
+        or not choices
+        or any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in choices)
+        or len(set(choices)) != len(choices)
+    ):
+        raise ConfigError("search_space.hidden_dim.choices必须是不重复的正整数列表")
+    if hpo["enabled"] and (
+        loss["mode"] != "multitask"
+        or selection["mode"] != "composite"
+        or cfg["runoff_mode"] != "water_balance_lstm"
+        or cfg["routing_mode"] != "kinematic_wave_gnn"
+    ):
+        raise ConfigError("HPO仅允许E4 multitask + composite selection配置")
 
     optimizer = _mapping(cfg, "optimizer", {"name", "lr", "weight_decay"})
     _enum(optimizer, "name", {"adamw"})

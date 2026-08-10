@@ -43,6 +43,43 @@ solver:
   minimum_length: 10.0
   seconds_per_step: 3600.0
 loss_weights: {discharge: 2.0, water_level: 1.0}
+loss:
+  # legacy完整保留原始 2*Q Huber + 1*Z Huber；multitask由新配置显式开启。
+  mode: legacy
+  discharge_weight: 2.0
+  water_level_weight: 1.0
+  q_point_weight: 1.0
+  q_peak_weight: 0.25
+  q_volume_weight: 0.25
+  z_level_weight: 1.0
+  z_slope_weight: 0.25
+validation_selection:
+  mode: val_loss
+  q_nse_weight: 0.35
+  q_kge_weight: 0.15
+  q_peak_weight: 0.20
+  q_volume_weight: 0.10
+  z_level_weight: 0.10
+  z_slope_weight: 0.10
+  efficiency_clip_min: -1.0
+  efficiency_clip_max: 1.0
+hyperparameter_optimization:
+  enabled: false
+  n_trials: 40
+  output_dir: outputs/hpo_e4_multitask_v1
+  sampler: {name: tpe, seed: 42}
+  pruner:
+    name: median
+    n_startup_trials: 5
+    n_warmup_steps: 10
+    interval_steps: 1
+  search_space:
+    learning_rate: {type: log_float, low: 1.0e-4, high: 2.0e-3}
+    weight_decay: {type: log_float, low: 1.0e-6, high: 1.0e-3}
+    hidden_dim: {type: categorical, choices: [32, 64, 96]}
+    q_peak_weight: {type: log_float, low: 0.05, high: 1.0}
+    q_volume_weight: {type: log_float, low: 0.05, high: 1.0}
+    z_slope_weight: {type: log_float, low: 0.05, high: 1.0}
 optimizer: {name: adamw, lr: 0.001, weight_decay: 1.0e-5}
 training: {epochs: 5, patience: 5, gradient_clip: 1.0, checkpoint: outputs/best.pt, log_csv: outputs/train.csv}
 transfer_learning:

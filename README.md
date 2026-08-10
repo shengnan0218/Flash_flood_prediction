@@ -312,6 +312,21 @@ python evaluate.py --config configs/hunan_e4.yaml --dataset-root "D:\path\to\_mo
 
 默认配置也指向 `project/_model_dataset`，若数据放在该处可省略 `--dataset-root`。
 
+新版多目标 E4 单次训练使用独立配置和输出，不覆盖旧实验：
+
+```powershell
+python train_hunan.py --config configs/hunan_e4_multitask.yaml --dataset-root "D:\path\to\_model_dataset"
+```
+
+它采用事件—流域平衡 Q point loss、6 h 峰值/洪量 loss、绝对 Z 与真正逐小时
+first-difference Z loss，并以越大越好的综合 VALIDATION score 选择 best/早停。
+准确公式、去重口径和默认权重见
+[docs/multitask_training_and_hpo.md](docs/multitask_training_and_hpo.md)。
+
+Optuna 是独立、显式启用的后续入口；`hyperparameter_optimization.enabled`
+默认是 `false`，普通训练不会启动搜索。本轮不应把 HPO 当作新版单次训练的
+默认下一步。
+
 ## 8. E1–E4 实验
 
 正式配置采用分层继承：`base.yaml` 只保存共享默认值，`hunan_e4.yaml` 在其上覆盖湖南数据契约和 E4 运行参数，E1–E3 再继承 `hunan_e4.yaml` 并仅切换产流/汇流模块。不需要另外的旧 `e1_pure_ai.yaml`–`e4_full_physics.yaml` 文件。
@@ -323,7 +338,11 @@ python evaluate.py --config configs/hunan_e4.yaml --dataset-root "D:\path\to\_mo
 | `configs/hunan_e3_physics_routing.yaml` | Pure LSTM | Kinematic wave |
 | `configs/hunan_e4.yaml` | Water-balance LSTM | Kinematic wave |
 
-四组实验共享完全相同的数据、split、目标、损失、评价和 checkpoint 规则。建议先用 E1 完成数据与 GPU 吞吐检查，再依次运行 E2–E4。
+旧基线四组共享完全相同的数据、split、目标、损失、评价和 checkpoint 规则。
+未来多目标 HPO 只允许在 E4 搜索一次共享参数；得到真实最优结果后，E1–E4
+冻结同一套 loss/权重、hidden dim、lr、weight decay、seed、epoch、早停和
+checkpoint 规则，只切换上表两个 physics mode，禁止分别调参。TEST 不参与
+任何选择或剪枝。
 
 ## 9. 模型与安全约束
 

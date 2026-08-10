@@ -1,0 +1,23 @@
+_base_: hunan_e4.yaml
+
+# 新版多目标训练；旧 hunan_e4.yaml 继续使用原始Huber/val_loss选择。
+loss:
+  mode: multitask
+  discharge_weight: 2.0
+  water_level_weight: 1.0
+  q_point_weight: 1.0
+  q_peak_weight: 0.25
+  q_volume_weight: 0.25
+  z_level_weight: 1.0
+  z_slope_weight: 0.25
+
+validation_selection:
+  mode: composite
+
+training:
+  checkpoint: outputs/hunan_e4_multitask_v1_best.pt
+  log_csv: outputs/hunan_e4_multitask_v1_train.csv
+
+hyperparameter_optimization:
+  enabled: false
+  output_dir: outputs/hpo_e4_multitask_v1
