@@ -14,6 +14,7 @@
       "VALIDATION": 120,
       "TEST": 116
     },
+    "provisional_split_count_note": "These counts only collapse same-split duplicate components under the existing assignments. They are not the official post-rebuild split; the deterministic split strategy must be rerun on merged real events.",
     "overlapping_event_pair_count": 26,
     "must_merge_pair_count": 15,
     "cross_split_leakage_pair_count": 0,

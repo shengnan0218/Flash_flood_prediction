@@ -444,6 +444,11 @@ def _event_overlap_audit(
         ),
         "event_split_counts_before": split_counts,
         "event_split_counts_after_provisional_merge": projected_split_counts,
+        "provisional_split_count_note": (
+            "These counts only collapse same-split duplicate components under the "
+            "existing assignments. They are not the official post-rebuild split; "
+            "the deterministic split strategy must be rerun on merged real events."
+        ),
         "overlapping_event_pair_count": int((frame["overlap_hours"] > 0).sum()),
         "must_merge_pair_count": int((frame["status"] == "MUST_MERGE").sum()),
         "cross_split_leakage_pair_count": int(

@@ -243,7 +243,7 @@ python audit_dataset_quality.py --dataset-root "D:\path\to\_model_dataset"
 
 - `qc/event_hydrograph_overlap.csv`：同一图/出口的相邻或时间重叠事件对。只有“共享有效目标时刻且共享同一实测峰时”，或正式 hydro window 确实重叠时，才标记 `MUST_MERGE`；仅样本时段重叠但峰不同标记 `REVIEW`。同一连续过程跨 split 标记 `CROSS_SPLIT_LEAKAGE`。
 - `qc/water_level_station_audit.csv`：按目标站和 split 输出物理水位范围、TRAIN 站级范围、TRAIN 全局 normalization 范围、逐时跳变和站内基准一致性。TRAIN 事件中若整场水位范围落在站级事件中位数 Tukey outer fence 之外，判为基准断裂并标记 `FAIL`，不自动删除站点或事件。
-- `qc/dataset_quality_audit_summary.json`：合并连通组、预计事件数变化、各 split 预计数量和严格失败计数。
+- `qc/dataset_quality_audit_summary.json`：合并连通组、预计事件数变化、不重新划分时的暂定 split 数量和严格失败计数；正式数量必须在合并后的真实事件层重新执行原 deterministic split 得到。
 
 `validate_dataset.py` 会重新计算这些审计，不会只信任已有 QC 文件。`strict_validation=true` 时，只要存在 `MUST_MERGE`、`CROSS_SPLIT_LEAKAGE`、TRAIN 水位基准断裂，或 normalization 与 TRAIN 输入窗口重算不一致，就会终止。可用 `--qc-output-dir` 在失败前保留本次审计证据。
 
