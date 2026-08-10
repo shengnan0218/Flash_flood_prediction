@@ -1,0 +1,42 @@
+{
+  "dynamic_features": [
+    "FLOW",
+    "WATER_LEVEL"
+  ],
+  "rainfall_storage": "step11_sparse_positive_hour_intervals; missing node-hour within model windows means 0 mm",
+  "rainfall_timestamp_convention": "TIMESTAMP = start_time of [start_time,end_time) 1-hour interval",
+  "dynamic_masks": [
+    "RAIN_MASK",
+    "FLOW_MASK",
+    "WATER_LEVEL_MASK"
+  ],
+  "node_static_features": [
+    "log_incremental_area",
+    "log_upstream_area",
+    "mean_hillslope_flow_distance_m",
+    "mean_slope_deg",
+    "elevation_std_m",
+    "drainage_density_km_per_km2",
+    "soil_log_ksat_0_30cm",
+    "soil_profile_depth_cm",
+    "forest_fraction",
+    "impervious_fraction"
+  ],
+  "edge_static_features": [
+    "reach_length_km",
+    "reach_slope_m_per_m"
+  ],
+  "history_hours": 24,
+  "forecast_hours": 6,
+  "sample_step_hours": 1,
+  "target_mode": "AUTO",
+  "time_zone": "Asia/Shanghai",
+  "dynamic_layout": "long: GRAPH_ID,TIMESTAMP,NODE_INDEX,STATION_ID,features,masks",
+  "physical_features": {
+    "incremental_area_km2": {
+      "source": "log_incremental_area",
+      "transform": "log1p",
+      "unit": "km2"
+    }
+  }
+}
