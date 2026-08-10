@@ -247,7 +247,7 @@ python audit_dataset_quality.py --dataset-root "D:\path\to\_model_dataset"
 
 `validate_dataset.py` 会重新计算这些审计，不会只信任已有 QC 文件。`strict_validation=true` 时，只要存在 `MUST_MERGE`、`CROSS_SPLIT_LEAKAGE`、TRAIN 水位基准断裂，或 normalization 与 TRAIN 输入窗口重算不一致，就会终止。可用 `--qc-output-dir` 在失败前保留本次审计证据。
 
-当前仓库中的 `source_manifest.json` 指向仓库外的 `16_build_model_dataset_v3.py`，因此仓库只能审计并阻止问题数据训练，不能安全地在评价阶段伪造事件合并。修复必须回到该上游构建步骤；合并后同时重建 final/all events、split、sample index、normalization、summary、QC 和 manifest。
+仓库现已纳入权威上游构建器 `scripts/16_build_model_dataset_v3.py` 及其运行说明 `docs/README_16_build_model_dataset.md`。该构建器在正式 split 前使用同一出口的有效目标小时、实测峰时和正式 hydro window 形成确定性合并连通组；随后重新生成 final/all events、split、sample index、normalization、summary、QC 和 manifest。TRAIN 内不可恢复的水位基准断裂按事件级排除并留痕，不自动平移水位，也不删除整站。旧 `_model_dataset_v4_candidate` 仍保留为审计证据，不能继续训练。
 
 ## 6. 未来降雨策略
 
