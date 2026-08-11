@@ -3,8 +3,9 @@
 The multi-task discharge objective is balanced at sample level.  Each Q
 window first produces one point/peak/volume value, after which the TRAIN-only
 graph-event sample weight is applied.  Water-level level and first-difference
-terms retain valid-element means.  Every physical error is divided by a
-TRAIN-only target standard deviation supplied in ``cfg['_runtime']``.
+terms retain valid-element means.  Physical errors are divided by explicit
+TRAIN-only scales supplied in ``cfg['_runtime']``; the strict Q-normalization
+experiment selects a per-graph scale without changing physical model tensors.
 """
 from __future__ import annotations
 
@@ -55,6 +56,34 @@ def _positive_scale(scales: Mapping[str, Any], name: str) -> float:
     if not math.isfinite(value) or value <= 0:
         raise ValueError(f"TRAIN loss scale {name}必须为有限正数，实际={value}")
     return value
+
+
+def _single_graph_id(batch: Any, batch_size: int) -> str:
+    value = getattr(batch, "graph_id", None)
+    if isinstance(value, str):
+        identifiers = (value,)
+    elif isinstance(value, (tuple, list)):
+        identifiers = tuple(value)
+    else:
+        raise ValueError(
+            "per-graph Q loss要求batch.graph_id为字符串或逐样本字符串序列"
+        )
+    if not identifiers or any(
+        not isinstance(identifier, str) or not identifier.strip()
+        for identifier in identifiers
+    ):
+        raise ValueError("per-graph Q loss的GRAPH_ID必须全部为非空字符串")
+    if len(identifiers) not in {1, batch_size}:
+        raise ValueError(
+            f"batch.graph_id数量必须为1或batch size={batch_size}，"
+            f"实际={len(identifiers)}"
+        )
+    unique = set(identifiers)
+    if len(unique) != 1:
+        raise ValueError(
+            f"per-graph Q loss禁止一个batch混合多个GRAPH_ID，实际={sorted(unique)}"
+        )
+    return identifiers[0]
 
 
 def _sample_weights(batch: Any, batch_size: int, reference: torch.Tensor) -> torch.Tensor:
@@ -148,15 +177,43 @@ class FloodMultitaskLoss:
         self.cfg = cfg
         loss_cfg = cfg.get("loss", {})
         self.mode = str(loss_cfg.get("mode", "legacy"))
+        self.q_scale_mode = str(loss_cfg.get("q_scale_mode", "global"))
         if self.mode not in {"legacy", "multitask"}:
             raise ValueError(f"loss.mode必须是legacy/multitask，实际={self.mode!r}")
+        if self.q_scale_mode not in {"global", "per_graph"}:
+            raise ValueError(
+                "loss.q_scale_mode必须是global/per_graph，"
+                f"实际={self.q_scale_mode!r}"
+            )
 
     def scales(self) -> tuple[float, float]:
+        """Return the unchanged global TRAIN scales used outside Q supervision."""
+
         runtime_scales = self.cfg.get("_runtime", {}).get("loss_scales", {})
         return (
             _positive_scale(runtime_scales, "discharge"),
             _positive_scale(runtime_scales, "water_level"),
         )
+
+    def q_scale_for_batch(self, batch: Any, batch_size: int) -> float:
+        global_q_scale, _ = self.scales()
+        if self.q_scale_mode == "global":
+            return global_q_scale
+        graph_id = _single_graph_id(batch, batch_size)
+        runtime_scales = self.cfg.get("_runtime", {}).get("loss_scales", {})
+        graph_scales = runtime_scales.get("discharge_by_graph")
+        if not isinstance(graph_scales, Mapping) or graph_id not in graph_scales:
+            raise ValueError(
+                f"GRAPH_ID={graph_id}: 缺少TRAIN-only per-graph Q loss scale；"
+                "禁止回退global std"
+            )
+        value = float(graph_scales[graph_id])
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(
+                f"GRAPH_ID={graph_id}: per-graph Q loss scale必须为有限正数，"
+                f"实际={value}"
+            )
+        return value
 
     def coefficients(self) -> dict[str, float]:
         if self.mode == "legacy":
@@ -215,11 +272,13 @@ class FloodMultitaskLoss:
         z_target = batch.z_target
         q_mask = _checked_mask(q_prediction, q_target, batch.q_target_mask)
         z_mask = _checked_mask(z_prediction, z_target, batch.z_target_mask)
-        q_scale, z_scale = self.scales()
+        global_q_scale, z_scale = self.scales()
 
         if self.mode == "legacy":
             q_sum, q_count = masked_huber_stats(
-                q_prediction / q_scale, q_target / q_scale, q_mask
+                q_prediction / global_q_scale,
+                q_target / global_q_scale,
+                q_mask,
             )
             z_sum, z_count = masked_huber_stats(
                 z_prediction / z_scale, z_target / z_scale, z_mask
@@ -234,6 +293,11 @@ class FloodMultitaskLoss:
             }
 
         batch_size = q_prediction.shape[0]
+        q_scale = (
+            self.q_scale_for_batch(batch, batch_size)
+            if q_mask.any()
+            else global_q_scale
+        )
         weights = _sample_weights(batch, batch_size, q_prediction)
         q_active = q_mask.reshape(batch_size, -1).any(dim=1)
         valid_counts = q_mask.reshape(batch_size, -1).sum(dim=1)

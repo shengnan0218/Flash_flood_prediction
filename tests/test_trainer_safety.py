@@ -21,9 +21,12 @@ def config(directory: Path) -> dict:
     return {
         "optimizer": {"lr": 0.01, "weight_decay": 0.0},
         "amp": False,
+        "batch_size": 1,
         "loss_weights": {"discharge": 1.0, "water_level": 1.0},
         "gradient_accumulation_steps": 1,
         "training": {
+            "epochs": 1,
+            "patience": 1,
             "gradient_clip": 1.0,
             "checkpoint": str(directory / "best.pt"),
             "log_csv": str(directory / "train.csv"),
@@ -32,6 +35,47 @@ def config(directory: Path) -> dict:
 
 
 class TestTrainerSafety(unittest.TestCase):
+    def test_patience_100_runs_all_epochs_zero_through_99(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cfg = config(root)
+            cfg["training"]["epochs"] = 100
+            cfg["training"]["patience"] = 100
+            cfg["_runtime"] = {
+                "q_scale_audit": {
+                    "computed_from_split": "TRAIN",
+                    "graphs": {
+                        "G1": {
+                            "valid_unique_point_count": 2,
+                            "mean_m3s": 1.0,
+                            "std_m3s": 0.5,
+                            "q_loss_scale_m3s": 1.0,
+                            "floor_applied": True,
+                        }
+                    },
+                }
+            }
+            trainer = Trainer(TinyModel(), cfg, torch.device("cpu"))
+            epochs: list[int] = []
+
+            def constant_train_epoch(_loader, epoch: int):
+                epochs.append(epoch)
+                return {"loss": 1.0}
+
+            with (
+                mock.patch.object(
+                    trainer, "train_epoch", side_effect=constant_train_epoch
+                ),
+                mock.patch.object(trainer, "save_checkpoint"),
+                mock.patch("trainers.trainer._append_csv_row"),
+            ):
+                history = trainer.fit([object()], val_loader=None)
+
+            self.assertEqual(epochs, list(range(100)))
+            self.assertEqual(len(history), 100)
+            audit_path = root / "best_q_scales.json"
+            self.assertTrue(audit_path.is_file())
+
     def test_gradient_clipping_defers_nonfinite_amp_gradients_to_scaler(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             trainer = Trainer(

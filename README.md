@@ -207,7 +207,11 @@ GRAPH_ID,TARGET_VARIABLE
 }
 ```
 
-FLOW/WATER_LEVEL 的 TRAIN 标准差还用于把联合 Q/Z Huber 损失无量纲化，避免把 m³/s 与 m 直接相加。训练 loss 与早停 loss 因此是标准化空间的无量纲 Huber；下列评估指标仍在物理空间计算：
+默认/既有实验使用 FLOW/WATER_LEVEL 的 TRAIN 全局标准差把联合 Q/Z Huber
+损失无量纲化，避免把 m³/s 与 m 直接相加。严格对照配置
+`hunan_e4_multitask_qnorm_v1.yaml` 仅把 Q point/peak/volume 的监督误差改为
+各 FLOW 目标河网自己的 TRAIN 出口 Q 标准差；Z 与动态输入 normalization
+不变。下列评估指标始终在物理空间计算：
 
 - 全部有效标签的逐时 MAE，以及 MAE、RMSE、带符号 bias、NSE、KGE；
 - `q_sample_peak_mae` 与 `q_sample_peak_bias`，其中 bias 为预测峰值减观测峰值；
@@ -322,6 +326,17 @@ python train_hunan.py --config configs/hunan_e4_multitask.yaml --dataset-root "D
 first-difference Z loss，并以越大越好的综合 VALIDATION score 选择 best/早停。
 准确公式、去重口径和默认权重见
 [docs/multitask_training_and_hpo.md](docs/multitask_training_and_hpo.md)。
+
+逐图 Q loss normalization 的 100-epoch 严格对照实验使用：
+
+```powershell
+python train_hunan.py --config configs/hunan_e4_multitask_qnorm_v1.yaml --dataset-root "D:\path\to\_model_dataset_v5_event_zqc"
+```
+
+它只用 TRAIN supervision 中去重后的出口 Q 目标时刻计算逐图 population std，
+并应用 `q_scale_floor_m3s: 1.0`。训练执行 epoch 0--99，仍逐轮验证并保留
+best/last checkpoint；逐图统计写入同一输出目录的
+`hunan_e4_multitask_qnorm_v1_q_scales.json`。
 
 Optuna 是独立、显式启用的后续入口；`hyperparameter_optimization.enabled`
 默认是 `false`，普通训练不会启动搜索。本轮不应把 HPO 当作新版单次训练的

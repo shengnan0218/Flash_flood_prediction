@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import math
 import os
 import random
@@ -644,6 +645,34 @@ class Trainer:
         return path.with_name(f"{path.stem}.last{path.suffix}")
 
     @staticmethod
+    def q_scale_audit_path(path: str | Path) -> Path:
+        path = Path(path)
+        stem = path.stem
+        if stem.endswith("_best"):
+            stem = stem[: -len("_best")]
+        return path.with_name(f"{stem}_q_scales.json")
+
+    def _write_q_scale_audit(self, checkpoint_path: Path) -> Path | None:
+        audit = self.cfg.get("_runtime", {}).get("q_scale_audit")
+        if audit is None:
+            return None
+        if not isinstance(audit, dict):
+            raise ValueError("_runtime.q_scale_audit必须是JSON对象")
+        path = self.q_scale_audit_path(checkpoint_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        text = json.dumps(audit, ensure_ascii=False, indent=2, sort_keys=True)
+        path.write_text(text + "\n", encoding="utf-8")
+        print(
+            "q_loss_scale_audit",
+            json.dumps(
+                {"path": str(path.resolve()), **audit},
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+        )
+        return path
+
+    @staticmethod
     def _capture_rng_state() -> dict[str, Any]:
         state: dict[str, Any] = {
             "python": random.getstate(),
@@ -933,11 +962,16 @@ class Trainer:
         patience = int(self.cfg["training"]["patience"])
         checkpoint_path = Path(self.cfg["training"]["checkpoint"])
         last_path = self.last_checkpoint_path(checkpoint_path)
+        audit_path = (
+            self.q_scale_audit_path(checkpoint_path)
+            if self.cfg.get("_runtime", {}).get("q_scale_audit") is not None
+            else None
+        )
         if self.start_epoch == 0:
             existing = [
                 path
-                for path in (log, checkpoint_path, last_path)
-                if path.exists()
+                for path in (log, checkpoint_path, last_path, audit_path)
+                if path is not None and path.exists()
             ]
             if existing and not overwrite:
                 raise FileExistsError(
@@ -946,6 +980,7 @@ class Trainer:
                 )
             if overwrite and log.exists():
                 log.write_text("", encoding="utf-8")
+        self._write_q_scale_audit(checkpoint_path)
         self._restore_loader_rng_state(train_loader)
 
         for epoch in range(self.start_epoch, int(self.cfg["training"]["epochs"])):

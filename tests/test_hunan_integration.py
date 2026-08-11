@@ -408,7 +408,132 @@ def write_test_config(path: Path, dataset_root: Path, output_root: Path) -> dict
     return cfg
 
 
+def write_qnorm_test_config(
+    path: Path, dataset_root: Path, output_root: Path
+) -> dict:
+    cfg = write_test_config(path, dataset_root, output_root)
+    cfg["loss"]["mode"] = "multitask"
+    cfg["loss"]["q_scale_mode"] = "per_graph"
+    cfg["loss"]["q_scale_floor_m3s"] = 1.0
+    cfg["validation_selection"]["mode"] = "composite"
+    validate_config(cfg)
+    path.write_text(
+        yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False), encoding="utf-8"
+    )
+    return cfg
+
+
 class TestHunanFormalIntegration(unittest.TestCase):
+    def test_per_graph_q_scale_is_train_only_unique_and_floor_audited(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            temporary = Path(directory)
+            dataset_root = temporary / "_model_dataset"
+            build_formal_fixture(dataset_root)
+
+            # Duplicate one TRAIN sliding window under a new SAMPLE_ID.  Its two
+            # target timestamps must still contribute exactly once to std.
+            sample_path = dataset_root / "events" / "sample_index.csv"
+            with sample_path.open("r", encoding="utf-8", newline="") as handle:
+                reader = csv.DictReader(handle)
+                fieldnames = list(reader.fieldnames or ())
+                sample_rows = list(reader)
+            duplicate = next(
+                dict(row)
+                for row in sample_rows
+                if row["EVENT_ID"] == "G_FLOW_TRAIN"
+            )
+            duplicate["SAMPLE_ID"] = "S_G_FLOW_TRAIN_DUPLICATE_WINDOW"
+            sample_rows.append(duplicate)
+            _write_csv(sample_path, fieldnames, sample_rows)
+
+            # Make non-TRAIN outlet FLOW deliberately extreme.  Per-graph scale
+            # must remain the TRAIN values 13 and 14 m3/s.
+            dynamic_path = dataset_root / "dynamic" / "graph_B_FLOW_hourly.csv"
+            with dynamic_path.open("r", encoding="utf-8", newline="") as handle:
+                reader = csv.DictReader(handle)
+                dynamic_fields = list(reader.fieldnames or ())
+                dynamic_rows = list(reader)
+            for row in dynamic_rows:
+                if (
+                    row["STATION_ID"] == "F_OUT"
+                    and not row["TIMESTAMP"].startswith("2020-01-01")
+                ):
+                    row["FLOW"] = "10000.0"
+            _write_csv(dynamic_path, dynamic_fields, dynamic_rows)
+
+            config_path = temporary / "qnorm.yaml"
+            write_qnorm_test_config(
+                config_path, dataset_root, temporary / "out"
+            )
+            cfg, _model, train_loader, _validation_loader, _device = setup_training(
+                config_path
+            )
+            audit = cfg["_runtime"]["q_scale_audit"]["graphs"]["G_FLOW"]
+            self.assertEqual(audit["valid_unique_point_count"], 2)
+            self.assertAlmostEqual(audit["mean_m3s"], 13.5)
+            self.assertAlmostEqual(audit["std_m3s"], 0.5)
+            self.assertAlmostEqual(audit["q_loss_scale_m3s"], 1.0)
+            self.assertTrue(audit["floor_applied"])
+            self.assertEqual(len(train_loader.dataset), 3)
+
+            eval_cfg, _eval_model, _test_loader, _eval_device = setup_evaluation(
+                config_path, split="TEST"
+            )
+            self.assertEqual(
+                eval_cfg["_runtime"]["loss_scales"]["discharge_by_graph"],
+                cfg["_runtime"]["loss_scales"]["discharge_by_graph"],
+            )
+            level_cfg, _level_model, _level_train, _level_val, _level_device = (
+                setup_training(config_path, graph_id="G_LEVEL")
+            )
+            self.assertEqual(
+                level_cfg["_runtime"]["loss_scales"]["discharge_by_graph"],
+                {},
+            )
+            self.assertEqual(
+                level_cfg["_runtime"]["q_scale_audit"]["graphs"]["G_LEVEL"][
+                    "status"
+                ],
+                "NOT_APPLICABLE_NO_FLOW_SUPERVISION",
+            )
+            checkpoint = {"config": deepcopy(cfg)}
+            validate_checkpoint_config(checkpoint, eval_cfg)
+            changed_scale_cfg = deepcopy(eval_cfg)
+            changed_scale_cfg["_runtime"]["loss_scales"][
+                "discharge_by_graph"
+            ]["G_FLOW"] += 0.25
+            with self.assertRaisesRegex(
+                ValueError, "loss_scales.discharge_by_graph.G_FLOW"
+            ):
+                validate_checkpoint_config(checkpoint, changed_scale_cfg)
+
+    def test_per_graph_q_scale_fails_with_one_unique_train_point(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            temporary = Path(directory)
+            dataset_root = temporary / "_model_dataset"
+            build_formal_fixture(dataset_root)
+            dynamic_path = dataset_root / "dynamic" / "graph_B_FLOW_hourly.csv"
+            with dynamic_path.open("r", encoding="utf-8", newline="") as handle:
+                reader = csv.DictReader(handle)
+                fieldnames = list(reader.fieldnames or ())
+                rows = list(reader)
+            for row in rows:
+                if (
+                    row["STATION_ID"] == "F_OUT"
+                    and row["TIMESTAMP"] == "2020-01-01 03:00:00"
+                ):
+                    row["FLOW"] = ""
+                    row["FLOW_MASK"] = "0"
+            _write_csv(dynamic_path, fieldnames, rows)
+            config_path = temporary / "qnorm.yaml"
+            write_qnorm_test_config(
+                config_path, dataset_root, temporary / "out"
+            )
+            with self.assertRaisesRegex(
+                ValueError, "GRAPH_ID=G_FLOW.*仅1个"
+            ):
+                setup_training(config_path)
+
     def test_two_graph_auto_target_train_validate_test(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             temporary = Path(directory)

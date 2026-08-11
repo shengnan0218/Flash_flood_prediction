@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import hashlib
+import math
 from pathlib import Path
 from typing import Any
 
@@ -264,8 +265,14 @@ def _contract_digest(root: Path) -> str:
     return digest.hexdigest()
 
 
-def _runtime_metadata(loader: Any, mode: str) -> dict[str, Any]:
+def _runtime_metadata(
+    loader: Any,
+    cfg: dict[str, Any],
+    *,
+    q_scale_dataset: Any | None = None,
+) -> dict[str, Any]:
     dataset = loader.dataset
+    mode = cfg["data"]["mode"]
     if mode == "synthetic":
         return {
             "loss_scales": {"discharge": 1.0, "water_level": 1.0},
@@ -276,13 +283,14 @@ def _runtime_metadata(loader: Any, mode: str) -> dict[str, Any]:
         graph_id: sorted(values)
         for graph_id, values in sorted(dataset.target_variables_by_graph.items())
     }
-    return {
+    loss_scales: dict[str, Any] = {
+        "discharge": float(dataset.normalization["FLOW"].std),
+        "water_level": float(dataset.normalization["WATER_LEVEL"].std),
+    }
+    runtime: dict[str, Any] = {
         # Huber loss is calculated on errors divided by TRAIN-only standard
         # deviation.  Reported MAE remains in physical m3/s and metres.
-        "loss_scales": {
-            "discharge": float(dataset.normalization["FLOW"].std),
-            "water_level": float(dataset.normalization["WATER_LEVEL"].std),
-        },
+        "loss_scales": loss_scales,
         "data_contract": {
             "format_version": 1,
             "mode": "hunan",
@@ -292,6 +300,54 @@ def _runtime_metadata(loader: Any, mode: str) -> dict[str, Any]:
             "artifact_sha256": _contract_digest(root),
         },
     }
+    if cfg["loss"]["q_scale_mode"] == "per_graph":
+        source = dataset if q_scale_dataset is None else q_scale_dataset
+        raw_statistics = source.train_q_supervision_statistics()
+        expected_flow_graphs = {
+            graph_id
+            for graph_id in source.graph_ids
+            if "FLOW" in source.target_variables_by_graph[graph_id]
+        }
+        if set(raw_statistics) != expected_flow_graphs:
+            raise ValueError(
+                "TRAIN逐图Q统计未完整覆盖FLOW监督graph: "
+                f"expected={sorted(expected_flow_graphs)}, "
+                f"actual={sorted(raw_statistics)}"
+            )
+        floor = float(cfg["loss"]["q_scale_floor_m3s"])
+        graph_audit: dict[str, dict[str, Any]] = {}
+        graph_scales: dict[str, float] = {}
+        for graph_id in sorted(source.graph_ids):
+            if graph_id not in raw_statistics:
+                graph_audit[graph_id] = {
+                    "status": "NOT_APPLICABLE_NO_FLOW_SUPERVISION",
+                    "valid_unique_point_count": 0,
+                    "mean_m3s": None,
+                    "std_m3s": None,
+                    "q_loss_scale_m3s": None,
+                    "floor_applied": False,
+                }
+                continue
+            statistics = raw_statistics[graph_id]
+            raw_std = float(statistics["std_m3s"])
+            used_scale = max(raw_std, floor)
+            floor_applied = raw_std < floor
+            graph_scales[graph_id] = used_scale
+            graph_audit[graph_id] = {
+                "status": "APPLIED",
+                **statistics,
+                "q_loss_scale_m3s": used_scale,
+                "floor_applied": floor_applied,
+            }
+        loss_scales["discharge_by_graph"] = graph_scales
+        runtime["q_scale_audit"] = {
+            "computed_from_split": "TRAIN",
+            "source": "unique TRAIN outlet-Q supervision timestamps",
+            "std_definition": "population std (ddof=0)",
+            "q_scale_floor_m3s": floor,
+            "graphs": graph_audit,
+        }
+    return runtime
 
 
 def setup_training(
@@ -317,7 +373,7 @@ def setup_training(
     nodes = _dataset_nodes(train_loader)
     if _dataset_nodes(validation_loader) != nodes:
         raise ValueError("TRAIN 与 VALIDATION 的节点数不一致")
-    cfg["_runtime"] = _runtime_metadata(train_loader, cfg["data"]["mode"])
+    cfg["_runtime"] = _runtime_metadata(train_loader, cfg)
     model = HybridFloodModel(cfg, nodes)
     device = resolve_device(cfg["device"], cfg["gpu_id"])
     return cfg, model, train_loader, validation_loader, device
@@ -351,7 +407,7 @@ def setup_training_from_config(
     nodes = _dataset_nodes(train_loader)
     if _dataset_nodes(validation_loader) != nodes:
         raise ValueError("TRAIN 与 VALIDATION 的节点数不一致")
-    cfg["_runtime"] = _runtime_metadata(train_loader, cfg["data"]["mode"])
+    cfg["_runtime"] = _runtime_metadata(train_loader, cfg)
     model = HybridFloodModel(cfg, nodes)
     device = resolve_device(cfg["device"], cfg["gpu_id"])
     return cfg, model, train_loader, validation_loader, device
@@ -368,8 +424,28 @@ def setup_evaluation(
     cfg = _runtime_config(config_path, dataset_root, graph_id)
     seed_everything(cfg["seed"])
     split = _normalise_split(split)
-    loader = _make_loader(cfg, split, shuffle=False)
-    cfg["_runtime"] = _runtime_metadata(loader, cfg["data"]["mode"])
+    q_scale_dataset = None
+    dynamic_cache: dict | None = None
+    if (
+        cfg["data"]["mode"] == "hunan"
+        and cfg["loss"]["q_scale_mode"] == "per_graph"
+    ):
+        # Standalone VALIDATION/TEST loss must reuse TRAIN scales.  Constructing
+        # this deterministic TRAIN view never fits on the evaluated split.
+        dynamic_cache = {}
+        train_scale_loader = _make_loader(
+            cfg,
+            cfg["data"]["train_split"],
+            shuffle=False,
+            dynamic_cache=dynamic_cache,
+        )
+        q_scale_dataset = train_scale_loader.dataset
+    loader = _make_loader(
+        cfg, split, shuffle=False, dynamic_cache=dynamic_cache
+    )
+    cfg["_runtime"] = _runtime_metadata(
+        loader, cfg, q_scale_dataset=q_scale_dataset
+    )
     model = HybridFloodModel(cfg, _dataset_nodes(loader))
     device = resolve_device(cfg["device"], cfg["gpu_id"])
     return cfg, model, loader, device
@@ -399,6 +475,17 @@ def validate_checkpoint_config(
         "physical_bounds",
     )
     mismatches = [key for key in keys if saved.get(key) != cfg.get(key)]
+    saved_loss = saved.get("loss") if isinstance(saved.get("loss"), dict) else {}
+    current_loss = cfg.get("loss", {})
+    saved_q_scale_mode = saved_loss.get("q_scale_mode", "global")
+    current_q_scale_mode = current_loss.get("q_scale_mode", "global")
+    if saved_q_scale_mode != current_q_scale_mode:
+        mismatches.append("loss.q_scale_mode")
+    if current_q_scale_mode == "per_graph":
+        saved_floor = saved_loss.get("q_scale_floor_m3s")
+        current_floor = current_loss.get("q_scale_floor_m3s")
+        if saved_floor != current_floor:
+            mismatches.append("loss.q_scale_floor_m3s")
     saved_data = saved.get("data")
     if isinstance(saved_data, dict):
         for key in (
@@ -439,6 +526,45 @@ def validate_checkpoint_config(
             not resume and not current_graphs.issubset(saved_graphs)
         ):
             mismatches.append("data_contract.graph_ids")
+        if current_q_scale_mode == "per_graph":
+            saved_q_scales = (
+                saved.get("_runtime", {})
+                .get("loss_scales", {})
+                .get("discharge_by_graph")
+            )
+            current_q_scales = (
+                cfg.get("_runtime", {})
+                .get("loss_scales", {})
+                .get("discharge_by_graph")
+            )
+            if not isinstance(saved_q_scales, dict) or not isinstance(
+                current_q_scales, dict
+            ):
+                mismatches.append("loss_scales.discharge_by_graph")
+            else:
+                saved_scale_graphs = set(saved_q_scales)
+                current_scale_graphs = set(current_q_scales)
+                if (resume and saved_scale_graphs != current_scale_graphs) or (
+                    not resume
+                    and not current_scale_graphs.issubset(saved_scale_graphs)
+                ):
+                    mismatches.append("loss_scales.discharge_by_graph")
+                for graph_id in current_scale_graphs & saved_scale_graphs:
+                    saved_value = float(saved_q_scales[graph_id])
+                    current_value = float(current_q_scales[graph_id])
+                    if not (
+                        math.isfinite(saved_value)
+                        and math.isfinite(current_value)
+                        and math.isclose(
+                            saved_value,
+                            current_value,
+                            rel_tol=0.0,
+                            abs_tol=1.0e-12,
+                        )
+                    ):
+                        mismatches.append(
+                            f"loss_scales.discharge_by_graph.{graph_id}"
+                        )
     if mismatches:
         raise ValueError(
             "checkpoint 与当前配置不兼容: " + ", ".join(sorted(set(mismatches)))

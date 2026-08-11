@@ -46,6 +46,9 @@ loss_weights: {discharge: 2.0, water_level: 1.0}
 loss:
   # legacy完整保留原始 2*Q Huber + 1*Z Huber；multitask由新配置显式开启。
   mode: legacy
+  # global保持既有TRAIN全局FLOW std；per_graph仅允许湖南multitask实验。
+  q_scale_mode: global
+  q_scale_floor_m3s: 1.0
   discharge_weight: 2.0
   water_level_weight: 1.0
   q_point_weight: 1.0

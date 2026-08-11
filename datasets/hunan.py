@@ -507,6 +507,62 @@ class HunanGraphEventDataset(Dataset[GraphEventBatch]):
     def graph_id_for_index(self, index: int) -> str:
         return self._samples[index].graph_id
 
+    def train_q_supervision_statistics(
+        self,
+    ) -> dict[str, dict[str, float | int]]:
+        """Summarise unique physical outlet-Q targets for each TRAIN graph.
+
+        A target timestamp can occur in several sliding windows (and, during
+        audit of unrepaired inputs, even in overlapping events).  It is counted
+        once per graph here, so window density cannot change the Q loss scale.
+        Only graphs whose authoritative target includes FLOW are returned.
+        """
+
+        if self.split != "TRAIN":
+            raise ValueError(
+                "逐图Q loss scale只能由TRAIN dataset计算，"
+                f"当前split={self.split}"
+            )
+        flow_graphs = {
+            graph_id
+            for graph_id in self.graph_ids
+            if "FLOW" in self.target_variables_by_graph[graph_id]
+        }
+        target_indices = {graph_id: set() for graph_id in flow_graphs}
+        for sample in self._samples:
+            if "FLOW" not in sample.target_variables:
+                continue
+            _, future_indices = self._window_indices(sample)
+            target_indices[sample.graph_id].update(future_indices)
+
+        result: dict[str, dict[str, float | int]] = {}
+        for graph_id in sorted(flow_graphs):
+            graph = self._graphs[graph_id]
+            outlet = next(node.node_index for node in graph.nodes if node.is_outlet)
+            indices = sorted(target_indices[graph_id])
+            dynamic = self._dynamic[graph_id]
+            valid = dynamic.flow_mask[indices, outlet]
+            values = dynamic.flow[indices, outlet][valid].to(dtype=torch.float64)
+            count = int(values.numel())
+            if count < 2:
+                raise ValueError(
+                    f"GRAPH_ID={graph_id}: TRAIN出口Q有效唯一目标时刻仅{count}个；"
+                    "至少需要2个才能计算逐图population std"
+                )
+            mean = float(values.mean().item())
+            std = float(values.std(unbiased=False).item())
+            if not math.isfinite(mean) or not math.isfinite(std) or std < 0:
+                raise ValueError(
+                    f"GRAPH_ID={graph_id}: TRAIN出口Q统计量无效，"
+                    f"count={count}, mean={mean}, std={std}"
+                )
+            result[graph_id] = {
+                "valid_unique_point_count": count,
+                "mean_m3s": mean,
+                "std_m3s": std,
+            }
+        return result
+
     def _load_feature_schema(self) -> tuple[str, ...]:
         path = self.root / "metadata" / "feature_schema.json"
         if not path.exists():

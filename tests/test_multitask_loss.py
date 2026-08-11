@@ -14,6 +14,8 @@ def config(*, mode: str = "multitask") -> dict:
         "loss_weights": {"discharge": 2.0, "water_level": 1.0},
         "loss": {
             "mode": mode,
+            "q_scale_mode": "global",
+            "q_scale_floor_m3s": 1.0,
             "discharge_weight": 2.0,
             "water_level_weight": 1.0,
             "q_point_weight": 1.0,
@@ -106,6 +108,59 @@ class TestMultitaskLoss(unittest.TestCase):
         engine.combine(stats).backward()
         self.assertTrue(torch.isfinite(q_prediction.grad).all())
         self.assertTrue(torch.isfinite(z_prediction.grad).all())
+
+    def test_per_graph_q_scale_changes_only_normalized_supervision(self) -> None:
+        losses: dict[str, float] = {}
+        for graph_id in ("G_SMALL", "G_LARGE"):
+            item = batch()
+            item.graph_id = (graph_id, graph_id)
+            q_prediction = torch.where(
+                item.q_target_mask,
+                item.q_target + 2.0,
+                torch.zeros_like(item.q_target),
+            ).requires_grad_()
+            physical_prediction = q_prediction.detach().clone()
+            cfg = config()
+            cfg["loss"]["q_scale_mode"] = "per_graph"
+            cfg["_runtime"]["loss_scales"]["discharge_by_graph"] = {
+                "G_SMALL": 1.0,
+                "G_LARGE": 10.0,
+            }
+            statistics = FloodMultitaskLoss(cfg).batch_statistics(
+                {"q": q_prediction, "z": item.z_target}, item
+            )
+            losses[graph_id] = float(
+                statistics["q_point"].numerator.detach()
+                / statistics["q_point"].denominator
+            )
+            # Loss scaling must not mutate physical m3/s predictions.
+            torch.testing.assert_close(q_prediction.detach(), physical_prediction)
+        self.assertGreater(losses["G_SMALL"], losses["G_LARGE"])
+
+    def test_per_graph_q_scale_never_falls_back_to_global(self) -> None:
+        item = batch()
+        item.graph_id = ("G_MISSING", "G_MISSING")
+        cfg = config()
+        cfg["loss"]["q_scale_mode"] = "per_graph"
+        cfg["_runtime"]["loss_scales"]["discharge_by_graph"] = {}
+        with self.assertRaisesRegex(ValueError, "G_MISSING.*禁止回退"):
+            FloodMultitaskLoss(cfg).batch_statistics(
+                {"q": item.q_target, "z": item.z_target}, item
+            )
+
+    def test_water_level_only_graph_does_not_require_unused_q_scale(self) -> None:
+        item = batch()
+        item.q_target_mask[:] = False
+        item.graph_id = ("G_LEVEL", "G_LEVEL")
+        cfg = config()
+        cfg["loss"]["q_scale_mode"] = "per_graph"
+        cfg["_runtime"]["loss_scales"]["discharge_by_graph"] = {
+            "G_FLOW": 1.0
+        }
+        statistics = FloodMultitaskLoss(cfg).batch_statistics(
+            {"q": item.q_target, "z": item.z_target}, item
+        )
+        self.assertEqual(statistics["q_point"].denominator, 0)
 
     def test_q_components_ignore_a_sample_with_no_valid_q_without_nan(self) -> None:
         item = batch()

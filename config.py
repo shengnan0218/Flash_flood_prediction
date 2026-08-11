@@ -283,6 +283,8 @@ def validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
         "loss",
         {
             "mode",
+            "q_scale_mode",
+            "q_scale_floor_m3s",
             "discharge_weight",
             "water_level_weight",
             "q_point_weight",
@@ -293,6 +295,8 @@ def validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
         },
     )
     _enum(loss, "mode", {"legacy", "multitask"})
+    _enum(loss, "q_scale_mode", {"global", "per_graph"})
+    _number(loss, "q_scale_floor_m3s", strictly=True)
     for key in (
         "discharge_weight",
         "water_level_weight",
@@ -320,6 +324,12 @@ def validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
                 "multitask固定要求Q:Z=2:1且q_point/z_level权重为1，"
                 f"不符合项={changed}"
             )
+    if loss["q_scale_mode"] == "per_graph" and (
+        loss["mode"] != "multitask" or data["mode"] != "hunan"
+    ):
+        raise ConfigError(
+            "loss.q_scale_mode=per_graph仅允许湖南正式multitask loss"
+        )
 
     selection = _mapping(
         cfg,

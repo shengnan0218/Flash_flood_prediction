@@ -14,6 +14,12 @@ L_{legacy}=2\,\operatorname{Huber}(Q/\sigma_Q)+
 `normalization_stats.json` 中明确标记为 TRAIN 的标准差。VALIDATION/TEST
 不会重算 loss scale。
 
+严格对照实验使用 `configs/hunan_e4_multitask_qnorm_v1.yaml`。它保持模型、
+优化器、batch、全部多任务权重及 composite selection 不变，只将三个 Q loss
+项的 \(\sigma_Q\) 改为逐图 TRAIN scale，并将 patience 设为 100 以完整执行
+epoch 0--99。best checkpoint 仍按原 composite score 选择，不使用最后一轮
+替代。既有 `hunan_e4_multitask.yaml` 继续使用全局 Q scale。
+
 ## 2. TRAIN 事件—流域平衡
 
 对 graph \(g\) 中 event \(e\) 的一个滑动窗口 sample，原始权重为：
@@ -59,6 +65,23 @@ L_Z=L_{z,level}+\lambda_{slope}L_{z,slope}.
 
 默认 \(\lambda_{peak}=\lambda_{volume}=\lambda_{slope}=0.25\)。训练 CSV
 分别记录 total、Q total/point/peak/volume、Z total/level/slope 及有效数量。
+
+逐图对照配置对每个含 FLOW 监督的 graph 先按
+`GRAPH_ID + outlet target timestamp` 去除滑窗重复，再以 TRAIN 物理 Q
+计算 population std（`ddof=0`）：
+
+\[
+\sigma_{Q,g}^{used}=\max(\operatorname{std}(Q_{TRAIN,g}),1.0\;m^3/s).
+\]
+
+不足两个有效唯一时刻会按 GRAPH_ID 立即失败，不回退全局 std。这个 scale
+只进入 Q point/peak/volume 的 error scaling；模型输出、history/target、运动波
+路由和全部正式指标仍为物理单位。VALIDATION/TEST 会重新构造只读 TRAIN 视图
+取得相同 scale，不在被评估 split 上拟合。训练开始时完整统计写入
+`outputs/hunan_e4_multitask_qnorm_v1_q_scales.json`，并随 checkpoint config
+保存、在 resume/evaluation 时核对。审计文件列出全部 TRAIN graph；
+WATER_LEVEL-only graph 明确标为 `NOT_APPLICABLE_NO_FLOW_SUPERVISION`，不为
+不存在的 Q loss 伪造或回退 scale。
 
 ## 4. VALIDATION selection score
 
