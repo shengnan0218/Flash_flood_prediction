@@ -11,6 +11,7 @@ from scripts.common import (
     validate_checkpoint_config,
 )
 from trainers import Trainer
+from metrics.p2_event_evaluation import evaluate_p2_flood_events
 
 
 def _json_safe(value):
@@ -40,6 +41,14 @@ def main() -> None:
     parser.add_argument(
         "--config", default=str(Path(__file__).resolve().parent / "configs" / "hunan_e4.yaml")
     )
+    parser.add_argument(
+        "--event-sample-index",
+        help="P2重新生成的test_flood_event_samples.csv；只引用冻结continuous dynamic",
+    )
+    parser.add_argument(
+        "--output-dir",
+        help="P2 Q/Z/ΔZ逐点和分组指标输出目录",
+    )
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument(
         "--dataset-root",
@@ -64,10 +73,37 @@ def main() -> None:
         split=args.split,
         dataset_root=args.dataset_root,
         graph_id=args.graph_id,
+        sample_index_path=args.event_sample_index,
     )
     trainer = Trainer(model, cfg, device)
     checkpoint = trainer.load_weights(args.checkpoint)
     validate_checkpoint_config(checkpoint, cfg)
+    if args.event_sample_index:
+        if args.split != "TEST":
+            parser.error("--event-sample-index只允许--split TEST")
+        if cfg["data"].get("dataset_type") != "continuous":
+            parser.error("--event-sample-index要求continuous P2配置")
+        output_dir = args.output_dir or (
+            Path(args.checkpoint).expanduser().resolve().parent
+            / "hunan_p2_flood_event_test"
+        )
+        result = {
+            "split": "TEST",
+            "checkpoint": str(Path(args.checkpoint).expanduser().resolve()),
+            "event_sample_index": str(
+                Path(args.event_sample_index).expanduser().resolve()
+            ),
+            "metrics": evaluate_p2_flood_events(
+                model, loader, device, output_dir
+            ),
+        }
+        text = json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False)
+        if args.output:
+            output = Path(args.output).expanduser().resolve()
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(text + "\n", encoding="utf-8")
+        print(text)
+        return
     formal_evaluation = cfg.get("data", {}).get("mode") == "hunan"
     metrics = trainer.evaluate(
         loader,

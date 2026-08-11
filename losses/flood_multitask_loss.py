@@ -86,6 +86,22 @@ def _single_graph_id(batch: Any, batch_size: int) -> str:
     return identifiers[0]
 
 
+def _single_target_station_id(batch: Any, batch_size: int) -> str:
+    value = getattr(batch, "target_station_id", None)
+    if isinstance(value, str):
+        identifiers = (value,)
+    elif isinstance(value, (tuple, list)):
+        identifiers = tuple(value)
+    else:
+        raise ValueError("per-station ΔZ loss要求batch.target_station_id")
+    if len(identifiers) not in {1, batch_size} or len(set(identifiers)) != 1:
+        raise ValueError("per-station ΔZ loss要求一个batch只含一个有效目标站")
+    station = identifiers[0]
+    if not isinstance(station, str) or not station.strip():
+        raise ValueError("target_station_id必须是非空字符串")
+    return station
+
+
 def _sample_weights(batch: Any, batch_size: int, reference: torch.Tensor) -> torch.Tensor:
     value = getattr(batch, "sample_weight", None)
     if value is None:
@@ -170,6 +186,32 @@ def water_level_first_differences(
     )
 
 
+def delta_z_first_differences(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    target_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """First differences for an already causal ΔZ(t+h) trajectory.
+
+    The h1 predecessor is exactly zero (= ΔZ at t0), while later horizons use
+    adjacent forecast values.  No absolute history value is subtracted again.
+    """
+
+    valid = _checked_mask(prediction, target, target_mask)
+    zero_prediction = torch.zeros_like(prediction[:, :1])
+    zero_target = torch.zeros_like(target[:, :1])
+    predecessor_prediction = torch.cat((zero_prediction, prediction[:, :-1]), dim=1)
+    predecessor_target = torch.cat((zero_target, target[:, :-1]), dim=1)
+    predecessor_valid = torch.cat(
+        (torch.ones_like(valid[:, :1]), valid[:, :-1]), dim=1
+    )
+    return (
+        prediction - predecessor_prediction,
+        target - predecessor_target,
+        valid & predecessor_valid,
+    )
+
+
 class FloodMultitaskLoss:
     """Compute legacy or Q-point/peak/volume + Z-level/slope objectives."""
 
@@ -178,6 +220,10 @@ class FloodMultitaskLoss:
         loss_cfg = cfg.get("loss", {})
         self.mode = str(loss_cfg.get("mode", "legacy"))
         self.q_scale_mode = str(loss_cfg.get("q_scale_mode", "global"))
+        self.z_target_mode = str(loss_cfg.get("z_target_mode", "absolute"))
+        self.delta_z_scale_mode = str(
+            loss_cfg.get("delta_z_scale_mode", "global")
+        )
         if self.mode not in {"legacy", "multitask"}:
             raise ValueError(f"loss.mode必须是legacy/multitask，实际={self.mode!r}")
         if self.q_scale_mode not in {"global", "per_graph"}:
@@ -185,6 +231,8 @@ class FloodMultitaskLoss:
                 "loss.q_scale_mode必须是global/per_graph，"
                 f"实际={self.q_scale_mode!r}"
             )
+        if self.z_target_mode not in {"absolute", "delta_from_t0"}:
+            raise ValueError(f"未知z_target_mode={self.z_target_mode!r}")
 
     def scales(self) -> tuple[float, float]:
         """Return the unchanged global TRAIN scales used outside Q supervision."""
@@ -213,6 +261,25 @@ class FloodMultitaskLoss:
                 f"GRAPH_ID={graph_id}: per-graph Q loss scale必须为有限正数，"
                 f"实际={value}"
             )
+        return value
+
+    def z_scale_for_batch(self, batch: Any, batch_size: int) -> float:
+        _, global_z_scale = self.scales()
+        if self.delta_z_scale_mode == "global":
+            return global_z_scale
+        station_id = _single_target_station_id(batch, batch_size)
+        station_scales = (
+            self.cfg.get("_runtime", {})
+            .get("loss_scales", {})
+            .get("delta_z_by_station")
+        )
+        if not isinstance(station_scales, Mapping) or station_id not in station_scales:
+            raise ValueError(
+                f"STATION_ID={station_id}: 缺少TRAIN-only ΔZ scale；禁止回退全局WATER_LEVEL std"
+            )
+        value = float(station_scales[station_id])
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"STATION_ID={station_id}: ΔZ scale必须为有限正数")
         return value
 
     def coefficients(self) -> dict[str, float]:
@@ -250,15 +317,24 @@ class FloodMultitaskLoss:
                 "z_slope": 0,
             }
         q_active = q_mask.reshape(q_mask.shape[0], -1).any(dim=1)
-        _, _, slope_mask = water_level_first_differences(
-            batch.z_target,
-            batch.z_target,
-            z_mask,
-            batch.z_history,
-            batch.z_mask,
-        )
+        if self.z_target_mode == "delta_from_t0":
+            _, _, slope_mask = delta_z_first_differences(
+                batch.z_target, batch.z_target, z_mask
+            )
+        else:
+            _, _, slope_mask = water_level_first_differences(
+                batch.z_target,
+                batch.z_target,
+                z_mask,
+                batch.z_history,
+                batch.z_mask,
+            )
         return {
-            "q_point": int(q_active.sum().item()),
+            "q_point": (
+                int(q_mask.sum().item())
+                if self.z_target_mode == "delta_from_t0"
+                else int(q_active.sum().item())
+            ),
             "q_peak": int(q_active.sum().item()),
             "q_volume": int(q_active.sum().item()),
             "z_level": int(z_mask.sum().item()),
@@ -272,7 +348,7 @@ class FloodMultitaskLoss:
         z_target = batch.z_target
         q_mask = _checked_mask(q_prediction, q_target, batch.q_target_mask)
         z_mask = _checked_mask(z_prediction, z_target, batch.z_target_mask)
-        global_q_scale, z_scale = self.scales()
+        global_q_scale, global_z_scale = self.scales()
 
         if self.mode == "legacy":
             q_sum, q_count = masked_huber_stats(
@@ -281,7 +357,9 @@ class FloodMultitaskLoss:
                 q_mask,
             )
             z_sum, z_count = masked_huber_stats(
-                z_prediction / z_scale, z_target / z_scale, z_mask
+                z_prediction / global_z_scale,
+                z_target / global_z_scale,
+                z_mask,
             )
             zero = (q_prediction.reshape(-1)[:0].sum() + z_prediction.reshape(-1)[:0].sum())
             return {
@@ -298,6 +376,7 @@ class FloodMultitaskLoss:
             if q_mask.any()
             else global_q_scale
         )
+        z_scale = self.z_scale_for_batch(batch, batch_size) if z_mask.any() else global_z_scale
         weights = _sample_weights(batch, batch_size, q_prediction)
         q_active = q_mask.reshape(batch_size, -1).any(dim=1)
         valid_counts = q_mask.reshape(batch_size, -1).sum(dim=1)
@@ -311,9 +390,12 @@ class FloodMultitaskLoss:
             q_point_elements.reshape(batch_size, -1).sum(dim=1)
             / valid_counts.clamp_min(1).to(q_point_elements.dtype)
         )
-        q_point = _weighted_sample_term(
-            q_point_per_sample, q_active, weights, q_prediction
-        )
+        if self.z_target_mode == "delta_from_t0":
+            q_point = LossTerm(q_point_elements[q_mask].sum(), int(q_mask.sum().item()))
+        else:
+            q_point = _weighted_sample_term(
+                q_point_per_sample, q_active, weights, q_prediction
+            )
 
         negative_infinity = torch.full_like(q_prediction, float("-inf"))
         q_peak_prediction = torch.where(q_mask, q_prediction, negative_infinity).reshape(batch_size, -1).amax(dim=1)
@@ -343,13 +425,18 @@ class FloodMultitaskLoss:
         z_level_sum, z_level_count = masked_huber_stats(
             z_prediction / z_scale, z_target / z_scale, z_mask
         )
-        slope_prediction, slope_target, slope_mask = water_level_first_differences(
-            z_prediction,
-            z_target,
-            z_mask,
-            batch.z_history,
-            batch.z_mask,
-        )
+        if self.z_target_mode == "delta_from_t0":
+            slope_prediction, slope_target, slope_mask = delta_z_first_differences(
+                z_prediction, z_target, z_mask
+            )
+        else:
+            slope_prediction, slope_target, slope_mask = water_level_first_differences(
+                z_prediction,
+                z_target,
+                z_mask,
+                batch.z_history,
+                batch.z_mask,
+            )
         z_slope_sum, z_slope_count = masked_huber_stats(
             slope_prediction / z_scale,
             slope_target / z_scale,

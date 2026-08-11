@@ -652,6 +652,14 @@ class Trainer:
             stem = stem[: -len("_best")]
         return path.with_name(f"{stem}_q_scales.json")
 
+    @staticmethod
+    def target_scale_audit_path(path: str | Path) -> Path:
+        path = Path(path)
+        stem = path.stem
+        if stem.endswith("_best"):
+            stem = stem[: -len("_best")]
+        return path.with_name(f"{stem}_target_scales.json")
+
     def _write_q_scale_audit(self, checkpoint_path: Path) -> Path | None:
         audit = self.cfg.get("_runtime", {}).get("q_scale_audit")
         if audit is None:
@@ -670,6 +678,21 @@ class Trainer:
                 sort_keys=True,
             ),
         )
+        return path
+
+    def _write_target_scale_audit(self, checkpoint_path: Path) -> Path | None:
+        audit = self.cfg.get("_runtime", {}).get("target_scale_audit")
+        if audit is None:
+            return None
+        if not isinstance(audit, dict):
+            raise ValueError("_runtime.target_scale_audit必须是JSON对象")
+        path = self.target_scale_audit_path(checkpoint_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(audit, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        print("target_scale_audit", json.dumps({"path": str(path.resolve())}, ensure_ascii=False))
         return path
 
     @staticmethod
@@ -960,17 +983,32 @@ class Trainer:
             self.cfg["gradient_accumulation_steps"],
         )
         patience = int(self.cfg["training"]["patience"])
+        early_stopping = bool(self.cfg["training"].get("early_stopping", True))
         checkpoint_path = Path(self.cfg["training"]["checkpoint"])
         last_path = self.last_checkpoint_path(checkpoint_path)
+        final_checkpoint_value = self.cfg["training"].get("final_checkpoint")
+        final_path = Path(final_checkpoint_value) if final_checkpoint_value else None
         audit_path = (
             self.q_scale_audit_path(checkpoint_path)
             if self.cfg.get("_runtime", {}).get("q_scale_audit") is not None
             else None
         )
+        target_audit_path = (
+            self.target_scale_audit_path(checkpoint_path)
+            if self.cfg.get("_runtime", {}).get("target_scale_audit") is not None
+            else None
+        )
         if self.start_epoch == 0:
             existing = [
                 path
-                for path in (log, checkpoint_path, last_path, audit_path)
+                for path in (
+                    log,
+                    checkpoint_path,
+                    last_path,
+                    final_path,
+                    audit_path,
+                    target_audit_path,
+                )
                 if path is not None and path.exists()
             ]
             if existing and not overwrite:
@@ -981,10 +1019,11 @@ class Trainer:
             if overwrite and log.exists():
                 log.write_text("", encoding="utf-8")
         self._write_q_scale_audit(checkpoint_path)
+        self._write_target_scale_audit(checkpoint_path)
         self._restore_loader_rng_state(train_loader)
 
         for epoch in range(self.start_epoch, int(self.cfg["training"]["epochs"])):
-            if self.stale >= patience:
+            if early_stopping and self.stale >= patience:
                 break
             self._set_loader_epoch(train_loader, epoch)
             tick = time.perf_counter()
@@ -996,7 +1035,10 @@ class Trainer:
             validation_diagnostics: ValidationDiagnostics | None = None
             validation_summary: dict[str, float | int] = {}
             if val_loader is not None:
-                formal_validation = self.cfg.get("data", {}).get("mode") == "hunan"
+                formal_validation = (
+                    self.cfg.get("data", {}).get("mode") == "hunan"
+                    and self.cfg.get("data", {}).get("dataset_type", "event") == "event"
+                )
                 validation_metrics = self.evaluate(
                     val_loader,
                     include_validation_diagnostics=formal_validation,
@@ -1051,6 +1093,11 @@ class Trainer:
             # The configured path remains the best checkpoint.  A deterministic
             # sibling always records the exact last epoch for strict resumption.
             self.save_checkpoint(last_path, epoch, row, kind="last")
+            if (
+                final_path is not None
+                and epoch == int(self.cfg["training"]["epochs"]) - 1
+            ):
+                self.save_checkpoint(final_path, epoch, row, kind="final")
             if improved:
                 self.save_checkpoint(checkpoint_path, epoch, row, kind="best")
                 if validation_diagnostics is not None:
@@ -1067,6 +1114,6 @@ class Trainer:
                             "selection_metric_value": score,
                         },
                     )
-            if self.stale >= patience:
+            if early_stopping and self.stale >= patience:
                 break
         return history

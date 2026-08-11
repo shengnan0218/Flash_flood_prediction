@@ -40,6 +40,15 @@ _HUNAN_REQUIRED_FILES = (
     "qc/rain_source_coverage.csv",
     "qc/sample_rejection.csv",
 )
+_HUNAN_CONTINUOUS_REQUIRED_FILES = (
+    "graph/node_catalog.csv",
+    "graph/edge_topology.csv",
+    "graph/node_static_attributes.csv",
+    "graph/edge_static_attributes.csv",
+    "samples/sample_index.csv",
+    "metadata/feature_schema.json",
+    "metadata/normalization_stats.json",
+)
 _CONTRACT_HASH_FILES = tuple(
     name
     for name in _HUNAN_REQUIRED_FILES
@@ -83,7 +92,9 @@ def _runtime_config_from_mapping(
         )
     if graph_id is not None:
         cfg["data"]["graph_id"] = graph_id
-    for key in ("checkpoint", "log_csv"):
+    for key in ("checkpoint", "log_csv", "final_checkpoint"):
+        if cfg["training"].get(key) is None:
+            continue
         path = Path(cfg["training"][key]).expanduser()
         cfg["training"][key] = str(
             path.resolve() if path.is_absolute() else (_PROJECT_ROOT / path).resolve()
@@ -128,9 +139,14 @@ def _hunan_loader(
     split: str,
     shuffle: bool,
     dynamic_cache: dict | None = None,
+    sample_index_path: str | Path | None = None,
 ) -> Any:
     try:
-        from datasets import HunanGraphEventDataset, build_hunan_loader
+        from datasets import (
+            HunanContinuousDataset,
+            HunanGraphEventDataset,
+            build_hunan_loader,
+        )
     except ImportError as exc:
         raise RuntimeError(
             "湖南正式数据适配器不可用；请确认 datasets.hunan 已安装在当前 project 中"
@@ -140,7 +156,13 @@ def _hunan_loader(
     root = Path(data_cfg["dataset_root"]).expanduser().resolve()
     if not root.is_dir():
         raise FileNotFoundError(f"湖南正式 _model_dataset 根目录不存在: {root}")
-    missing = [name for name in _HUNAN_REQUIRED_FILES if not (root / name).is_file()]
+    continuous = data_cfg.get("dataset_type", "event") == "continuous"
+    required = _HUNAN_CONTINUOUS_REQUIRED_FILES if continuous else _HUNAN_REQUIRED_FILES
+    missing = [name for name in required if not (root / name).is_file()]
+    if continuous and sample_index_path is not None:
+        missing = [name for name in missing if name != "samples/sample_index.csv"]
+        if not Path(sample_index_path).expanduser().resolve().is_file():
+            missing.append(str(Path(sample_index_path).expanduser().resolve()))
     dynamic_dir = root / "dynamic"
     if not dynamic_dir.is_dir() or not any(dynamic_dir.glob("graph_*_hourly.csv")):
         missing.append("dynamic/graph_<BASIN_ID>_hourly.csv")
@@ -148,20 +170,24 @@ def _hunan_loader(
         raise FileNotFoundError(
             "湖南正式 _model_dataset 结构不完整，缺少: " + ", ".join(missing)
         )
-    target = data_cfg["target_variable"]
-    dataset = HunanGraphEventDataset(
-        root,
-        split,
+    common = dict(
         history_hours=cfg["history_length"],
         forecast_hours=cfg["forecast_horizon"],
         graph_id=data_cfg["graph_id"],
-        target_variables=target,
         normalize_dynamic=data_cfg["normalize_dynamic"],
         future_rainfall_mode=data_cfg["future_rainfall_mode"],
         use_observation_masks=data_cfg["use_observation_masks"],
         strict=data_cfg["strict_validation"],
         dynamic_cache=dynamic_cache,
     )
+    if continuous:
+        dataset = HunanContinuousDataset(
+            root, split, sample_index_path=sample_index_path, **common
+        )
+    else:
+        dataset = HunanGraphEventDataset(
+            root, split, target_variables=data_cfg["target_variable"], **common
+        )
     if len(dataset) == 0:
         raise ValueError(f"{split} 划分没有可用样本")
     dimensions = {
@@ -178,6 +204,33 @@ def _hunan_loader(
     ]
     if mismatches:
         raise ValueError("配置与 feature_schema/正式表维度不一致: " + "; ".join(mismatches))
+    sampling_weights = None
+    sampling_cfg = cfg.get("train_sampling", {})
+    if (
+        continuous
+        and split == "TRAIN"
+        and shuffle
+        and bool(sampling_cfg.get("enabled", False))
+    ):
+        statistics = dataset.train_target_statistics()
+        q_floor = float(cfg["loss"]["q_scale_floor_m3s"])
+        dz_floor = float(cfg["loss"]["delta_z_scale_floor_m"])
+        q_scales = {
+            graph: max(float(values["std_m3s"]), q_floor)
+            for graph, values in statistics["q_by_graph"].items()
+        }
+        dz_scales = {
+            station: max(float(values["std_m"]), dz_floor)
+            for station, values in statistics["delta_z_by_station"].items()
+        }
+        sampling_weights = dataset.hydrologic_sampling_weights(
+            q_scales=q_scales,
+            delta_z_scales=dz_scales,
+            response_strength=float(sampling_cfg["response_strength"]),
+            response_cap=float(sampling_cfg["response_cap"]),
+            minimum_weight=float(sampling_cfg["minimum_weight"]),
+            maximum_weight=float(sampling_cfg["maximum_weight"]),
+        )
     return build_hunan_loader(
         dataset,
         batch_size=cfg["batch_size"],
@@ -186,6 +239,7 @@ def _hunan_loader(
         pin_memory=cfg["pin_memory"],
         drop_last=False,
         seed=cfg["seed"] + _SPLIT_SEED_OFFSET[split],
+        sampling_weights=sampling_weights,
     )
 
 
@@ -194,12 +248,15 @@ def _make_loader(
     split: str,
     shuffle: bool,
     dynamic_cache: dict | None = None,
+    sample_index_path: str | Path | None = None,
 ) -> Any:
     if split != "TRAIN" and shuffle:
         raise ValueError(f"{split} loader 禁止 shuffle")
     if cfg["data"]["mode"] == "synthetic":
         return _synthetic_loader(cfg, split, shuffle)
-    return _hunan_loader(cfg, split, shuffle, dynamic_cache)
+    return _hunan_loader(
+        cfg, split, shuffle, dynamic_cache, sample_index_path=sample_index_path
+    )
 
 
 def _dataset_nodes(loader: Any) -> int:
@@ -249,14 +306,19 @@ def _ensure_matching_graph(train_loader: Any, validation_loader: Any) -> None:
         )
 
 
-def _contract_digest(root: Path) -> str:
+def _contract_digest(root: Path, *, continuous: bool = False) -> str:
     """Hash the small authoritative artifacts that define tensor semantics.
 
     Hourly CSVs can be province-scale, so their provenance must be represented
     by ``source_manifest.json`` rather than being re-read solely for hashing.
     """
     digest = hashlib.sha256()
-    for relative_name in _CONTRACT_HASH_FILES:
+    files = (
+        _HUNAN_CONTINUOUS_REQUIRED_FILES
+        if continuous
+        else _CONTRACT_HASH_FILES
+    )
+    for relative_name in files:
         path = root / relative_name
         digest.update(relative_name.encode("utf-8"))
         with path.open("rb") as handle:
@@ -292,12 +354,16 @@ def _runtime_metadata(
         # deviation.  Reported MAE remains in physical m3/s and metres.
         "loss_scales": loss_scales,
         "data_contract": {
-            "format_version": 1,
+            "format_version": 2 if cfg["data"].get("dataset_type") == "continuous" else 1,
             "mode": "hunan",
+            "dataset_type": cfg["data"].get("dataset_type", "event"),
             "station_ids": list(dataset.station_ids),
             "graph_ids": sorted(dataset.graph_ids),
             "target_variables_by_graph": target_mapping,
-            "artifact_sha256": _contract_digest(root),
+            "artifact_sha256": _contract_digest(
+                root,
+                continuous=cfg["data"].get("dataset_type") == "continuous",
+            ),
         },
     }
     if cfg["loss"]["q_scale_mode"] == "per_graph":
@@ -346,6 +412,35 @@ def _runtime_metadata(
             "std_definition": "population std (ddof=0)",
             "q_scale_floor_m3s": floor,
             "graphs": graph_audit,
+        }
+    if cfg["loss"].get("delta_z_scale_mode", "global") == "per_station":
+        source = dataset if q_scale_dataset is None else q_scale_dataset
+        if getattr(source, "split", None) != "TRAIN":
+            raise ValueError("per-station ΔZ scale必须来自TRAIN dataset")
+        statistics = source.train_target_statistics()["delta_z_by_station"]
+        floor = float(cfg["loss"]["delta_z_scale_floor_m"])
+        station_scales = {
+            station: max(float(values["std_m"]), floor)
+            for station, values in statistics.items()
+        }
+        loss_scales["delta_z_by_station"] = station_scales
+        runtime["delta_z_scale_audit"] = {
+            "computed_from_split": "TRAIN",
+            "source": "valid delta-Z(t+h)=Z(t+h)-Z(t0) supervision",
+            "std_definition": "population std (ddof=0)",
+            "delta_z_scale_floor_m": floor,
+            "stations": {
+                station: {
+                    **values,
+                    "delta_z_loss_scale_m": station_scales[station],
+                    "floor_applied": float(values["std_m"]) < floor,
+                }
+                for station, values in statistics.items()
+            },
+        }
+        runtime["target_scale_audit"] = {
+            "q": runtime.get("q_scale_audit"),
+            "delta_z": runtime["delta_z_scale_audit"],
         }
     return runtime
 
@@ -419,6 +514,7 @@ def setup_evaluation(
     split: str = "TEST",
     dataset_root: str | Path | None = None,
     graph_id: str | None = None,
+    sample_index_path: str | Path | None = None,
 ) -> tuple[dict[str, Any], HybridFloodModel, Any, torch.device]:
     """Build a deterministic, never-shuffled evaluation loader."""
     cfg = _runtime_config(config_path, dataset_root, graph_id)
@@ -428,7 +524,10 @@ def setup_evaluation(
     dynamic_cache: dict | None = None
     if (
         cfg["data"]["mode"] == "hunan"
-        and cfg["loss"]["q_scale_mode"] == "per_graph"
+        and (
+            cfg["loss"]["q_scale_mode"] == "per_graph"
+            or cfg["loss"].get("delta_z_scale_mode") == "per_station"
+        )
     ):
         # Standalone VALIDATION/TEST loss must reuse TRAIN scales.  Constructing
         # this deterministic TRAIN view never fits on the evaluated split.
@@ -441,7 +540,11 @@ def setup_evaluation(
         )
         q_scale_dataset = train_scale_loader.dataset
     loader = _make_loader(
-        cfg, split, shuffle=False, dynamic_cache=dynamic_cache
+        cfg,
+        split,
+        shuffle=False,
+        dynamic_cache=dynamic_cache,
+        sample_index_path=sample_index_path,
     )
     cfg["_runtime"] = _runtime_metadata(
         loader, cfg, q_scale_dataset=q_scale_dataset
@@ -486,10 +589,19 @@ def validate_checkpoint_config(
         current_floor = current_loss.get("q_scale_floor_m3s")
         if saved_floor != current_floor:
             mismatches.append("loss.q_scale_floor_m3s")
+    z_defaults = {
+        "z_target_mode": "absolute",
+        "delta_z_scale_mode": "global",
+        "delta_z_scale_floor_m": 0.01,
+    }
+    for key, default in z_defaults.items():
+        if saved_loss.get(key, default) != current_loss.get(key):
+            mismatches.append(f"loss.{key}")
     saved_data = saved.get("data")
     if isinstance(saved_data, dict):
         for key in (
             "mode",
+            "dataset_type",
             "target_variable",
             "use_observation_masks",
             "future_rainfall_mode",
@@ -517,9 +629,18 @@ def validate_checkpoint_config(
             )
         if not isinstance(current_contract, dict):
             raise ValueError("当前正式数据尚未生成运行时数据契约")
-        for key in ("station_ids", "target_variables_by_graph", "artifact_sha256"):
+        for key in ("station_ids", "artifact_sha256"):
             if saved_contract.get(key) != current_contract.get(key):
                 mismatches.append(f"data_contract.{key}")
+        saved_targets = saved_contract.get("target_variables_by_graph")
+        current_targets = current_contract.get("target_variables_by_graph")
+        if not isinstance(saved_targets, dict) or not isinstance(current_targets, dict):
+            mismatches.append("data_contract.target_variables_by_graph")
+        elif resume:
+            if saved_targets != current_targets:
+                mismatches.append("data_contract.target_variables_by_graph")
+        elif any(saved_targets.get(graph) != targets for graph, targets in current_targets.items()):
+            mismatches.append("data_contract.target_variables_by_graph")
         saved_graphs = set(saved_contract.get("graph_ids", ()))
         current_graphs = set(current_contract.get("graph_ids", ()))
         if (resume and saved_graphs != current_graphs) or (
@@ -565,6 +686,32 @@ def validate_checkpoint_config(
                         mismatches.append(
                             f"loss_scales.discharge_by_graph.{graph_id}"
                         )
+        if current_loss.get("delta_z_scale_mode") == "per_station":
+            saved_delta = (
+                saved.get("_runtime", {})
+                .get("loss_scales", {})
+                .get("delta_z_by_station")
+            )
+            current_delta = (
+                cfg.get("_runtime", {})
+                .get("loss_scales", {})
+                .get("delta_z_by_station")
+            )
+            if not isinstance(saved_delta, dict) or not isinstance(current_delta, dict):
+                mismatches.append("loss_scales.delta_z_by_station")
+            else:
+                if resume and set(saved_delta) != set(current_delta):
+                    mismatches.append("loss_scales.delta_z_by_station")
+                if not resume and not set(current_delta).issubset(saved_delta):
+                    mismatches.append("loss_scales.delta_z_by_station")
+                for station in set(current_delta) & set(saved_delta):
+                    if not math.isclose(
+                        float(current_delta[station]),
+                        float(saved_delta[station]),
+                        rel_tol=0.0,
+                        abs_tol=1.0e-12,
+                    ):
+                        mismatches.append(f"loss_scales.delta_z_by_station.{station}")
     if mismatches:
         raise ValueError(
             "checkpoint 与当前配置不兼容: " + ", ".join(sorted(set(mismatches)))

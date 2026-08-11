@@ -1,0 +1,41 @@
+_base_: hunan_e4_multitask_qnorm_v1.yaml
+
+# P2 baseline: frozen Step16 continuous windows; events never admit training data.
+data:
+  dataset_root: _model_dataset_v6_continuous_multitask
+  dataset_type: continuous
+  target_variable: BOTH
+
+history_length: 24
+forecast_horizon: 6
+dynamic_dim: 3
+
+# TRAIN-only inverse graph-frequency and bounded hydrologic-response sampling.
+# Set enabled=false for the ordinary random-sampling ablation.
+train_sampling:
+  enabled: true
+  response_strength: 1.0
+  response_cap: 4.0
+  minimum_weight: 0.25
+  maximum_weight: 4.0
+
+loss:
+  q_scale_mode: per_graph
+  q_scale_floor_m3s: 1.0
+  z_target_mode: delta_from_t0
+  delta_z_scale_mode: per_station
+  delta_z_scale_floor_m: 0.01
+
+validation_selection:
+  mode: val_loss
+
+training:
+  epochs: 100
+  patience: 100
+  early_stopping: false
+  checkpoint: outputs/hunan_p2_continuous_multitask_best.pt
+  final_checkpoint: outputs/hunan_p2_continuous_multitask_epoch100.pt
+  log_csv: outputs/hunan_p2_continuous_multitask_train.csv
+
+hyperparameter_optimization:
+  enabled: false

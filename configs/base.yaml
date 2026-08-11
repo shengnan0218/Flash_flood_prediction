@@ -20,6 +20,7 @@ debug_num_events: 16
 debug_max_batches: 4
 data:
   mode: synthetic
+  dataset_type: event
   dataset_root: null
   graph_id: null
   target_variable: BOTH
@@ -49,6 +50,9 @@ loss:
   # global保持既有TRAIN全局FLOW std；per_graph仅允许湖南multitask实验。
   q_scale_mode: global
   q_scale_floor_m3s: 1.0
+  z_target_mode: absolute
+  delta_z_scale_mode: global
+  delta_z_scale_floor_m: 0.01
   discharge_weight: 2.0
   water_level_weight: 1.0
   q_point_weight: 1.0
@@ -84,7 +88,20 @@ hyperparameter_optimization:
     q_volume_weight: {type: log_float, low: 0.05, high: 1.0}
     z_slope_weight: {type: log_float, low: 0.05, high: 1.0}
 optimizer: {name: adamw, lr: 0.001, weight_decay: 1.0e-5}
-training: {epochs: 5, patience: 5, gradient_clip: 1.0, checkpoint: outputs/best.pt, log_csv: outputs/train.csv}
+train_sampling:
+  enabled: false
+  response_strength: 1.0
+  response_cap: 4.0
+  minimum_weight: 0.25
+  maximum_weight: 4.0
+training:
+  epochs: 5
+  patience: 5
+  early_stopping: true
+  gradient_clip: 1.0
+  checkpoint: outputs/best.pt
+  final_checkpoint: null
+  log_csv: outputs/train.csv
 transfer_learning:
   strategy: observation_only
   stages: [observation_only, observation_and_edge_parameters, full_finetune]

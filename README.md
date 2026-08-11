@@ -1,5 +1,9 @@
 # 湖南省多站河网短时洪水训练与测试
 
+冻结 Step16 连续双目标数据上的 P2 流程见
+[`docs/p2_continuous_multitask.md`](docs/p2_continuous_multitask.md)。其训练不依赖
+事件；重新计算的洪水事件只用于 TEST 专项评价。
+
 本项目已经按湖南正式 `_model_dataset` 接口接通，不再把真实训练伪装成 synthetic 流程。它支持多张不同节点数的河网、按事件划分 TRAIN/VALIDATION/TEST、按河网自动选择流量或水位目标，以及 E1–E4 四组神经/物理消融实验。
 
 默认任务是用前 24 小时预测未来 1–6 小时。正式训练只读取湖南数据；浙江微调尚未启用。

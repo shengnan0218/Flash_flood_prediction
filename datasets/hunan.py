@@ -182,6 +182,28 @@ class _Sample:
     split: str
 
 
+@dataclass(frozen=True, slots=True)
+class _ContinuousSample:
+    """One frozen Step16 continuous window (or a TEST-event reference to it)."""
+
+    sample_id: str
+    graph_id: str
+    outlet_id: str
+    input_start: datetime
+    forecast_time: datetime
+    target_start: datetime
+    target_end: datetime
+    history_hours: int
+    forecast_hours: int
+    split: str
+    event_id: str = ""
+    event_start: str = ""
+    event_end: str = ""
+    rain_start: str = ""
+    rain_end: str = ""
+    peak_time: str = ""
+
+
 @dataclass(frozen=True)
 class _DynamicGraph:
     timestamps: tuple[datetime, ...]
@@ -282,6 +304,15 @@ def _required_text(value: str, name: str, context: str) -> str:
     if not value:
         raise ValueError(f"{context}: {name}不能为空")
     return value
+
+
+def _normalise_station_id(value: str) -> str:
+    """Remove only the spreadsheet-style trailing .0 from numeric station IDs."""
+
+    text = value.strip()
+    if text.endswith(".0") and text[:-2].isdigit():
+        return text[:-2]
+    return text
 
 
 def _parse_bool(value: str, name: str, context: str) -> bool:
@@ -1544,6 +1575,623 @@ class HunanGraphEventDataset(Dataset[GraphEventBatch]):
         )
 
 
+class HunanContinuousDataset(HunanGraphEventDataset):
+    """Continuous Step16 windows with simultaneous outlet Q and delta-Z targets.
+
+    This adapter deliberately does not read any Step13/event artifact.  The
+    authoritative split is the ``SPLIT`` column written by frozen Step16 and is
+    cross-checked against ``feature_schema.json`` absolute time boundaries.
+    """
+
+    CONTINUOUS_SAMPLE_COLUMNS = (
+        "SAMPLE_ID",
+        "GRAPH_ID",
+        "OUTLET_ID",
+        "INPUT_START",
+        "FORECAST_TIME",
+        "TARGET_START",
+        "TARGET_END",
+        "HISTORY_HOURS",
+        "FORECAST_HOURS",
+        "SPLIT",
+    )
+
+    def __init__(
+        self,
+        root: str | Path,
+        split: str,
+        history_hours: int | None = None,
+        forecast_hours: int | None = None,
+        *,
+        graph_id: str | None = None,
+        normalize_dynamic: bool = True,
+        future_rainfall_mode: str = "persistence",
+        use_observation_masks: bool = True,
+        strict: bool = True,
+        dynamic_cache: dict[tuple[str, str], _DynamicGraph] | None = None,
+        sample_index_path: str | Path | None = None,
+    ) -> None:
+        self.root = Path(root).expanduser().resolve()
+        if not self.root.is_dir():
+            raise FileNotFoundError(f"湖南连续数据根目录不存在或不是目录: {self.root}")
+        self.split = _normalise_split(split, "数据集split")
+        self.strict = strict
+        self.allow_divergence = False
+        self._dynamic_cache = dynamic_cache if dynamic_cache is not None else {}
+        self.normalize_dynamic = normalize_dynamic
+        self.future_rainfall_mode = future_rainfall_mode.strip().lower()
+        if self.future_rainfall_mode not in {"observed_hindcast", "zero", "persistence"}:
+            raise ValueError(
+                "future_rainfall_mode只能是observed_hindcast/zero/persistence，"
+                f"实际为{future_rainfall_mode!r}"
+            )
+        if not use_observation_masks:
+            raise ValueError("湖南正式数据必须使用观测mask，禁止把Q/Z缺测当作真实0")
+        self.use_observation_masks = True
+        self._requested_graph_id = graph_id.strip() if graph_id is not None else None
+        self._sample_index_path = (
+            Path(sample_index_path).expanduser().resolve()
+            if sample_index_path is not None
+            else self.root / "samples" / "sample_index.csv"
+        )
+
+        self.dynamic_features = self._load_continuous_feature_schema()
+        self.node_static_features = NODE_STATIC_FEATURES
+        self.edge_static_features = EDGE_STATIC_MODEL_FEATURES
+        self.dynamic_dim = len(self.dynamic_features)
+        self.node_static_dim = len(self.node_static_features)
+        self.edge_static_dim = len(self.edge_static_features)
+        required_stats = tuple(
+            dict.fromkeys(
+                feature
+                for feature in (*self.dynamic_features, "RAIN_MM", "FLOW", "WATER_LEVEL")
+                if feature in {"RAIN_MM", "FLOW", "WATER_LEVEL"}
+            )
+        )
+        self.normalization = NormalizationStats.load(
+            self.root / "metadata" / "normalization_stats.json",
+            required=required_stats,
+            require_train_provenance=self.strict,
+        )
+
+        nodes_by_graph, graph_metadata = self._load_node_catalog()
+        self.station_ids = tuple(
+            sorted({node.station_id for nodes in nodes_by_graph.values() for node in nodes})
+        )
+        self.station_to_index = {
+            station: index for index, station in enumerate(self.station_ids)
+        }
+        self.num_stations = len(self.station_ids)
+        self._graphs = self._load_graphs(nodes_by_graph, graph_metadata)
+        if self._requested_graph_id is not None and self._requested_graph_id not in self._graphs:
+            raise ValueError(
+                f"指定GRAPH_ID={self._requested_graph_id!r}不在node_catalog.csv中"
+            )
+        self._samples = self._load_continuous_samples(history_hours, forecast_hours)
+        used_graphs = tuple(dict.fromkeys(sample.graph_id for sample in self._samples))
+        self.graph_ids = used_graphs
+        self.graph_node_counts = {
+            graph: len(self._graphs[graph].nodes) for graph in used_graphs
+        }
+        self.target_variables_by_graph = {
+            graph: frozenset({"FLOW", "WATER_LEVEL"}) for graph in used_graphs
+        }
+        self.event_ids = frozenset(
+            sample.event_id for sample in self._samples if sample.event_id
+        )
+        self.event_split_by_id = {event_id: self.split for event_id in self.event_ids}
+        self.history_hours = self._samples[0].history_hours
+        self.forecast_hours = self._samples[0].forecast_hours
+        self.artifact_status = {
+            "contract": self._continuous_schema.get("contract"),
+            "sample_index": str(self._sample_index_path),
+        }
+        self.qc_status = {}
+        self._dynamic = self._load_dynamic_data(set(used_graphs))
+        self._filter_effective_supervision()
+        self.sample_weights = tuple(1.0 for _ in self._samples)
+        self._target_statistics_cache: dict[str, Any] | None = None
+
+    def _load_continuous_feature_schema(self) -> tuple[str, ...]:
+        path = self.root / "metadata" / "feature_schema.json"
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8-sig"))
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(f"缺少连续数据feature_schema.json: {path}") from exc
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"feature_schema.json不是有效JSON: {path}: {exc}") from exc
+        if not isinstance(raw, dict):
+            raise ValueError("feature_schema.json根节点必须是对象")
+        contract = str(raw.get("contract", ""))
+        if contract != "continuous-hourly-dual-target-v1":
+            raise ValueError(
+                "P2只接受冻结的continuous-hourly-dual-target-v1契约，"
+                f"实际={contract!r}"
+            )
+        if int(raw.get("history_hours", -1)) != 24 or int(raw.get("forecast_hours", -1)) != 6:
+            raise ValueError("冻结Step16契约必须是history=24、forecast=6")
+        self._continuous_schema = raw
+        time_splits = raw.get("time_splits")
+        if not isinstance(time_splits, dict):
+            raise ValueError("feature_schema.json缺少time_splits绝对边界")
+        self._time_splits: dict[str, tuple[datetime, datetime]] = {}
+        for name in ("TRAIN", "VALIDATION", "TEST"):
+            value = time_splits.get(name)
+            if not isinstance(value, dict):
+                raise ValueError(f"feature_schema.json缺少{name}时间边界")
+            start = _parse_datetime(str(value.get("start", "")), "start", str(path))
+            end = _parse_datetime(str(value.get("end", "")), "end", str(path))
+            if start > end:
+                raise ValueError(f"{name}时间边界start>end")
+            self._time_splits[name] = (start, end)
+        if not (
+            self._time_splits["TRAIN"][1] < self._time_splits["VALIDATION"][0]
+            and self._time_splits["VALIDATION"][1] < self._time_splits["TEST"][0]
+        ):
+            raise ValueError("TRAIN/VALIDATION/TEST绝对时间边界重叠或顺序错误")
+        dynamic = tuple(
+            name.upper()
+            for name in _feature_list(raw, "dynamic_features", DEFAULT_DYNAMIC_FEATURES)
+        )
+        unsupported = sorted(set(dynamic) - SUPPORTED_DYNAMIC_FEATURES)
+        if unsupported:
+            raise ValueError(f"feature_schema包含不支持的动态特征{unsupported}")
+        node = _feature_list(raw, "node_static_features", NODE_STATIC_FEATURES)
+        edge = _feature_list(raw, "edge_static_features", EDGE_STATIC_SOURCE_FEATURES)
+        if node != NODE_STATIC_FEATURES or edge != EDGE_STATIC_SOURCE_FEATURES:
+            raise ValueError("连续数据静态特征顺序与模型正式契约不一致")
+        try:
+            self._area_source, self._area_inverse = self._parse_area_contract(raw, path)
+        except ValueError:
+            # Step16 v1 names this field ``log_incremental_area`` and writes the
+            # natural log directly.  Treat that versioned contract as the
+            # explicit declaration; no heuristic is applied to other contracts.
+            self._area_source, self._area_inverse = "log_incremental_area", "exp"
+        return dynamic
+
+    def _load_continuous_samples(
+        self, history_hours: int | None, forecast_hours: int | None
+    ) -> list[_ContinuousSample]:
+        path = self._sample_index_path
+        try:
+            handle = path.open("r", encoding="utf-8-sig", newline="")
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(f"缺少连续sample index: {path}") from exc
+        selected: list[_ContinuousSample] = []
+        seen: set[str] = set()
+        with handle:
+            reader = csv.DictReader(handle)
+            if reader.fieldnames is None:
+                raise ValueError(f"CSV缺少表头: {path}")
+            missing = [name for name in self.CONTINUOUS_SAMPLE_COLUMNS if name not in reader.fieldnames]
+            if missing:
+                raise ValueError(f"连续sample index缺少列{missing}: {path}")
+            for line_number, raw in enumerate(reader, start=2):
+                row = {name: (raw.get(name) or "").strip() for name in reader.fieldnames}
+                row_split = _normalise_split(row["SPLIT"], f"{path}第{line_number}行SPLIT")
+                if row_split != self.split:
+                    continue
+                graph = _required_text(row["GRAPH_ID"], "GRAPH_ID", f"{path}第{line_number}行")
+                if self._requested_graph_id is not None and graph != self._requested_graph_id:
+                    continue
+                if graph not in self._graphs:
+                    raise ValueError(f"{path}第{line_number}行引用未知GRAPH_ID={graph!r}")
+                sample_id = _required_text(row["SAMPLE_ID"], "SAMPLE_ID", f"{path}第{line_number}行")
+                if sample_id in seen:
+                    raise ValueError(f"连续sample index的SAMPLE_ID重复: {sample_id}")
+                seen.add(sample_id)
+                history = _parse_int(row["HISTORY_HOURS"], "HISTORY_HOURS", str(path), 1)
+                forecast = _parse_int(row["FORECAST_HOURS"], "FORECAST_HOURS", str(path), 1)
+                if history_hours is not None and history != int(history_hours):
+                    raise ValueError(f"SAMPLE_ID={sample_id}: history与配置不一致")
+                if forecast_hours is not None and forecast != int(forecast_hours):
+                    raise ValueError(f"SAMPLE_ID={sample_id}: forecast与配置不一致")
+                input_start = _parse_datetime(row["INPUT_START"], "INPUT_START", str(path))
+                origin = _parse_datetime(row["FORECAST_TIME"], "FORECAST_TIME", str(path))
+                target_start = _parse_datetime(row["TARGET_START"], "TARGET_START", str(path))
+                target_end = _parse_datetime(row["TARGET_END"], "TARGET_END", str(path))
+                if origin != input_start + timedelta(hours=history - 1):
+                    raise ValueError(f"SAMPLE_ID={sample_id}: forecast origin不是history最后一小时")
+                if target_start != origin + timedelta(hours=1) or target_end != origin + timedelta(hours=forecast):
+                    raise ValueError(f"SAMPLE_ID={sample_id}: h1..h{forecast}目标时间定义错误")
+                split_start, split_end = self._time_splits[row_split]
+                if input_start < split_start or target_end > split_end:
+                    raise ValueError(
+                        f"SAMPLE_ID={sample_id}: 窗口跨越{row_split}绝对边界，"
+                        f"window={input_start}..{target_end}, split={split_start}..{split_end}"
+                    )
+                outlet = _normalise_station_id(
+                    _required_text(row["OUTLET_ID"], "OUTLET_ID", str(path))
+                )
+                expected_outlet = self._graphs[graph].outlet_id
+                if outlet != expected_outlet:
+                    # Frozen Step16 v1 let pandas infer this denormalized CSV
+                    # column, so numeric IDs can appear as ``.0`` and IDs such
+                    # as 810E0050 can be rendered as scientific notation.  The
+                    # graph catalogue and Q_<outlet> key remain lossless and
+                    # authoritative; accept only that provable identity.
+                    if graph != f"Q_{expected_outlet}":
+                        raise ValueError(
+                            f"SAMPLE_ID={sample_id}: OUTLET_ID={outlet}与graph出口"
+                            f"{expected_outlet}不一致且无法由GRAPH_ID证明"
+                        )
+                    outlet = expected_outlet
+                selected.append(
+                    _ContinuousSample(
+                        sample_id,
+                        graph,
+                        outlet,
+                        input_start,
+                        origin,
+                        target_start,
+                        target_end,
+                        history,
+                        forecast,
+                        row_split,
+                        row.get("EVENT_ID", ""),
+                        row.get("EVENT_START", row.get("HYDRO_START", "")),
+                        row.get("EVENT_END", row.get("HYDRO_END", "")),
+                        row.get("RAIN_START", ""),
+                        row.get("RAIN_END", ""),
+                        row.get("PEAK_TIME", ""),
+                    )
+                )
+        if not selected:
+            raise ValueError(
+                f"连续sample index在split={self.split}, graph={self._requested_graph_id!r}下为空: {path}"
+            )
+        return selected
+
+    def _filter_effective_supervision(self) -> None:
+        groups: dict[str, list[tuple[int, _ContinuousSample]]] = {}
+        for index, sample in enumerate(self._samples):
+            groups.setdefault(sample.graph_id, []).append((index, sample))
+        keep = torch.zeros(len(self._samples), dtype=torch.bool)
+        horizons = torch.arange(1, self.forecast_hours + 1)
+        for graph_id, indexed_samples in groups.items():
+            graph = self._graphs[graph_id]
+            outlet = next(node.node_index for node in graph.nodes if node.is_outlet)
+            dynamic = self._dynamic[graph_id]
+            for start in range(0, len(indexed_samples), 100_000):
+                chunk = indexed_samples[start : start + 100_000]
+                origins = torch.tensor(
+                    [self._origin_index(sample) for _, sample in chunk], dtype=torch.long
+                )
+                future = origins.unsqueeze(1) + horizons.unsqueeze(0)
+                q_valid = dynamic.flow_mask[future, outlet].any(dim=1)
+                dz_valid = (
+                    dynamic.water_level_mask[origins, outlet]
+                    & dynamic.water_level_mask[future, outlet].any(dim=1)
+                )
+                keep[[index for index, _ in chunk]] = q_valid | dz_valid
+        retained = [sample for index, sample in enumerate(self._samples) if bool(keep[index])]
+        if not retained:
+            raise ValueError(f"{self.split}没有Q或严格ΔZ有效监督窗口")
+        self._samples = retained
+
+    def _origin_index(self, sample: _ContinuousSample) -> int:
+        dynamic = self._dynamic[sample.graph_id]
+        try:
+            origin = dynamic.time_to_index[sample.forecast_time]
+        except KeyError as exc:
+            raise ValueError(f"SAMPLE_ID={sample.sample_id}: dynamic缺少FORECAST_TIME") from exc
+        history_start = origin - sample.history_hours + 1
+        future_end = origin + sample.forecast_hours
+        if history_start < 0 or future_end >= len(dynamic.timestamps):
+            raise ValueError(f"SAMPLE_ID={sample.sample_id}: dynamic窗口越界")
+        if (
+            dynamic.timestamps[history_start] != sample.input_start
+            or dynamic.timestamps[future_end] != sample.target_end
+        ):
+            raise ValueError(f"SAMPLE_ID={sample.sample_id}: dynamic不是连续逐小时窗口")
+        return origin
+
+    def _window_indices(
+        self, sample: _ContinuousSample
+    ) -> tuple[list[int], list[int]]:
+        origin = self._origin_index(sample)
+        return (
+            list(range(origin - sample.history_hours + 1, origin + 1)),
+            list(range(origin + 1, origin + sample.forecast_hours + 1)),
+        )
+
+    def train_target_statistics(self) -> dict[str, Any]:
+        """Compute P2 Q/ΔZ scales from TRAIN supervision only."""
+
+        if self.split != "TRAIN":
+            raise ValueError(f"target scale只能从TRAIN计算，当前={self.split}")
+        if self._target_statistics_cache is not None:
+            return self._target_statistics_cache
+        samples_by_graph: dict[str, list[_ContinuousSample]] = {}
+        for sample in self._samples:
+            samples_by_graph.setdefault(sample.graph_id, []).append(sample)
+        q_stats: dict[str, dict[str, float | int]] = {}
+        dz_moments: dict[str, list[float | int]] = {
+            self._graphs[graph].outlet_id: [0, 0.0, 0.0] for graph in self.graph_ids
+        }
+        horizons = torch.arange(1, self.forecast_hours + 1)
+        for graph_id, samples in samples_by_graph.items():
+            graph = self._graphs[graph_id]
+            outlet = next(node.node_index for node in graph.nodes if node.is_outlet)
+            dynamic = self._dynamic[graph_id]
+            q_used = torch.zeros(len(dynamic.timestamps), dtype=torch.bool)
+            moments = dz_moments[graph.outlet_id]
+            for start in range(0, len(samples), 100_000):
+                chunk = samples[start : start + 100_000]
+                origins = torch.tensor(
+                    [self._origin_index(sample) for sample in chunk], dtype=torch.long
+                )
+                future = origins.unsqueeze(1) + horizons.unsqueeze(0)
+                q_future_mask = dynamic.flow_mask[future, outlet]
+                q_used[future[q_future_mask]] = True
+                z_future_mask = dynamic.water_level_mask[future, outlet]
+                z_valid = (
+                    dynamic.water_level_mask[origins, outlet].unsqueeze(1)
+                    & z_future_mask
+                )
+                deltas = (
+                    dynamic.water_level[future, outlet]
+                    - dynamic.water_level[origins, outlet].unsqueeze(1)
+                ).to(torch.float64)
+                values = deltas[z_valid]
+                moments[0] = int(moments[0]) + int(values.numel())
+                moments[1] = float(moments[1]) + float(values.sum())
+                moments[2] = float(moments[2]) + float(values.square().sum())
+            values = dynamic.flow[q_used, outlet].to(torch.float64)
+            if values.numel() < 2:
+                raise ValueError(f"GRAPH_ID={graph_id}: TRAIN有效出口Q不足2点")
+            q_stats[graph_id] = {
+                "valid_unique_point_count": int(values.numel()),
+                "mean_m3s": float(values.mean()),
+                "std_m3s": float(values.std(unbiased=False)),
+            }
+        dz_stats: dict[str, dict[str, float | int]] = {}
+        for station_id, (count, total, squared_total) in dz_moments.items():
+            count = int(count)
+            if count < 2:
+                raise ValueError(f"STATION_ID={station_id}: TRAIN有效ΔZ不足2点")
+            mean = float(total) / count
+            variance = max(float(squared_total) / count - mean * mean, 0.0)
+            dz_stats[station_id] = {
+                "valid_point_count": count,
+                "mean_m": mean,
+                "std_m": math.sqrt(variance),
+            }
+        self._target_statistics_cache = {"q_by_graph": q_stats, "delta_z_by_station": dz_stats}
+        return self._target_statistics_cache
+
+    def train_q_supervision_statistics(self) -> dict[str, dict[str, float | int]]:
+        return self.train_target_statistics()["q_by_graph"]
+
+    def hydrologic_sampling_weights(
+        self,
+        *,
+        q_scales: Mapping[str, float],
+        delta_z_scales: Mapping[str, float],
+        response_strength: float,
+        response_cap: float,
+        minimum_weight: float,
+        maximum_weight: float,
+    ) -> torch.Tensor:
+        """Return bounded TRAIN-only graph-balance × response weights."""
+
+        if self.split != "TRAIN":
+            raise ValueError("weighted sampling只能用于TRAIN")
+        graph_counts = Counter(sample.graph_id for sample in self._samples)
+        raw = torch.zeros(len(self._samples), dtype=torch.float64)
+        q_means = {
+            graph: float(values["mean_m3s"])
+            for graph, values in self.train_target_statistics()["q_by_graph"].items()
+        }
+        groups: dict[str, list[tuple[int, _ContinuousSample]]] = {}
+        for index, sample in enumerate(self._samples):
+            groups.setdefault(sample.graph_id, []).append((index, sample))
+        horizons = torch.arange(1, self.forecast_hours + 1)
+        for graph_id, indexed_samples in groups.items():
+            graph = self._graphs[graph_id]
+            outlet = next(node.node_index for node in graph.nodes if node.is_outlet)
+            dynamic = self._dynamic[graph_id]
+            q_scale = float(q_scales[graph_id])
+            dz_scale = float(delta_z_scales[graph.outlet_id])
+            for start in range(0, len(indexed_samples), 100_000):
+                chunk = indexed_samples[start : start + 100_000]
+                positions = [index for index, _ in chunk]
+                origins = torch.tensor(
+                    [self._origin_index(sample) for _, sample in chunk], dtype=torch.long
+                )
+                future = origins.unsqueeze(1) + horizons.unsqueeze(0)
+                q = dynamic.flow[future, outlet].to(torch.float64)
+                q_valid = dynamic.flow_mask[future, outlet]
+                q_count = q_valid.sum(dim=1)
+                anomaly = (
+                    ((q - q_means[graph_id]).abs() * q_valid).sum(dim=1)
+                    / q_count.clamp_min(1)
+                    / q_scale
+                )
+                sequence = torch.cat(
+                    (
+                        dynamic.flow[origins, outlet]
+                        .to(torch.float64)
+                        .unsqueeze(1),
+                        q,
+                    ),
+                    dim=1,
+                )
+                sequence_mask = torch.cat(
+                    (dynamic.flow_mask[origins, outlet].unsqueeze(1), q_valid), dim=1
+                )
+                pair_mask = sequence_mask[:, 1:] & sequence_mask[:, :-1]
+                pair_count = pair_mask.sum(dim=1)
+                change = (
+                    (sequence.diff(dim=1).abs() * pair_mask).sum(dim=1)
+                    / pair_count.clamp_min(1)
+                    / q_scale
+                )
+                q_response = torch.maximum(anomaly, change)
+                q_available = q_count > 0
+
+                z0 = dynamic.water_level[origins, outlet].to(torch.float64)
+                z_valid = (
+                    dynamic.water_level_mask[origins, outlet].unsqueeze(1)
+                    & dynamic.water_level_mask[future, outlet]
+                )
+                z_count = z_valid.sum(dim=1)
+                dz_response = (
+                    (
+                        (
+                            dynamic.water_level[future, outlet].to(torch.float64)
+                            - z0.unsqueeze(1)
+                        ).abs()
+                        * z_valid
+                    ).sum(dim=1)
+                    / z_count.clamp_min(1)
+                    / dz_scale
+                )
+                z_available = z_count > 0
+                available = q_available.to(torch.float64) + z_available.to(torch.float64)
+                response = (
+                    q_response * q_available + dz_response * z_available
+                ) / available.clamp_min(1)
+                response.clamp_(max=response_cap)
+                values = (1.0 + response_strength * response) / graph_counts[graph_id]
+                raw[positions] = values
+        weights = raw
+        weights /= weights.mean()
+        weights.clamp_(minimum_weight, maximum_weight)
+        weights /= weights.mean()
+        return weights.to(torch.float32)
+
+    def __getitem__(self, index: int) -> GraphEventBatch:
+        sample = self._samples[index]
+        graph = self._graphs[sample.graph_id]
+        dynamic = self._dynamic[sample.graph_id]
+        history_indices, future_indices = self._window_indices(sample)
+        history_flow = dynamic.flow[history_indices].clone()
+        history_level = dynamic.water_level[history_indices].clone()
+        q_mask = dynamic.flow_mask[history_indices].clone()
+        z_mask = dynamic.water_level_mask[history_indices].clone()
+        feature_values: list[torch.Tensor] = []
+        for feature in self.dynamic_features:
+            if feature == "FLOW":
+                value, mask = history_flow, q_mask
+            elif feature == "WATER_LEVEL":
+                value, mask = history_level, z_mask
+            elif feature == "RAIN_MM":
+                value, mask = dynamic.rainfall[history_indices], dynamic.rainfall_mask[history_indices]
+            elif feature == "FLOW_MASK":
+                feature_values.append(q_mask.float())
+                continue
+            elif feature == "WATER_LEVEL_MASK":
+                feature_values.append(z_mask.float())
+                continue
+            elif feature == "RAIN_MASK":
+                feature_values.append(dynamic.rainfall_mask[history_indices].float())
+                continue
+            else:
+                raise AssertionError(f"未实现动态特征{feature}")
+            if self.normalize_dynamic:
+                value, _ = self.normalization.transform(feature, value, mask)
+            else:
+                value = torch.where(mask, value.float(), torch.zeros_like(value, dtype=torch.float32))
+            feature_values.append(value)
+        dynamic_features = torch.stack(feature_values, dim=-1)
+
+        history_rain_mask = dynamic.rainfall_mask[history_indices].clone()
+        history_rain = torch.where(
+            history_rain_mask,
+            dynamic.rainfall[history_indices],
+            torch.zeros_like(dynamic.rainfall[history_indices]),
+        )
+        if self.future_rainfall_mode == "observed_hindcast":
+            future_rain_mask = dynamic.rainfall_mask[future_indices].clone()
+            future_rain = torch.where(
+                future_rain_mask,
+                dynamic.rainfall[future_indices],
+                torch.zeros_like(dynamic.rainfall[future_indices]),
+            )
+        elif self.future_rainfall_mode == "zero":
+            future_rain = torch.zeros((sample.forecast_hours, len(graph.nodes)), dtype=torch.float32)
+            future_rain_mask = torch.zeros_like(future_rain, dtype=torch.bool)
+        else:  # persistence
+            persisted = torch.zeros(len(graph.nodes), dtype=torch.float32)
+            for node_index in range(len(graph.nodes)):
+                valid = history_rain_mask[:, node_index].nonzero(as_tuple=False).flatten()
+                if valid.numel():
+                    persisted[node_index] = history_rain[valid[-1], node_index]
+            future_rain = persisted.unsqueeze(0).expand(sample.forecast_hours, -1).clone()
+            future_rain_mask = torch.zeros_like(future_rain, dtype=torch.bool)
+        rainfall = torch.cat((history_rain, future_rain), dim=0).unsqueeze(-1)
+        rainfall_mask = torch.cat((history_rain_mask, future_rain_mask), dim=0).unsqueeze(-1)
+
+        nodes = len(graph.nodes)
+        q_target = torch.zeros((sample.forecast_hours, nodes), dtype=torch.float32)
+        dz_target = torch.zeros_like(q_target)
+        q_target_mask = torch.zeros_like(q_target, dtype=torch.bool)
+        dz_target_mask = torch.zeros_like(q_target_mask)
+        z_reference = torch.zeros(nodes, dtype=torch.float32)
+        z_reference_mask = torch.zeros(nodes, dtype=torch.bool)
+        outlet = next(node.node_index for node in graph.nodes if node.is_outlet)
+        q_values = dynamic.flow[future_indices, outlet]
+        q_valid = dynamic.flow_mask[future_indices, outlet]
+        q_target[:, outlet] = torch.where(q_valid, q_values, torch.zeros_like(q_values))
+        q_target_mask[:, outlet] = q_valid
+        t0_index = history_indices[-1]
+        t0_valid = dynamic.water_level_mask[t0_index, outlet]
+        if bool(t0_valid):
+            baseline = dynamic.water_level[t0_index, outlet]
+            z_reference[outlet] = baseline
+            z_reference_mask[outlet] = True
+            z_values = dynamic.water_level[future_indices, outlet]
+            z_valid = dynamic.water_level_mask[future_indices, outlet]
+            dz_target[:, outlet] = torch.where(
+                z_valid, z_values - baseline, torch.zeros_like(z_values)
+            )
+            dz_target_mask[:, outlet] = z_valid
+
+        station_ids = tuple(node.station_id for node in graph.nodes)
+        station_index = torch.tensor(
+            [self.station_to_index[station] for station in station_ids], dtype=torch.long
+        )
+        return GraphEventBatch(
+            dynamic_node_features=dynamic_features,
+            rainfall=rainfall,
+            node_static=graph.node_static,
+            edge_index=graph.edge_index,
+            edge_static=graph.edge_static,
+            q_history=history_flow,
+            z_history=history_level,
+            q_mask=q_mask,
+            z_mask=z_mask,
+            q_target=q_target,
+            z_target=dz_target,
+            q_target_mask=q_target_mask,
+            z_target_mask=dz_target_mask,
+            node_mask=torch.ones(nodes, dtype=torch.bool),
+            event_mask=torch.tensor(bool(sample.event_id)),
+            rainfall_mask=rainfall_mask,
+            station_index=station_index,
+            node_area_km2=graph.node_area_km2,
+            station_ids=station_ids,
+            sample_id=sample.sample_id,
+            event_id=sample.event_id,
+            graph_id=sample.graph_id,
+            target_station_id=sample.outlet_id,
+            forecast_time=_format_datetime(sample.forecast_time),
+            event_rain_start=sample.rain_start,
+            event_rain_end=sample.rain_end,
+            event_hydro_start=sample.event_start,
+            event_hydro_end=sample.event_end,
+            event_peak_time=sample.peak_time,
+            event_sample_start=sample.event_start,
+            event_sample_end=sample.event_end,
+            sample_weight=torch.tensor(1.0, dtype=torch.float32),
+            z_reference=z_reference,
+            z_reference_mask=z_reference_mask,
+            target_start=_format_datetime(sample.target_start),
+            target_end=_format_datetime(sample.target_end),
+        )
+
+
 def collate_hunan_graph_events(items: list[GraphEventBatch]) -> GraphEventBatch:
     """Collate samples from one graph and reject accidental graph mixing."""
     if not items:
@@ -1581,6 +2229,8 @@ def collate_hunan_graph_events(items: list[GraphEventBatch]) -> GraphEventBatch:
         "event_peak_time",
         "event_sample_start",
         "event_sample_end",
+        "target_start",
+        "target_end",
     }
     kwargs: dict[str, Any] = {}
     for name in GraphEventBatch.__dataclass_fields__:
@@ -1651,6 +2301,50 @@ class GraphGroupedBatchSampler(Sampler[list[int]]):
         return sum((len(indices) + self.batch_size - 1) // self.batch_size for indices in self._groups.values())
 
 
+class WeightedGraphGroupedBatchSampler(GraphGroupedBatchSampler):
+    """TRAIN-only bounded weighted draws while keeping every batch single-graph."""
+
+    def __init__(
+        self,
+        dataset: HunanContinuousDataset,
+        batch_size: int,
+        weights: torch.Tensor,
+        drop_last: bool = False,
+        seed: int = 42,
+    ) -> None:
+        super().__init__(dataset, batch_size, True, drop_last, seed)
+        if weights.ndim != 1 or weights.numel() != len(dataset):
+            raise ValueError("weighted sampler的weights必须与TRAIN样本一一对应")
+        if not torch.isfinite(weights).all() or (weights <= 0).any():
+            raise ValueError("weighted sampler的weights必须为有限正数")
+        self.weights = weights.to(torch.float64).cpu()
+        self.num_samples = len(dataset)
+
+    def __iter__(self) -> Iterator[list[int]]:
+        draws = torch.multinomial(
+            self.weights,
+            self.num_samples,
+            replacement=True,
+            generator=self.generator,
+        ).tolist()
+        by_graph: dict[str, list[int]] = {}
+        for index in draws:
+            by_graph.setdefault(self.dataset.graph_id_for_index(index), []).append(index)
+        batches: list[list[int]] = []
+        for indices in by_graph.values():
+            for start in range(0, len(indices), self.batch_size):
+                batch = indices[start : start + self.batch_size]
+                if len(batch) == self.batch_size or not self.drop_last:
+                    batches.append(batch)
+        order = torch.randperm(len(batches), generator=self.generator).tolist()
+        yield from (batches[position] for position in order)
+
+    def __len__(self) -> int:
+        # Group totals vary slightly per multinomial epoch.  This stable upper
+        # bound is used only for progress reporting, never for normalization.
+        return (self.num_samples + self.batch_size - 1) // self.batch_size + len(self._groups)
+
+
 def build_hunan_loader(
     dataset: HunanGraphEventDataset,
     batch_size: int,
@@ -1659,9 +2353,19 @@ def build_hunan_loader(
     pin_memory: bool = False,
     drop_last: bool = False,
     seed: int = 42,
+    sampling_weights: torch.Tensor | None = None,
 ) -> DataLoader[GraphEventBatch]:
     """Build a DataLoader whose batches are safe for shared graph tensors."""
-    sampler = GraphGroupedBatchSampler(dataset, batch_size, shuffle, drop_last, seed)
+    if sampling_weights is not None:
+        if not shuffle or getattr(dataset, "split", None) != "TRAIN":
+            raise ValueError("weighted sampler只允许TRAIN且必须启用shuffle")
+        if not isinstance(dataset, HunanContinuousDataset):
+            raise ValueError("weighted sampler仅用于P2 continuous dataset")
+        sampler = WeightedGraphGroupedBatchSampler(
+            dataset, batch_size, sampling_weights, drop_last, seed
+        )
+    else:
+        sampler = GraphGroupedBatchSampler(dataset, batch_size, shuffle, drop_last, seed)
     return DataLoader(
         dataset,
         batch_sampler=sampler,

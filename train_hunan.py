@@ -1,4 +1,4 @@
-"""Train on formal Hunan TRAIN events and select checkpoints on VALIDATION only."""
+"""Train formal Hunan event or continuous datasets with VALIDATION selection."""
 from __future__ import annotations
 
 import argparse
@@ -16,14 +16,14 @@ def _event_count(loader) -> int:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="湖南洪水模型训练；TRAIN 与 VALIDATION 按事件严格隔离"
+        description="湖南洪水模型训练；P2 continuous严格使用Step16绝对时间split"
     )
     parser.add_argument(
         "--config", default=str(Path(__file__).resolve().parent / "configs" / "hunan_e4.yaml")
     )
     parser.add_argument(
         "--dataset-root",
-        help="覆盖配置中的 _model_dataset 根目录（含 graph/dynamic/events/metadata/qc）",
+        help="覆盖配置中的 _model_dataset 根目录",
     )
     parser.add_argument(
         "--graph-id",
@@ -52,11 +52,18 @@ def main() -> None:
                 "mode": cfg["data"]["mode"],
                 "dataset_root": cfg["data"]["dataset_root"],
                 "target_variable": cfg["data"]["target_variable"],
+                "dataset_type": cfg["data"].get("dataset_type", "event"),
                 "future_rainfall_mode": cfg["data"]["future_rainfall_mode"],
                 "train_samples": len(train_loader.dataset),
                 "validation_samples": len(validation_loader.dataset),
                 "train_events": _event_count(train_loader),
                 "validation_events": _event_count(validation_loader),
+                "train_weighted_sampling": bool(
+                    cfg.get("train_sampling", {}).get("enabled", False)
+                ),
+                "early_stopping": bool(
+                    cfg["training"].get("early_stopping", True)
+                ),
                 "train_graphs": list(getattr(train_loader.dataset, "graph_ids", ())),
                 "validation_graphs": list(
                     getattr(validation_loader.dataset, "graph_ids", ())

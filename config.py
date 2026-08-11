@@ -41,6 +41,7 @@ _ROOT_KEYS = {
     "validation_selection",
     "hyperparameter_optimization",
     "optimizer",
+    "train_sampling",
     "training",
     "transfer_learning",
 }
@@ -178,6 +179,7 @@ def validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
         "data",
         {
             "mode",
+            "dataset_type",
             "dataset_root",
             "graph_id",
             "target_variable",
@@ -191,6 +193,7 @@ def validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
         },
     )
     _enum(data, "mode", {"synthetic", "hunan"})
+    _enum(data, "dataset_type", {"event", "continuous"})
     _enum(data, "target_variable", {"AUTO", "FLOW", "WATER_LEVEL", "BOTH"})
     _enum(
         data,
@@ -214,6 +217,12 @@ def validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
         raise ConfigError("合成调试模式的 data.graph_id 必须为 null")
     if data["mode"] == "synthetic" and data["target_variable"] == "AUTO":
         raise ConfigError("合成调试模式不支持 target_variable=AUTO")
+    if data["dataset_type"] == "continuous" and (
+        data["mode"] != "hunan" or data["target_variable"] != "BOTH"
+    ):
+        raise ConfigError(
+            "continuous dataset要求data.mode=hunan且target_variable=BOTH"
+        )
     if data["mode"] == "hunan":
         if cfg["node_static_dim"] != 10 or cfg["edge_static_dim"] != 2:
             raise ConfigError("湖南正式数据固定要求 node_static_dim=10、edge_static_dim=2")
@@ -285,6 +294,9 @@ def validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
             "mode",
             "q_scale_mode",
             "q_scale_floor_m3s",
+            "z_target_mode",
+            "delta_z_scale_mode",
+            "delta_z_scale_floor_m",
             "discharge_weight",
             "water_level_weight",
             "q_point_weight",
@@ -297,6 +309,9 @@ def validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
     _enum(loss, "mode", {"legacy", "multitask"})
     _enum(loss, "q_scale_mode", {"global", "per_graph"})
     _number(loss, "q_scale_floor_m3s", strictly=True)
+    _enum(loss, "z_target_mode", {"absolute", "delta_from_t0"})
+    _enum(loss, "delta_z_scale_mode", {"global", "per_station"})
+    _number(loss, "delta_z_scale_floor_m", strictly=True)
     for key in (
         "discharge_weight",
         "water_level_weight",
@@ -330,6 +345,15 @@ def validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
         raise ConfigError(
             "loss.q_scale_mode=per_graph仅允许湖南正式multitask loss"
         )
+    if loss["z_target_mode"] == "delta_from_t0" and (
+        data["dataset_type"] != "continuous"
+        or loss["delta_z_scale_mode"] != "per_station"
+    ):
+        raise ConfigError(
+            "delta_from_t0要求continuous dataset和TRAIN-only per_station ΔZ scale"
+        )
+    if data["dataset_type"] == "continuous" and loss["z_target_mode"] != "delta_from_t0":
+        raise ConfigError("continuous P2必须使用delta_from_t0水位监督")
 
     selection = _mapping(
         cfg,
@@ -369,7 +393,11 @@ def validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
             raise ConfigError(f"validation_selection.{key}必须是有限数值")
     if selection["efficiency_clip_min"] >= selection["efficiency_clip_max"]:
         raise ConfigError("validation_selection efficiency clip要求min < max")
-    if loss["mode"] == "multitask" and selection["mode"] != "composite":
+    if (
+        loss["mode"] == "multitask"
+        and selection["mode"] != "composite"
+        and data["dataset_type"] != "continuous"
+    ):
         raise ConfigError("multitask loss必须使用composite validation selection")
 
     hpo = _mapping(
@@ -448,17 +476,63 @@ def validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
     _number(optimizer, "lr", strictly=True)
     _number(optimizer, "weight_decay")
 
+    sampling = _mapping(
+        cfg,
+        "train_sampling",
+        {
+            "enabled",
+            "response_strength",
+            "response_cap",
+            "minimum_weight",
+            "maximum_weight",
+        },
+    )
+    _bool(sampling, "enabled")
+    for key in (
+        "response_strength",
+        "response_cap",
+        "minimum_weight",
+        "maximum_weight",
+    ):
+        _number(sampling, key, strictly=True)
+    if sampling["minimum_weight"] > sampling["maximum_weight"]:
+        raise ConfigError("train_sampling要求minimum_weight<=maximum_weight")
+    if sampling["enabled"] and data["dataset_type"] != "continuous":
+        raise ConfigError("TRAIN weighted sampling仅允许continuous dataset")
+
+    raw_training = cfg.get("training")
+    if isinstance(raw_training, dict):
+        # Backward-compatible defaults for programmatically constructed legacy
+        # configs. P2 overrides both fields explicitly.
+        raw_training.setdefault("early_stopping", True)
+        raw_training.setdefault("final_checkpoint", None)
     training = _mapping(
         cfg,
         "training",
-        {"epochs", "patience", "gradient_clip", "checkpoint", "log_csv"},
+        {
+            "epochs",
+            "patience",
+            "early_stopping",
+            "gradient_clip",
+            "checkpoint",
+            "final_checkpoint",
+            "log_csv",
+        },
     )
     _int(training, "epochs", 1)
     _int(training, "patience", 1)
+    _bool(training, "early_stopping")
     _number(training, "gradient_clip", strictly=True)
     for key in ("checkpoint", "log_csv"):
         if not isinstance(training[key], str) or not training[key].strip():
             raise ConfigError(f"training.{key} 必须是非空路径")
+    final_checkpoint = training["final_checkpoint"]
+    if final_checkpoint is not None and (
+        not isinstance(final_checkpoint, str) or not final_checkpoint.strip()
+    ):
+        raise ConfigError("training.final_checkpoint必须是非空路径或null")
+    if not training["early_stopping"] and final_checkpoint is None:
+        raise ConfigError("取消early stopping时必须显式设置final_checkpoint")
 
     transfer = _mapping(
         cfg,

@@ -55,6 +55,15 @@ class GraphEventBatch:
     # TRAIN-only graph -> event -> window balancing weight.  This is consumed
     # by the discharge loss and never enters model.forward computations.
     sample_weight: Tensor | None = None
+    # Continuous P2 supervision metadata. ``z_target`` is delta-Z when these
+    # fields are present.  The baseline is the observed Z at the forecast
+    # origin t0; it is never searched backwards and never comes from a future
+    # timestamp.  Evaluation reconstructs absolute Z without feeding the
+    # baseline to model.forward.
+    z_reference: Tensor | None = None
+    z_reference_mask: Tensor | None = None
+    target_start: str | tuple[str, ...] | None = None
+    target_end: str | tuple[str, ...] | None = None
 
     def to(self, device: torch.device) -> "GraphEventBatch":
         return GraphEventBatch(
@@ -188,6 +197,24 @@ def validate_batch(x: GraphEventBatch, expected: dict[str, int] | None = None) -
             raise ValueError("sample_weight必须是浮点Tensor")
         if not torch.isfinite(x.sample_weight).all() or (x.sample_weight <= 0).any():
             raise ValueError("sample_weight必须全部为有限正数")
+    if (x.z_reference is None) != (x.z_reference_mask is None):
+        raise ValueError("z_reference与z_reference_mask必须同时提供或同时省略")
+    if x.z_reference is not None:
+        _require_shape(
+            "z_reference", tuple(x.z_reference.shape), (batch_size, nodes)
+        )
+        _require_shape(
+            "z_reference_mask",
+            tuple(x.z_reference_mask.shape),
+            (batch_size, nodes),
+        )
+        _require_bool("z_reference_mask", x.z_reference_mask)
+        if not torch.isfinite(x.z_reference).all():
+            raise ValueError("z_reference含NaN/Inf；缺测基线必须用0占位并由mask标记")
+        # A valid delta-Z target is impossible without a valid t0 baseline.
+        invalid_target = x.z_target_mask & ~x.z_reference_mask.unsqueeze(1)
+        if invalid_target.any():
+            raise ValueError("ΔZ target有效但对应forecast-origin Z(t0)无效")
 
     if x.node_mask is not None:
         _require_bool("node_mask", x.node_mask)
