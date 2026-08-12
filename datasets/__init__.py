@@ -3,12 +3,12 @@ from .hunan import (
     EDGE_STATIC_MODEL_FEATURES,
     NODE_STATIC_FEATURES,
     GraphGroupedBatchSampler,
-    HunanContinuousDataset,
     HunanGraphEventDataset,
     WeightedGraphGroupedBatchSampler,
     build_hunan_loader,
     collate_hunan_graph_events,
 )
+from .continuous_sampling import HunanContinuousDataset
 from .normalization import FeatureStatistics, HunanScaler, NormalizationStats
 
 __all__ = [
