@@ -10,6 +10,7 @@ from data.schema import validate_batch
 from models.observation import MonotonicQZObservation
 from models.routing import KinematicWaveGNN, PureDirectedGNN
 from models.runoff import PureLSTMRunoff, WaterBalanceLSTM
+from models.state_initialization import HydrologicalStateInitializer
 
 
 class HybridFloodModel(nn.Module):
@@ -24,6 +25,15 @@ class HybridFloodModel(nn.Module):
         self.use_observation_masks = bool(
             cfg.get("data", {}).get("use_observation_masks", False)
         )
+        state_cfg = cfg.get("state_initialization", {})
+        self.use_state_initialization = bool(state_cfg.get("enabled", False))
+        self.state_initialization_mode = str(
+            state_cfg.get("mode", "forecast_origin")
+        )
+        if self.use_state_initialization and self.state_initialization_mode != "forecast_origin":
+            raise ValueError(
+                "当前state_initialization仅支持mode='forecast_origin'"
+            )
         self.expected = {
             key: int(cfg[key])
             for key in (
@@ -35,9 +45,8 @@ class HybridFloodModel(nn.Module):
             )
         }
 
-        # Rainfall is always an explicit forcing.  In formal mode the three
-        # availability masks are additional inputs, rather than treating an
-        # imputed zero as indistinguishable from an observed zero.
+        # Rainfall is always an explicit forcing. In formal mode the three
+        # availability masks are additional inputs.
         runoff_input_dim = int(cfg["dynamic_dim"]) + 1
         if self.use_observation_masks:
             runoff_input_dim += 3
@@ -65,6 +74,25 @@ class HybridFloodModel(nn.Module):
             )
         else:
             raise ValueError(f"未知routing_mode={routing_mode!r}")
+
+        if self.use_state_initialization:
+            if runoff_mode != "water_balance_lstm":
+                raise ValueError(
+                    "P3 state initialization当前要求runoff_mode=water_balance_lstm"
+                )
+            if routing_mode != "kinematic_wave_gnn":
+                raise ValueError(
+                    "P3 state initialization当前要求routing_mode=kinematic_wave_gnn"
+                )
+            self.state_initializer = HydrologicalStateInitializer(
+                runoff_input_dim,
+                int(cfg["node_static_dim"]),
+                int(cfg["edge_static_dim"]),
+                hidden,
+            )
+        else:
+            self.state_initializer = None
+
         self.observation = MonotonicQZObservation(stations)
 
     def _temporal_inputs(
@@ -106,7 +134,6 @@ class HybridFloodModel(nn.Module):
     def _physical_area(batch: Any) -> torch.Tensor:
         area = getattr(batch, "node_area_km2", None)
         if area is None:
-            # Backwards compatibility for the synthetic debug fixture only.
             area = batch.node_static[:, 0]
         if area.ndim != 1 or area.shape[0] != batch.node_static.shape[0]:
             raise ValueError("node_area_km2必须为[N]并与当前河网节点对应")
@@ -114,12 +141,77 @@ class HybridFloodModel(nn.Module):
             raise ValueError("物理增量汇水面积必须为有限正数，单位km²")
         return area
 
+    def _state_initialized_forward(
+        self,
+        batch: Any,
+        features: torch.Tensor,
+        rainfall: torch.Tensor,
+        area_km2: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        if self.state_initializer is None:
+            raise RuntimeError("state_initializer未构建")
+        history_features = features[:, : self.history]
+        future_features = features[:, self.history : self.history + self.horizon]
+        future_rainfall = rainfall[:, self.history : self.history + self.horizon]
+        state = self.state_initializer(
+            history_features,
+            batch.node_static,
+            batch.edge_index,
+            batch.edge_static,
+        )
+        q_lateral, runoff_diagnostics = self.runoff(
+            future_features,
+            future_rainfall,
+            area_km2,
+            seconds=self.seconds_per_step,
+            initial_state=(
+                state["h0"],
+                state["c0"],
+                state["storage_fast_mm"],
+                state["storage_slow_mm"],
+            ),
+        )
+        q_all, routing_diagnostics = self.routing(
+            q_lateral,
+            batch.node_static,
+            batch.edge_index,
+            batch.edge_static,
+            initial_edge_discharge=state["edge_discharge_m3s"],
+        )
+        diagnostics: dict[str, torch.Tensor] = {
+            **runoff_diagnostics,
+            **routing_diagnostics,
+            "initial_storage_fast_mm": state["storage_fast_mm"],
+            "initial_storage_slow_mm": state["storage_slow_mm"],
+            "initial_runoff_hidden_h": state["h0"],
+            "initial_runoff_hidden_c": state["c0"],
+        }
+        return q_lateral, q_all, diagnostics
+
     def forward(
         self, batch: Any
     ) -> dict[str, torch.Tensor | dict[str, torch.Tensor]]:
         validate_batch(batch, self.expected)
         features, rainfall = self._temporal_inputs(batch)
         area_km2 = self._physical_area(batch)
+
+        if self.use_state_initialization:
+            q_lateral, q_all, diagnostics = self._state_initialized_forward(
+                batch, features, rainfall, area_km2
+            )
+            channel_all = diagnostics.get("node_channel_storage")
+            z_all = self.observation(
+                q_all,
+                channel_all,
+                getattr(batch, "station_index", None),
+            )
+            return {
+                "q": q_all,
+                "z": z_all,
+                "q_lat": q_lateral,
+                "diagnostics": diagnostics,
+            }
+
         q_lateral, runoff_diagnostics = self.runoff(
             features,
             rainfall,
