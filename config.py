@@ -42,6 +42,7 @@ _ROOT_KEYS = {
     "hyperparameter_optimization",
     "optimizer",
     "train_sampling",
+    "state_initialization",
     "training",
     "transfer_learning",
 }
@@ -139,6 +140,14 @@ def _bounds(cfg: Mapping[str, Any], key: str, *, positive: bool = True) -> None:
 
 def validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
     """Validate the complete merged configuration and return it unchanged."""
+    # Backward-compatible default for legacy/programmatically constructed P1/P2
+    # configurations.  Canonical YAMLs also declare this block explicitly.
+    if "state_initialization" not in cfg:
+        cfg["state_initialization"] = {
+            "enabled": False,
+            "mode": "forecast_origin",
+        }
+
     unknown = set(cfg) - _ROOT_KEYS
     if unknown:
         raise ConfigError(f"配置含未知顶层字段: {', '.join(sorted(unknown))}")
@@ -236,6 +245,25 @@ def validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
             raise ConfigError(
                 "当前CSV内存数据层在Windows正式模式要求num_workers=0，"
                 "避免worker复制整省动态张量"
+            )
+
+    state_initialization = _mapping(
+        cfg,
+        "state_initialization",
+        {"enabled", "mode"},
+    )
+    _bool(state_initialization, "enabled")
+    _enum(state_initialization, "mode", {"forecast_origin"})
+    if state_initialization["enabled"]:
+        if data["dataset_type"] != "continuous":
+            raise ConfigError("state_initialization仅允许continuous dataset")
+        if cfg["runoff_mode"] != "water_balance_lstm":
+            raise ConfigError(
+                "state_initialization要求runoff_mode=water_balance_lstm"
+            )
+        if cfg["routing_mode"] != "kinematic_wave_gnn":
+            raise ConfigError(
+                "state_initialization要求routing_mode=kinematic_wave_gnn"
             )
 
     bounds = _mapping(cfg, "physical_bounds", {"width", "manning_n"})
