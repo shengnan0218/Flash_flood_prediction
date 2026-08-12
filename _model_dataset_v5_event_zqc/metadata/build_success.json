@@ -1,8 +1,0 @@
-{
-  "status": "COMPLETE",
-  "dataset_contract_version": "5-event-zqc-strict",
-  "builder_revision": "2026-08-10-hydro-missing-token-fix-v1",
-  "event_count": 797,
-  "sample_count": 38809,
-  "event_without_sample_count": 0
-}
