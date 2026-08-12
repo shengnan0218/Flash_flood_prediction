@@ -1,0 +1,19 @@
+_base_: hunan_p3_state_init_single_q611e0340.yaml
+
+# Single-basin event-domain probe using the same continuous-hourly-dual-target-v1
+# tensor contract and P3 forecast-origin state initialization. The rebuilt
+# dataset must be supplied explicitly with --dataset-root so this config cannot
+# silently fall back to the old full-record continuous dataset.
+data:
+  dataset_root: __REPLACE_WITH_EVENT_DATASET_ROOT__
+
+# TRAIN sampling is selected from feature_schema.sampling_domain:
+# hydrologic_events_v1 -> graph/event/window balancing (no response reweighting).
+# The inherited enabled=true keeps weighted TRAIN sampling active.
+training:
+  checkpoint: outputs/hunan_p3_state_init_single_q611e0340_event_domain_best.pt
+  final_checkpoint: outputs/hunan_p3_state_init_single_q611e0340_event_domain_epoch100.pt
+  log_csv: outputs/hunan_p3_state_init_single_q611e0340_event_domain_train.csv
+
+hyperparameter_optimization:
+  enabled: false
