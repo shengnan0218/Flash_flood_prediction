@@ -6,10 +6,12 @@ _base_: hunan_p3_state_init_single_q611e0340.yaml
 # silently fall back to the old full-record continuous dataset.
 data:
   dataset_root: __REPLACE_WITH_EVENT_DATASET_ROOT__
+  graph_id: Q_611E0340
 
 # TRAIN sampling is selected from feature_schema.sampling_domain:
 # hydrologic_events_v1 -> graph/event/window balancing (no response reweighting).
-# The inherited enabled=true keeps weighted TRAIN sampling active.
+# The inherited enabled=true keeps weighted TRAIN sampling active; inherited
+# response-strength fields are ignored for hydrologic_events_v1 datasets.
 training:
   checkpoint: outputs/hunan_p3_state_init_single_q611e0340_event_domain_best.pt
   final_checkpoint: outputs/hunan_p3_state_init_single_q611e0340_event_domain_epoch100.pt
