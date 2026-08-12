@@ -22,6 +22,11 @@ class HydrologicalStateInitializer(nn.Module):
     directed edge the initializer predicts a non-negative discharge in m3/s;
     the routing module converts that discharge to a physically consistent
     initial reach volume using its own kinematic-wave relation.
+
+    ``history_context`` is also exposed for the P3 observation path.  It is the
+    already-computed forecast-origin representation of the same 24 h history;
+    exposing it restores access to antecedent stage information without adding
+    another recurrent encoder or changing the Q transition equations.
     """
 
     def __init__(
@@ -130,4 +135,5 @@ class HydrologicalStateInitializer(nn.Module):
             "storage_fast_mm": storage_fast,
             "storage_slow_mm": storage_slow,
             "edge_discharge_m3s": edge_discharge,
+            "history_context": context,
         }
