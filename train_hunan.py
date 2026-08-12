@@ -16,7 +16,7 @@ def _event_count(loader) -> int:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="湖南洪水模型训练；P2 continuous严格使用Step16绝对时间split"
+        description="湖南洪水模型训练；continuous张量契约可覆盖全时段或事件域采样"
     )
     parser.add_argument(
         "--config", default=str(Path(__file__).resolve().parent / "configs" / "hunan_e4.yaml")
@@ -60,6 +60,9 @@ def main() -> None:
                 "validation_events": _event_count(validation_loader),
                 "train_weighted_sampling": bool(
                     cfg.get("train_sampling", {}).get("enabled", False)
+                ),
+                "train_sampling_mode": getattr(
+                    train_loader.dataset, "train_sampling_mode", "legacy_or_unweighted"
                 ),
                 "early_stopping": bool(
                     cfg["training"].get("early_stopping", True)
