@@ -8,14 +8,7 @@ from data.schema import topological_levels
 
 
 class EdgeParameterNetwork(nn.Module):
-    """Estimate bounded effective width and Manning roughness per reach.
-
-    Both quantities are latent, differentiable routing parameters inferred
-    from the available reach and endpoint-node attributes.  In particular,
-    ``effective width`` is not presented as a surveyed channel measurement:
-    it is constrained to the configured physical interval and learned only
-    through the routing objective.
-    """
+    """Estimate bounded effective width and Manning roughness per reach."""
 
     def __init__(
         self,
@@ -34,9 +27,6 @@ class EdgeParameterNetwork(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_dim, 2),
         )
-        # A zero output is a neutral midpoint prior in bounded logit space.
-        # It is not a fixed pseudo-observation: gradients update both outputs
-        # and subsequently make them reach-specific functions of ``x``.
         nn.init.zeros_(self.net[-1].weight)
         nn.init.zeros_(self.net[-1].bias)
         self.bounds = (width_bounds, n_bounds)
@@ -52,11 +42,10 @@ class EdgeParameterNetwork(nn.Module):
 class KinematicWaveGNN(nn.Module):
     """Route lateral discharge through a converging DAG in physical units.
 
-    Each reach is a finite-volume reservoir advanced with a differentiable
-    backward-Euler solve under ``Q = alpha * A ** (5/3)``.  The routing is
-    mass conservative, only sends water from ``src`` to ``dst``, and explicitly
-    rejects divergent nodes: no split fraction exists in the formal input
-    contract, so duplicating flow at a branch would be scientifically invalid.
+    ``initial_edge_discharge`` is optional.  When supplied it represents the
+    forecast-origin discharge already present in each reach.  It is converted
+    to reach volume with this solver's own kinematic-wave relation, so P3 state
+    assimilation changes only the initial condition, not the routing equation.
     """
 
     def __init__(
@@ -113,6 +102,7 @@ class KinematicWaveGNN(nn.Module):
         node_static: torch.Tensor,
         edge_index: torch.Tensor,
         edge_static: torch.Tensor,
+        initial_edge_discharge: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         with torch.autocast(device_type=q_lat.device.type, enabled=False):
             q_lat = q_lat.float()
@@ -147,7 +137,6 @@ class KinematicWaveGNN(nn.Module):
             slope = slope.clamp_min(minimum_slope)
             source, destination = edge_index
 
-            # Compress heterogeneous physical scales only for the parameter MLP.
             edge_ml = torch.sign(edge_static) * torch.log1p(edge_static.abs())
             node_ml = torch.sign(node_static) * torch.log1p(node_static.abs())
             parameters = torch.cat(
@@ -174,13 +163,31 @@ class KinematicWaveGNN(nn.Module):
                 or implicit_iterations < 1
                 or implicit_tolerance <= 0
             ):
-                raise ValueError(
-                    "solver的时间步、CFL诊断或隐式求解参数无效"
-                )
+                raise ValueError("solver的时间步、CFL诊断或隐式求解参数无效")
             if not torch.isfinite(alpha).all() or (alpha <= 0).any():
                 raise FloatingPointError("运动波参数alpha必须为有限正数")
 
-            volume = torch.zeros(batch, edges, device=q_lat.device)
+            if initial_edge_discharge is None:
+                volume = torch.zeros(batch, edges, device=q_lat.device)
+                initial_q = torch.zeros(batch, edges, device=q_lat.device)
+            else:
+                initial_q = initial_edge_discharge.float()
+                if initial_q.shape != (batch, edges):
+                    raise ValueError("initial_edge_discharge必须为[B,E]")
+                if (
+                    not torch.isfinite(initial_q).all()
+                    or (initial_q < 0).any()
+                ):
+                    raise ValueError("initial_edge_discharge必须为有限非负m3/s")
+                if edges:
+                    initial_area = (
+                        initial_q / alpha.unsqueeze(0)
+                    ).clamp_min(0.0).pow(1.0 / exponent)
+                    volume = initial_area * length.unsqueeze(0)
+                else:
+                    volume = initial_q
+
+            initial_volume = volume.clone()
             node_outputs: list[torch.Tensor] = []
             node_storages: list[torch.Tensor] = []
             residuals: list[torch.Tensor] = []
@@ -208,10 +215,6 @@ class KinematicWaveGNN(nn.Module):
                     destinations = destination[edge_ids]
                     inflow = node_q[:, sources]
 
-                    # CFL is retained as a stiffness diagnostic for an
-                    # equivalent explicit discretisation.  It does not control
-                    # the backward-Euler update and therefore cannot abort a
-                    # physically valid short-reach/high-flow sample.
                     with torch.no_grad():
                         current_area = (
                             volume[:, edge_ids] / length[edge_ids]
@@ -237,21 +240,7 @@ class KinematicWaveGNN(nn.Module):
                         )
                         time_maximum_celerity.append(celerity.amax())
 
-                    # Backward Euler for a reach with constant mean inflow:
-                    #   V1 + dt * alpha * (V1 / L) ** p = V0 + Qin * dt.
-                    # With V1=available*y this becomes y+beta*y**p=1 on
-                    # 0<=y<=1.  The algebraic Newton form below avoids the
-                    # cancellation in x-f/df, stays positive, and uses a fixed
-                    # iteration count so the complete gradient path is retained.
                     available = volume[:, edge_ids] + inflow * dt
-                    # ``available ** (2/3)`` has an infinite derivative at an
-                    # exactly dry reach even though the physical storage/outflow
-                    # derivative is finite there.  Protect only this fractional
-                    # power with a tiny dimensionless wet-area floor.  This is
-                    # deliberately well above float32 subnormal range so CUDA
-                    # flush-to-zero cannot recreate an inf*0 gradient.
-                    # ``available`` itself remains untouched, so a dry reach
-                    # still has exactly zero storage and zero outflow.
                     wet_area_for_power = (
                         available / length[edge_ids]
                     ).clamp_min(1.0e-12)
@@ -346,6 +335,8 @@ class KinematicWaveGNN(nn.Module):
                 "explicit_cfl_exceedance_count": explicit_equivalent.gt(1).sum(),
                 "learned_effective_width": width,
                 "learned_effective_manning_n": manning,
+                "initial_edge_discharge_m3s": initial_q,
+                "initial_edge_storage_m3": initial_volume,
                 "edge_storage": volume,
                 "node_channel_storage": torch.stack(node_storages, dim=1),
             }
@@ -373,7 +364,10 @@ class PureDirectedGNN(nn.Module):
         node_static: torch.Tensor,
         edge_index: torch.Tensor,
         edge_static: torch.Tensor,
+        initial_edge_discharge: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        if initial_edge_discharge is not None:
+            raise ValueError("pure_gnn routing不支持physical initial_edge_discharge")
         batch, steps, nodes = q_lat.shape
         key = (nodes, tuple(edge_index.detach().cpu().flatten().tolist()))
         if key != self._key:
