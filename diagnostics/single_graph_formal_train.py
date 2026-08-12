@@ -1,13 +1,9 @@
 """Formal single-graph P3 training with read-only state diagnostics.
 
-This script deliberately reuses the production training stack:
-- setup_training() builds the official continuous TRAIN/VALIDATION loaders;
-- Trainer.fit() performs the unchanged Q+Z multitask optimization, weighted
-  TRAIN sampling, validation selection, checkpointing and 100-epoch budget;
-- a no-grad epoch callback observes a fixed deterministic VALIDATION prefix and
-  writes state summaries without adding any loss term or changing forward
-  dynamics;
-- after training, the best VALIDATION checkpoint is evaluated once on TEST.
+The optimization path is production code: setup_training() + Trainer.fit().
+The callback only performs eval/no-grad observation on a deterministic
+VALIDATION prefix. No diagnostic quantity enters the loss or forward dynamics.
+After training, the best VALIDATION checkpoint is evaluated once on TEST.
 """
 from __future__ import annotations
 
@@ -15,13 +11,18 @@ import argparse
 import csv
 import json
 import math
+import sys
 from pathlib import Path
 from typing import Any
 
 import torch
 
-from scripts.common import setup_evaluation, setup_training, validate_checkpoint_config
-from trainers import Trainer
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from scripts.common import setup_evaluation, setup_training, validate_checkpoint_config  # noqa: E402
+from trainers import Trainer  # noqa: E402
 
 
 def _finite(value: float) -> float | None:
@@ -31,14 +32,15 @@ def _finite(value: float) -> float | None:
 def _corr(x: torch.Tensor, y: torch.Tensor) -> float:
     x = x.detach().float().reshape(-1).cpu()
     y = y.detach().float().reshape(-1).cpu()
+    if x.numel() != y.numel():
+        raise ValueError("correlation两侧样本数不一致")
     valid = torch.isfinite(x) & torch.isfinite(y)
-    x = x[valid]
-    y = y[valid]
+    x, y = x[valid], y[valid]
     if x.numel() < 2:
         return float("nan")
     x = x - x.mean()
     y = y - y.mean()
-    denom = torch.sqrt((x.square().sum()) * (y.square().sum()))
+    denom = torch.sqrt(x.square().sum() * y.square().sum())
     if float(denom) <= 0:
         return float("nan")
     return float((x * y).sum() / denom)
@@ -48,12 +50,7 @@ def _stats(x: torch.Tensor) -> dict[str, float]:
     x = x.detach().float().reshape(-1).cpu()
     x = x[torch.isfinite(x)]
     if x.numel() == 0:
-        return {
-            "mean": float("nan"),
-            "std": float("nan"),
-            "min": float("nan"),
-            "max": float("nan"),
-        }
+        return {key: float("nan") for key in ("mean", "std", "min", "max")}
     return {
         "mean": float(x.mean()),
         "std": float(x.std(unbiased=False)),
@@ -92,7 +89,7 @@ def state_audit(
     epoch: int,
     max_batches: int,
 ) -> dict[str, Any]:
-    """Observe Q(t0) -> initialized storage -> H1 release on validation data."""
+    """Observe Q(t0) -> initialized storage -> H1 release on VALIDATION."""
     model = trainer.model
     was_training = model.training
     model.eval()
@@ -106,9 +103,9 @@ def state_audit(
     kf_h1_values: list[torch.Tensor] = []
     ks_h1_values: list[torch.Tensor] = []
     qlat_h1_values: list[torch.Tensor] = []
-    qpred_h1_values: list[torch.Tensor] = []
+    qpred_t0mask_values: list[torch.Tensor] = []
     qobs_h1_values: list[torch.Tensor] = []
-    qerr_h1_values: list[torch.Tensor] = []
+    qpred_h1_values: list[torch.Tensor] = []
 
     batches = 0
     for cpu_batch in loader:
@@ -151,20 +148,18 @@ def state_audit(
             kf_h1_values.append(kf_h1[q_t0_mask].detach().cpu())
             ks_h1_values.append(ks_h1[q_t0_mask].detach().cpu())
             qlat_h1_values.append(qlat_h1[q_t0_mask].detach().cpu())
-            qpred_h1_values.append(qpred_h1[q_t0_mask].detach().cpu())
+            qpred_t0mask_values.append(qpred_h1[q_t0_mask].detach().cpu())
 
         h1_mask = batch.q_target_mask[:, 0, outlet].bool()
         if h1_mask.any():
-            qobs = batch.q_target[:, 0, outlet][h1_mask]
-            qpred = qpred_h1[h1_mask]
-            qobs_h1_values.append(qobs.detach().cpu())
-            qerr_h1_values.append((qpred - qobs).detach().cpu())
-
+            qobs_h1_values.append(
+                batch.q_target[:, 0, outlet][h1_mask].detach().cpu()
+            )
+            qpred_h1_values.append(qpred_h1[h1_mask].detach().cpu())
         batches += 1
 
     if was_training:
         model.train()
-
     if not q_t0_values:
         raise ValueError("state audit固定VALIDATION前缀没有有效Q(t0)")
 
@@ -177,9 +172,7 @@ def state_audit(
     kf_h1 = torch.cat(kf_h1_values)
     ks_h1 = torch.cat(ks_h1_values)
     qlat_h1 = torch.cat(qlat_h1_values)
-    qpred_h1 = torch.cat(qpred_h1_values)
-    qobs_h1 = torch.cat(qobs_h1_values) if qobs_h1_values else torch.empty(0)
-    qerr_h1 = torch.cat(qerr_h1_values) if qerr_h1_values else torch.empty(0)
+    qpred_t0mask = torch.cat(qpred_t0mask_values)
 
     result: dict[str, Any] = {
         "epoch": epoch,
@@ -195,38 +188,29 @@ def state_audit(
         "k_fast_h1_mean": _stats(kf_h1)["mean"],
         "k_slow_h1_mean": _stats(ks_h1)["mean"],
         "q_lateral_h1_mean_m3s": _stats(qlat_h1)["mean"],
-        "q_pred_h1_mean_m3s": _stats(qpred_h1)["mean"],
+        "q_pred_h1_mean_m3s": _stats(qpred_t0mask)["mean"],
         "corr_q_t0_initial_total_storage": _corr(q_t0, st0),
         "corr_q_t0_initial_fast_storage": _corr(q_t0, sf0),
         "corr_q_t0_initial_slow_storage": _corr(q_t0, ss0),
         "corr_q_t0_q_lateral_h1": _corr(q_t0, qlat_h1),
-        "corr_q_t0_q_pred_h1": _corr(q_t0, qpred_h1),
+        "corr_q_t0_q_pred_h1": _corr(q_t0, qpred_t0mask),
     }
-    if qobs_h1.numel():
+
+    if qobs_h1_values:
+        qobs_h1 = torch.cat(qobs_h1_values)
+        qpred_h1 = torch.cat(qpred_h1_values)
+        qerr_h1 = qpred_h1 - qobs_h1
         result.update(
             {
                 "q_obs_h1_count": int(qobs_h1.numel()),
                 "q_obs_h1_mean_m3s": _stats(qobs_h1)["mean"],
+                "q_pred_valid_h1_mean_m3s": _stats(qpred_h1)["mean"],
                 "q_h1_bias_m3s": _stats(qerr_h1)["mean"],
                 "q_h1_mae_m3s": float(qerr_h1.abs().mean()),
                 "q_h1_rmse_m3s": float(torch.sqrt(qerr_h1.square().mean())),
-                "corr_q_obs_h1_q_pred_h1": _corr(
-                    qobs_h1,
-                    torch.cat(
-                        [
-                            output_tensor
-                            for output_tensor in []
-                        ]
-                    )
-                    if False
-                    else float("nan"),
+                "corr_q_obs_h1_q_pred_h1": _corr(qobs_h1, qpred_h1),
             }
         )
-        # qpred_h1 above is conditioned on valid Q(t0); H1 target availability
-        # need not be identical. Keep the H1 correlation out rather than mix
-        # differently indexed subsets; formal Trainer metrics already report H1.
-        result.pop("corr_q_obs_h1_q_pred_h1", None)
-
     return result
 
 
@@ -236,7 +220,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--config",
-        default="configs/hunan_p3_state_init_single_q611e0340.yaml",
+        default=str(PROJECT_ROOT / "configs" / "hunan_p3_state_init_single_q611e0340.yaml"),
     )
     parser.add_argument("--dataset-root", required=True)
     parser.add_argument("--graph-id", default="Q_611E0340")
@@ -244,11 +228,11 @@ def main() -> None:
     parser.add_argument("--state-audit-batches", type=int, default=8)
     parser.add_argument(
         "--state-audit-csv",
-        default="outputs/hunan_p3_state_init_single_q611e0340_state_audit.csv",
+        default=str(PROJECT_ROOT / "outputs" / "hunan_p3_state_init_single_q611e0340_state_audit.csv"),
     )
     parser.add_argument(
         "--test-json",
-        default="outputs/hunan_p3_state_init_single_q611e0340_test_metrics.json",
+        default=str(PROJECT_ROOT / "outputs" / "hunan_p3_state_init_single_q611e0340_test_metrics.json"),
     )
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
@@ -261,7 +245,9 @@ def main() -> None:
     if not args.overwrite:
         existing = [path for path in (audit_path, test_path) if path.exists()]
         if existing:
-            raise FileExistsError(f"state/test输出已存在，请换路径或加--overwrite: {existing}")
+            raise FileExistsError(
+                f"state/test输出已存在，请换路径或加--overwrite: {existing}"
+            )
     else:
         audit_path.unlink(missing_ok=True)
         test_path.unlink(missing_ok=True)
@@ -297,7 +283,10 @@ def main() -> None:
     trainer = Trainer(model, cfg, device)
 
     def callback(epoch: int, row: dict[str, float | int]) -> None:
-        if epoch % args.state_audit_every != 0 and epoch != int(cfg["training"]["epochs"]) - 1:
+        if (
+            epoch % args.state_audit_every != 0
+            and epoch != int(cfg["training"]["epochs"]) - 1
+        ):
             return
         audit = state_audit(
             trainer,
