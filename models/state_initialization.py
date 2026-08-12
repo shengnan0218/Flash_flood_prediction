@@ -2,7 +2,7 @@
 
 The initializer is deliberately separated from the physical transition models.
 It uses only the history window available at forecast origin, then produces
-non-negative catchment storages and non-negative reach discharge states.  The
+non-negative catchment storages and non-negative reach discharge states. The
 subsequent rainfall-runoff and routing evolution remains governed by the
 existing mass-conserving WaterBalanceCell and kinematic-wave solver.
 """
@@ -13,11 +13,12 @@ from torch import nn
 
 
 class HydrologicalStateInitializer(nn.Module):
-    """Encode the observed history into runoff and routing initial states.
+    """Encode observed history into WaterBalanceLSTM/routing initial states.
 
-    Node history is encoded independently for each graph node with a shared GRU.
-    Static attributes are fused after the temporal encoder.  Fast/slow storages
-    are expressed in mm and constrained non-negative with Softplus.  For each
+    Node history is encoded independently for each graph node with a shared
+    LSTM, matching the recurrent family already used by the runoff module.
+    Static attributes are fused after the temporal encoder. Fast/slow storages
+    are expressed in mm and constrained non-negative with Softplus. For each
     directed edge the initializer predicts a non-negative discharge in m3/s;
     the routing module converts that discharge to a physically consistent
     initial reach volume using its own kinematic-wave relation.
@@ -35,7 +36,7 @@ class HydrologicalStateInitializer(nn.Module):
         self.node_static_dim = int(node_static_dim)
         self.edge_static_dim = int(edge_static_dim)
 
-        self.history_encoder = nn.GRU(
+        self.history_encoder = nn.LSTM(
             temporal_input_dim,
             hidden_dim,
             batch_first=True,
@@ -93,15 +94,20 @@ class HydrologicalStateInitializer(nn.Module):
             .permute(0, 2, 1, 3)
             .reshape(batch * nodes, history, -1)
         )
-        _, encoded = self.history_encoder(sequence)
-        encoded = encoded[-1].reshape(batch, nodes, self.hidden_dim)
+        _, (encoded_h, encoded_c) = self.history_encoder(sequence)
+        encoded_h = encoded_h[-1].reshape(batch, nodes, self.hidden_dim)
+        encoded_c = encoded_c[-1].reshape(batch, nodes, self.hidden_dim)
 
         static_node = self._compressed_static(node_static)
         static_node = static_node.unsqueeze(0).expand(batch, -1, -1)
-        context = self.node_fusion(torch.cat([encoded, static_node], dim=-1))
+        context = self.node_fusion(torch.cat([encoded_h, static_node], dim=-1))
 
+        # Initialize the downstream WaterBalanceLSTM recurrent state from the
+        # same LSTM family. encoded_c is retained explicitly so the initializer
+        # does not discard the history encoder's memory-cell information.
         h0 = torch.tanh(self.h_head(context))
-        c0 = torch.tanh(self.c_head(context))
+        c_context = context + encoded_c
+        c0 = torch.tanh(self.c_head(c_context))
         storage = self.positive(self.storage_head(context))
         storage_fast = storage[..., 0]
         storage_slow = storage[..., 1]
