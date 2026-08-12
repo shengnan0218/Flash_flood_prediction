@@ -1,0 +1,17 @@
+_base_: hunan_p2_continuous_multitask.yaml
+
+# P3 strict comparison against P2: only add forecast-origin hydrological
+# state assimilation. Dataset, frozen Step16 split, sampler, loss, optimizer,
+# learning rate, batch size, WaterBalanceCell and kinematic-wave equations are
+# inherited unchanged from P2.
+state_initialization:
+  enabled: true
+  mode: forecast_origin
+
+training:
+  checkpoint: outputs/hunan_p3_state_init_best.pt
+  final_checkpoint: outputs/hunan_p3_state_init_epoch100.pt
+  log_csv: outputs/hunan_p3_state_init_train.csv
+
+hyperparameter_optimization:
+  enabled: false
