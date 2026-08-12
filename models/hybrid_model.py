@@ -25,6 +25,7 @@ class HybridFloodModel(nn.Module):
         self.use_observation_masks = bool(
             cfg.get("data", {}).get("use_observation_masks", False)
         )
+        self.z_target_mode = str(cfg.get("loss", {}).get("z_target_mode", "absolute"))
         state_cfg = cfg.get("state_initialization", {})
         self.use_state_initialization = bool(state_cfg.get("enabled", False))
         self.state_initialization_mode = str(
@@ -141,6 +142,116 @@ class HybridFloodModel(nn.Module):
             raise ValueError("物理增量汇水面积必须为有限正数，单位km²")
         return area
 
+    @staticmethod
+    def _latest_observed_history(
+        values: torch.Tensor, mask: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the latest valid history value per batch/node and availability."""
+        if values.ndim != 3 or mask.shape != values.shape:
+            raise ValueError("history values/mask必须同为[B,H,N]")
+        valid = mask.bool() & torch.isfinite(values)
+        batch, history, nodes = values.shape
+        positions = torch.arange(history, device=values.device).view(1, history, 1)
+        positions = positions.expand(batch, -1, nodes)
+        last = positions.masked_fill(~valid, -1).amax(dim=1)
+        available = last >= 0
+        gather_index = last.clamp_min(0).unsqueeze(1)
+        latest = values.gather(1, gather_index).squeeze(1)
+        latest = torch.where(available, latest, torch.zeros_like(latest))
+        return latest, available
+
+    @staticmethod
+    def _initial_node_channel_storage(
+        batch: Any,
+        routing_diagnostics: dict[str, torch.Tensor],
+        reference: torch.Tensor,
+    ) -> torch.Tensor:
+        """Map initialized edge volumes to the same node-storage convention as routing."""
+        batch_size, _, nodes = reference.shape
+        node_storage = torch.zeros(
+            batch_size, nodes, device=reference.device, dtype=reference.dtype
+        )
+        edge_storage = routing_diagnostics.get("initial_edge_storage_m3")
+        if edge_storage is None:
+            return node_storage
+        edge_storage = edge_storage.to(device=reference.device, dtype=reference.dtype)
+        edges = int(batch.edge_index.shape[1])
+        if edge_storage.shape != (batch_size, edges):
+            raise ValueError("initial_edge_storage_m3必须为[B,E]")
+        if edges:
+            destination = batch.edge_index[1].long().to(reference.device)
+            node_storage.index_add_(1, destination, edge_storage)
+        return node_storage
+
+    def _forecast_origin_delta_z(
+        self,
+        batch: Any,
+        q_future: torch.Tensor,
+        channel_future: torch.Tensor | None,
+        routing_diagnostics: dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Predict P3 water-level change relative to the observed forecast origin.
+
+        ``MonotonicQZObservation`` represents a station-wise absolute stage
+        response H(Q, channel_state).  P3 must not compare that absolute response
+        directly with a delta-Z target.  Instead it evaluates the same response
+        at the forecast origin and predicts H(t+h)-H(t0).  The observed Z0 is
+        then the exact anchor for reconstructing absolute future stage.
+        """
+        q_origin, q_origin_available = self._latest_observed_history(
+            batch.q_history, batch.q_mask
+        )
+        initial_channel = self._initial_node_channel_storage(
+            batch, routing_diagnostics, q_future
+        )
+        future_level_response = self.observation(
+            q_future,
+            channel_future,
+            getattr(batch, "station_index", None),
+        )
+        origin_level_response = self.observation(
+            q_origin.unsqueeze(1),
+            initial_channel.unsqueeze(1),
+            getattr(batch, "station_index", None),
+        )
+        raw_delta = future_level_response - origin_level_response
+
+        z_reference = getattr(batch, "z_reference", None)
+        z_reference_mask = getattr(batch, "z_reference_mask", None)
+        diagnostics: dict[str, torch.Tensor] = {
+            "forecast_origin_q_m3s": q_origin,
+            "forecast_origin_q_available": q_origin_available,
+            "initial_node_channel_storage_m3": initial_channel,
+            "forecast_origin_level_response": origin_level_response.squeeze(1),
+        }
+        if z_reference is None or z_reference_mask is None:
+            return raw_delta, diagnostics
+        if z_reference.ndim != 2 or z_reference.shape != q_origin.shape:
+            raise ValueError("z_reference必须为[B,N]并与forecast-origin Q一致")
+        if z_reference_mask.shape != z_reference.shape:
+            raise ValueError("z_reference_mask必须与z_reference同形状")
+        reference_valid = z_reference_mask.bool() & torch.isfinite(z_reference)
+        reference = torch.where(reference_valid, z_reference, torch.zeros_like(z_reference))
+
+        # Calibrate the absolute response curve to the observed Z0.  The delta
+        # algebraically remains H(t+h)-H(t0), while the absolute forecast is
+        # guaranteed to start from the measured forecast-origin stage rather
+        # than from a free station offset.
+        calibration = reference.unsqueeze(1) - origin_level_response
+        absolute_future = future_level_response + calibration
+        anchored_delta = absolute_future - reference.unsqueeze(1)
+        anchored_delta = torch.where(
+            reference_valid.unsqueeze(1), anchored_delta, raw_delta
+        )
+        diagnostics.update(
+            {
+                "forecast_origin_z_m": reference,
+                "forecast_origin_z_available": reference_valid,
+                "absolute_z_forecast_m": absolute_future,
+            }
+        )
+        return anchored_delta, diagnostics
+
     def _state_initialized_forward(
         self,
         batch: Any,
@@ -200,11 +311,17 @@ class HybridFloodModel(nn.Module):
                 batch, features, rainfall, area_km2
             )
             channel_all = diagnostics.get("node_channel_storage")
-            z_all = self.observation(
-                q_all,
-                channel_all,
-                getattr(batch, "station_index", None),
-            )
+            if self.z_target_mode == "delta_from_t0":
+                z_all, z_diagnostics = self._forecast_origin_delta_z(
+                    batch, q_all, channel_all, diagnostics
+                )
+                diagnostics.update(z_diagnostics)
+            else:
+                z_all = self.observation(
+                    q_all,
+                    channel_all,
+                    getattr(batch, "station_index", None),
+                )
             return {
                 "q": q_all,
                 "z": z_all,
