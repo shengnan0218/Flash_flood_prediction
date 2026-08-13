@@ -4,6 +4,18 @@ from types import SimpleNamespace
 import unittest
 
 from datasets.continuous_sampling import HunanContinuousDataset
+from datasets.hunan import GraphGroupedBatchSampler
+
+
+class _GroupedIndexDataset:
+    def __init__(self, graph_ids: list[str]) -> None:
+        self.graph_ids = graph_ids
+
+    def __len__(self) -> int:
+        return len(self.graph_ids)
+
+    def graph_id_for_index(self, index: int) -> str:
+        return self.graph_ids[index]
 
 
 class TestEventDomainSampling(unittest.TestCase):
@@ -43,6 +55,21 @@ class TestEventDomainSampling(unittest.TestCase):
                 response_cap=4.0,
                 minimum_weight=0.25,
                 maximum_weight=4.0,
+            )
+
+    def test_shuffled_group_sampler_is_one_full_pass_without_replacement(self) -> None:
+        dataset = _GroupedIndexDataset(["G1", "G1", "G1", "G2", "G2", "G3"])
+        sampler = GraphGroupedBatchSampler(
+            dataset, batch_size=2, shuffle=True, drop_last=False, seed=17
+        )
+        sampler.set_epoch(3)
+        batches = list(iter(sampler))
+        flattened = [index for batch in batches for index in batch]
+        self.assertEqual(sorted(flattened), list(range(len(dataset))))
+        self.assertEqual(len(flattened), len(set(flattened)))
+        for batch in batches:
+            self.assertEqual(
+                len({dataset.graph_id_for_index(index) for index in batch}), 1
             )
 
     def test_full_record_continuous_schema_keeps_response_weighting_mode(self) -> None:
