@@ -5,7 +5,16 @@ import argparse
 import json
 import math
 from pathlib import Path
+import sys
 from typing import Iterable
+
+# Allow direct execution from the repository root via
+# ``python scripts/diagnose_p3_z.py ...``.  When a file inside ``scripts/`` is
+# executed directly, Python otherwise places only that directory at sys.path[0]
+# and cannot resolve top-level project packages such as ``scripts``/``trainers``.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 import torch
 
