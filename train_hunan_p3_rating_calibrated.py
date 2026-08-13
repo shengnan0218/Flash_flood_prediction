@@ -63,6 +63,14 @@ def main() -> None:
     sampling_mode = getattr(
         train_loader.dataset, "train_sampling_mode", "legacy_or_unweighted"
     )
+    loss_weight_mode = getattr(
+        train_loader.dataset, "train_loss_weight_mode", "unit_or_legacy"
+    )
+    weight_statistics = (
+        train_loader.dataset.event_loss_weight_statistics()
+        if hasattr(train_loader.dataset, "event_loss_weight_statistics")
+        else {"mode": loss_weight_mode}
+    )
     sampler_name = type(train_loader.batch_sampler).__name__
     weighted_cfg = bool(cfg.get("train_sampling", {}).get("enabled", False))
     replacement_sampling = "Weighted" in sampler_name
@@ -71,6 +79,11 @@ def main() -> None:
             raise RuntimeError(
                 "hydrologic event-domain TRAIN必须full-pass且无replacement sampling；"
                 f"config_weighted={weighted_cfg}, sampler={sampler_name}"
+            )
+        if loss_weight_mode != "deterministic_graph_event_window_balance":
+            raise RuntimeError(
+                "hydrologic event-domain TRAIN缺少确定性graph/event/window loss balance；"
+                f"actual={loss_weight_mode}"
             )
 
     print(
@@ -95,6 +108,8 @@ def main() -> None:
                 "train_batch_sampler": sampler_name,
                 "train_weighted_sampling": weighted_cfg,
                 "train_replacement_sampling": replacement_sampling,
+                "train_loss_weight_mode": loss_weight_mode,
+                "train_loss_weight_statistics": weight_statistics,
                 "calibrated_rating_station_count": len(station_fits),
                 "usable_calibrated_rating_station_count": len(usable),
                 "rating_fits": usable,
