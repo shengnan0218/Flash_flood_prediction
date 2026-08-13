@@ -1,0 +1,19 @@
+_base_: hunan_p3_state_init_single_q611e0340_event_domain.yaml
+
+# Revised P3 single-basin experiment.
+# Runtime semantics are activated only by train_hunan_p3_rating_aligned.py:
+# - TRAIN-only station-aware FLOW input normalization;
+# - TRAIN-only relative-Z input normalization aligned with delta-Z loss scale;
+# - exact Q(t0) / inverse-rating Z(t0) forecast-origin anchoring;
+# - TRAIN-fitted rating(Q) as primary delta-Z backbone + small residual head;
+# - Z loss is allowed to backpropagate through rating(Q) into latent Q.
+# All inherited optimizer/LR/batch/loss weights/sampler/solver/100-epoch budget
+# remain unchanged. Future rainfall remains the inherited operational
+# persistence baseline.
+training:
+  checkpoint: outputs/hunan_p3_state_init_single_q611e0340_event_domain_rating_aligned_best.pt
+  final_checkpoint: outputs/hunan_p3_state_init_single_q611e0340_event_domain_rating_aligned_epoch100.pt
+  log_csv: outputs/hunan_p3_state_init_single_q611e0340_event_domain_rating_aligned_train.csv
+
+hyperparameter_optimization:
+  enabled: false
