@@ -11,14 +11,14 @@ from .flood_multitask_loss import LossTerm
 
 
 class FloodMultitaskLoss(_BaseFloodMultitaskLoss):
-    """Keep the existing 2:1 Q/Z objective and add weak P3 consistency.
+    """Keep legacy P3 consistency while allowing rating-backed P3 to replace it.
 
-    The primary Z level/slope losses supervise the independent Z head.  For P3
-    forecast-origin delta-Z only, an additional fixed 0.1 Huber penalty aligns
-    the independent delta-Z trajectory with the monotone hydraulic relation
-    H(Q_h,S_h)-H(Q_0,S_0).  This is intentionally a weak regularizer rather than
-    a third main task, and is the only loss path that directly couples the
-    independent Z prediction back to the Q/observation branch.
+    Historical P3 independent-Z experiments use a fixed 0.1 Huber consistency
+    penalty between the independent delta-Z trajectory and the learned monotone
+    hydraulic relation.  The revised ``p3_rating_aligned`` runtime deliberately
+    disables that legacy term because Q->Z is now the primary differentiable
+    prediction backbone itself; retaining an additional weak consistency target
+    would double-count a superseded relation and change the agreed objective.
     """
 
     P3_QZ_CONSISTENCY_WEIGHT = 0.1
@@ -26,11 +26,16 @@ class FloodMultitaskLoss(_BaseFloodMultitaskLoss):
 
     def _p3_consistency_enabled(self) -> bool:
         state = self.cfg.get("state_initialization", {})
+        runtime = self.cfg.get("_runtime", {})
+        rating_aligned = bool(
+            isinstance(runtime, Mapping) and runtime.get("p3_rating_aligned", False)
+        )
         return bool(
             self.mode == "multitask"
             and self.z_target_mode == "delta_from_t0"
             and isinstance(state, Mapping)
             and state.get("enabled", False)
+            and not rating_aligned
         )
 
     def coefficients(self) -> dict[str, float]:
