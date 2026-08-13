@@ -8,7 +8,7 @@ from models.hybrid_model import HybridFloodModel
 
 
 class _IdentityObservation(torch.nn.Module):
-    """Deterministic H(Q,S)=Q+0.1S for forecast-origin delta tests."""
+    """Deterministic H(Q,S)=Q+0.1S consistency relation."""
 
     def forward(self, q, channel_state=None, station_index=None):
         if channel_state is None:
@@ -16,18 +16,16 @@ class _IdentityObservation(torch.nn.Module):
         return q + 0.1 * channel_state
 
 
-class _ZeroResidual(torch.nn.Module):
-    def forward(self, x):
-        return torch.zeros_like(x[..., :1])
-
-
-class _ConstantResidual(torch.nn.Module):
-    def __init__(self, value: float) -> None:
+class _FixedIndependentHead(torch.nn.Module):
+    def __init__(self, values: list[float]) -> None:
         super().__init__()
-        self.value = float(value)
+        self.register_buffer("values", torch.tensor(values, dtype=torch.float32))
 
-    def forward(self, x):
-        return torch.full_like(x[..., :1], self.value)
+    def forward(self, history_context, q_future, *args, **kwargs):
+        batch, steps, nodes = q_future.shape
+        if steps != self.values.numel():
+            raise ValueError("test head horizon mismatch")
+        return self.values.view(1, steps, 1).expand(batch, -1, nodes)
 
 
 class _Batch:
@@ -35,12 +33,12 @@ class _Batch:
 
 
 class TestP3ForecastOriginZ(unittest.TestCase):
-    def _model_shell(self, residual: torch.nn.Module | None = None) -> HybridFloodModel:
+    def _model_shell(self, values: list[float]) -> HybridFloodModel:
         model = object.__new__(HybridFloodModel)
         torch.nn.Module.__init__(model)
         model.observation = _IdentityObservation()
         model.hidden_dim = 2
-        model.stage_residual_head = residual if residual is not None else _ZeroResidual()
+        model.independent_z_head = _FixedIndependentHead(values)
         return model
 
     def _batch(self) -> _Batch:
@@ -62,41 +60,41 @@ class TestP3ForecastOriginZ(unittest.TestCase):
             "history_context": torch.zeros((1, 1, 2)),
         }
 
-    def test_delta_is_future_response_minus_forecast_origin_response_when_residual_zero(self) -> None:
-        model = self._model_shell()
+    def test_independent_head_is_primary_z_prediction(self) -> None:
+        model = self._model_shell([0.2, 0.4, -0.1])
         batch = self._batch()
         future_q = torch.tensor([[[12.0], [15.0], [8.0]]])
-        delta, audit = model._forecast_origin_delta_z(
+        delta, audit = model._independent_forecast_origin_z(
             batch, future_q, torch.zeros_like(future_q), self._diagnostics()
         )
         torch.testing.assert_close(
-            delta[:, :, 0], torch.tensor([[2.0, 5.0, -2.0]])
+            delta[:, :, 0], torch.tensor([[0.2, 0.4, -0.1]])
         )
         torch.testing.assert_close(
             audit["absolute_z_forecast_m"][:, :, 0],
-            torch.tensor([[102.0, 105.0, 98.0]]),
+            torch.tensor([[100.2, 100.4, 99.9]]),
         )
 
-    def test_feed_forward_stage_memory_residual_enters_delta_z(self) -> None:
-        model = self._model_shell(_ConstantResidual(0.25))
+    def test_monotone_qz_is_only_consistency_target(self) -> None:
+        model = self._model_shell([0.2, 0.4, -0.1])
         batch = self._batch()
         future_q = torch.tensor([[[12.0], [15.0], [8.0]]])
-        delta, audit = model._forecast_origin_delta_z(
+        delta, audit = model._independent_forecast_origin_z(
             batch, future_q, torch.zeros_like(future_q), self._diagnostics()
         )
         torch.testing.assert_close(
-            delta[:, :, 0], torch.tensor([[2.25, 5.25, -1.75]])
+            audit["qz_consistency_delta_z_m"][:, :, 0],
+            torch.tensor([[2.0, 5.0, -2.0]]),
         )
-        torch.testing.assert_close(
-            audit["stage_memory_residual_m"][:, :, 0],
-            torch.tensor([[0.25, 0.25, 0.25]]),
+        self.assertFalse(
+            torch.allclose(delta, audit["qz_consistency_delta_z_m"])
         )
 
     def test_observed_z0_is_absolute_anchor(self) -> None:
-        model = self._model_shell()
+        model = self._model_shell([0.0])
         batch = self._batch()
         future_q = torch.tensor([[[10.0]]])
-        delta, audit = model._forecast_origin_delta_z(
+        delta, audit = model._independent_forecast_origin_z(
             batch, future_q, torch.zeros_like(future_q), self._diagnostics()
         )
         torch.testing.assert_close(delta, torch.zeros_like(delta))
@@ -112,7 +110,7 @@ class TestP3ForecastOriginZ(unittest.TestCase):
         self.assertTrue(bool(valid.item()))
 
     def test_initial_edge_storage_uses_routing_destination_convention(self) -> None:
-        model = self._model_shell()
+        model = self._model_shell([0.0])
         batch = self._batch()
         batch.edge_index = torch.tensor([[0], [1]], dtype=torch.long)
         reference = torch.zeros((1, 2, 2))
