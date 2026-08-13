@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import torch
 from torch import nn
-from torch.nn import functional as F
 
 
 class HydrologicalStateInitializer(nn.Module):
@@ -24,15 +23,13 @@ class HydrologicalStateInitializer(nn.Module):
     the routing module converts that discharge to a physically consistent
     initial reach volume using its own kinematic-wave relation.
 
-    P3 also exposes a dedicated ``history_context`` for the observation path.
-    That context is intentionally *not* the Q/storage context below: it is built
-    by a feed-forward multi-bin summary of the full observed history.  This
-    restores antecedent stage-shape information without adding a second
-    recurrent model and prevents the flexible Z residual from depending on the
-    Q-oriented fused state representation.
+    P3 additionally exposes a dedicated ``history_context`` for the independent
+    Z prediction path.  Unlike the Q/storage recurrent context, this stage
+    context preserves every hourly history input in its original temporal order:
+    the complete H x D history is flattened directly and passed through a small
+    feed-forward encoder.  No temporal averaging/pooling is applied, so short
+    flash-flood rise/peak/recession signatures remain available to the Z head.
     """
-
-    STAGE_HISTORY_BINS = 8
 
     def __init__(
         self,
@@ -40,12 +37,16 @@ class HydrologicalStateInitializer(nn.Module):
         node_static_dim: int,
         edge_static_dim: int,
         hidden_dim: int,
+        history_length: int,
     ) -> None:
         super().__init__()
         self.hidden_dim = int(hidden_dim)
         self.node_static_dim = int(node_static_dim)
         self.edge_static_dim = int(edge_static_dim)
         self.temporal_input_dim = int(temporal_input_dim)
+        self.history_length = int(history_length)
+        if self.history_length <= 0:
+            raise ValueError("history_length必须大于0")
 
         self.history_encoder = nn.LSTM(
             temporal_input_dim,
@@ -67,13 +68,10 @@ class HydrologicalStateInitializer(nn.Module):
         )
         self.positive = nn.Softplus()
 
-        # Pure feed-forward stage-history encoder. Adaptive temporal pooling
-        # preserves coarse chronology over the complete history window (8 bins;
-        # for the formal 24 h P3 contract this is eight successive 3 h blocks),
-        # while the explicit final-hour feature keeps forecast-origin detail.
-        # It consumes the same normalized dynamic/mask inputs already available
-        # at t0 and does not alter the Q recurrent/state-initialization path.
-        stage_input_dim = (self.STAGE_HISTORY_BINS + 1) * self.temporal_input_dim
+        # Dedicated stage-history encoder: preserve all hourly values and their
+        # exact order.  For the formal P3 contract this is 24 x D inputs per
+        # node, with no 3-hour binning or adaptive averaging.
+        stage_input_dim = self.history_length * self.temporal_input_dim
         self.stage_history_head = nn.Sequential(
             nn.Linear(stage_input_dim, hidden_dim),
             nn.SiLU(),
@@ -87,18 +85,20 @@ class HydrologicalStateInitializer(nn.Module):
         return torch.sign(value) * torch.log1p(value.abs())
 
     def _stage_history_context(self, sequence: torch.Tensor) -> torch.Tensor:
-        """Encode the whole observed trajectory without any recurrent module."""
+        """Encode every hourly history feature without temporal aggregation."""
         if sequence.ndim != 3:
             raise ValueError("stage history sequence必须为[B*N,H,D]")
-        if sequence.shape[1] < 1 or sequence.shape[2] != self.temporal_input_dim:
-            raise ValueError("stage history sequence时间/特征维无效")
-        # [BN,H,D] -> [BN,D,H] -> [BN,D,8] -> [BN,8*D]
-        pooled = F.adaptive_avg_pool1d(
-            sequence.transpose(1, 2), self.STAGE_HISTORY_BINS
-        )
-        pooled = pooled.transpose(1, 2).reshape(sequence.shape[0], -1)
-        latest = sequence[:, -1]
-        return self.stage_history_head(torch.cat([pooled, latest], dim=-1))
+        if sequence.shape[1] != self.history_length:
+            raise ValueError(
+                f"stage history长度应为{self.history_length}，实际={sequence.shape[1]}"
+            )
+        if sequence.shape[2] != self.temporal_input_dim:
+            raise ValueError(
+                "stage history特征维应为"
+                f"{self.temporal_input_dim}，实际={sequence.shape[2]}"
+            )
+        flattened = sequence.reshape(sequence.shape[0], -1)
+        return self.stage_history_head(flattened)
 
     def forward(
         self,
@@ -110,8 +110,10 @@ class HydrologicalStateInitializer(nn.Module):
         if history_features.ndim != 4:
             raise ValueError("history_features必须为[B,H,N,D]")
         batch, history, nodes, features = history_features.shape
-        if history < 1:
-            raise ValueError("state initializer至少需要1个历史时步")
+        if history != self.history_length:
+            raise ValueError(
+                f"state initializer history应为{self.history_length}小时，实际={history}"
+            )
         if features != self.temporal_input_dim:
             raise ValueError(
                 f"history_features特征维应为{self.temporal_input_dim}，实际={features}"
@@ -138,9 +140,8 @@ class HydrologicalStateInitializer(nn.Module):
             .reshape(batch * nodes, history, -1)
         )
 
-        # Dedicated stage path is independent of the Q-oriented recurrent
-        # representation below.  Z loss can train this feed-forward encoder
-        # without requiring the Q/storage context itself to carry stage shape.
+        # Z-specific context preserves the complete hourly sequence.  It is
+        # independent of the Q-oriented recurrent context below.
         stage_context = self._stage_history_context(sequence)
         stage_context = stage_context.reshape(batch, nodes, self.hidden_dim)
 
