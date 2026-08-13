@@ -1,4 +1,4 @@
-"""Differentiable station-wise linear Q-Z rating curves fitted on TRAIN only."""
+"""Differentiable station-wise Q-Z rating functions fitted on TRAIN only."""
 from __future__ import annotations
 
 from typing import Any, Mapping
@@ -7,13 +7,26 @@ import torch
 from torch import nn
 
 
-class TrainFittedLinearRating(nn.Module):
-    """Apply fixed TRAIN-only station rating curves while preserving dZ/dQ.
+class _StationIndexMixin:
+    num_stations: int
 
-    The fitted slope/intercept are data facts, not trainable parameters.  They
-    are registered as buffers so they travel with checkpoints and devices while
-    gradients still flow from Z loss through the affine transformation into Q.
-    """
+    def _indices(
+        self, nodes: int, station_index: torch.Tensor | None, device: torch.device
+    ) -> torch.Tensor:
+        if station_index is None:
+            if nodes > self.num_stations:
+                raise ValueError("当前图节点数超过rating站点目录")
+            return torch.arange(nodes, device=device, dtype=torch.long)
+        if station_index.dtype != torch.long or tuple(station_index.shape) != (nodes,):
+            raise ValueError("station_index必须为[N] LongTensor")
+        indices = station_index.to(device=device)
+        if (indices < 0).any() or (indices >= self.num_stations).any():
+            raise ValueError("station_index超出rating站点目录")
+        return indices
+
+
+class TrainFittedLinearRating(_StationIndexMixin, nn.Module):
+    """Apply fixed TRAIN-only station linear rating curves preserving dZ/dQ."""
 
     def __init__(self, stations: int) -> None:
         super().__init__()
@@ -54,20 +67,6 @@ class TrainFittedLinearRating(nn.Module):
         self.intercept.copy_(intercept)
         self.available.copy_(available)
 
-    def _indices(
-        self, nodes: int, station_index: torch.Tensor | None, device: torch.device
-    ) -> torch.Tensor:
-        if station_index is None:
-            if nodes > self.num_stations:
-                raise ValueError("当前图节点数超过rating站点目录")
-            return torch.arange(nodes, device=device, dtype=torch.long)
-        if station_index.dtype != torch.long or tuple(station_index.shape) != (nodes,):
-            raise ValueError("station_index必须为[N] LongTensor")
-        indices = station_index.to(device=device)
-        if (indices < 0).any() or (indices >= self.num_stations).any():
-            raise ValueError("station_index超出rating站点目录")
-        return indices
-
     def forward(
         self,
         q: torch.Tensor,
@@ -100,3 +99,138 @@ class TrainFittedLinearRating(nn.Module):
         safe_a = torch.where(available, a, torch.ones_like(a))
         q = ((z - b) / safe_a).clamp_min(0)
         return torch.where(available, q, torch.zeros_like(q)), available
+
+
+class TrainFittedMonotoneRating(_StationIndexMixin, nn.Module):
+    """Frozen TRAIN-only monotone piecewise-linear station rating functions.
+
+    Each station receives its own PAV-derived knot sequence. Knots are buffers,
+    never trainable parameters. Linear interpolation/extrapolation is fully
+    differentiable with respect to Q inside each active segment, so Z loss can
+    supervise the hydrologic Q prediction while paired Q/Z observations only
+    determine the fixed observation function before training begins.
+    """
+
+    def __init__(self, stations: int) -> None:
+        super().__init__()
+        if stations <= 0:
+            raise ValueError("stations必须为正")
+        self.num_stations = int(stations)
+        self.register_buffer("available", torch.zeros(stations, dtype=torch.bool))
+        self.register_buffer("knot_count", torch.zeros(stations, dtype=torch.long))
+        # Variable-length station knots are padded at configure time. Buffers are
+        # replaced atomically so they are checkpointed with the calibrated curve.
+        self.register_buffer("q_knots", torch.zeros((stations, 2), dtype=torch.float32))
+        self.register_buffer("z_knots", torch.zeros((stations, 2), dtype=torch.float32))
+
+    def configure(
+        self,
+        statistics: Mapping[str, Any],
+        station_to_index: Mapping[str, int],
+    ) -> None:
+        station_stats = statistics.get("stations")
+        if not isinstance(station_stats, Mapping):
+            raise ValueError("calibrated rating statistics缺少stations")
+        prepared: dict[int, tuple[list[float], list[float]]] = {}
+        max_knots = 2
+        for station_id, values in station_stats.items():
+            if station_id not in station_to_index:
+                continue
+            if not isinstance(values, Mapping) or not bool(values.get("usable_calibrated", False)):
+                continue
+            q_values = [float(value) for value in values.get("calibrated_q_knots_m3s", [])]
+            z_values = [float(value) for value in values.get("calibrated_z_knots_m", [])]
+            if len(q_values) != len(z_values) or len(q_values) < 2:
+                raise ValueError(f"STATION_ID={station_id}: calibrated knots无效")
+            if any(b <= a for a, b in zip(q_values, q_values[1:])):
+                raise ValueError(f"STATION_ID={station_id}: calibrated Q knots必须严格递增")
+            if any(b <= a for a, b in zip(z_values, z_values[1:])):
+                raise ValueError(f"STATION_ID={station_id}: calibrated Z knots必须严格递增")
+            index = int(station_to_index[station_id])
+            if not 0 <= index < self.num_stations:
+                raise ValueError(f"rating station index越界: {station_id} -> {index}")
+            prepared[index] = (q_values, z_values)
+            max_knots = max(max_knots, len(q_values))
+
+        device = self.available.device
+        q_knots = torch.zeros((self.num_stations, max_knots), dtype=torch.float32, device=device)
+        z_knots = torch.zeros((self.num_stations, max_knots), dtype=torch.float32, device=device)
+        counts = torch.zeros(self.num_stations, dtype=torch.long, device=device)
+        available = torch.zeros(self.num_stations, dtype=torch.bool, device=device)
+        for index, (q_values, z_values) in prepared.items():
+            count = len(q_values)
+            q_tensor = torch.tensor(q_values, dtype=torch.float32, device=device)
+            z_tensor = torch.tensor(z_values, dtype=torch.float32, device=device)
+            q_knots[index, :count] = q_tensor
+            z_knots[index, :count] = z_tensor
+            # Pad with the last knot; padding is excluded by knot_count.
+            q_knots[index, count:] = q_tensor[-1]
+            z_knots[index, count:] = z_tensor[-1]
+            counts[index] = count
+            available[index] = True
+        self.q_knots = q_knots
+        self.z_knots = z_knots
+        self.knot_count.copy_(counts)
+        self.available.copy_(available)
+
+    @staticmethod
+    def _interp_extrapolate(
+        value: torch.Tensor,
+        x: torch.Tensor,
+        y: torch.Tensor,
+    ) -> torch.Tensor:
+        """Piecewise-linear interpolation with end-segment extrapolation."""
+        right = torch.searchsorted(x.contiguous(), value.contiguous()).clamp(1, x.numel() - 1)
+        left = right - 1
+        x0 = x[left]
+        x1 = x[right]
+        y0 = y[left]
+        y1 = y[right]
+        slope = (y1 - y0) / (x1 - x0)
+        return y0 + slope * (value - x0)
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        station_index: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if q.ndim != 3:
+            raise ValueError("rating q必须为[B,T,N]")
+        if not torch.isfinite(q).all():
+            raise FloatingPointError("rating q含NaN/Inf")
+        _, _, nodes = q.shape
+        indices = self._indices(nodes, station_index, q.device)
+        output = torch.zeros_like(q)
+        station_available = self.available[indices]
+        for local_node, global_index in enumerate(indices.tolist()):
+            if not bool(self.available[global_index]):
+                continue
+            count = int(self.knot_count[global_index].item())
+            x = self.q_knots[global_index, :count]
+            y = self.z_knots[global_index, :count]
+            output[..., local_node] = self._interp_extrapolate(
+                q[..., local_node].clamp_min(0), x, y
+            )
+        return output, station_available
+
+    def inverse_from_z(
+        self,
+        z: torch.Tensor,
+        station_index: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if z.ndim != 2:
+            raise ValueError("rating inverse z必须为[B,N]")
+        batch, nodes = z.shape
+        indices = self._indices(nodes, station_index, z.device)
+        output = torch.zeros_like(z)
+        station_available = self.available[indices]
+        available = station_available.view(1, nodes).expand(batch, -1)
+        for local_node, global_index in enumerate(indices.tolist()):
+            if not bool(self.available[global_index]):
+                continue
+            count = int(self.knot_count[global_index].item())
+            # Strictly monotone calibrated Z knots make the inverse unique.
+            x = self.z_knots[global_index, :count]
+            y = self.q_knots[global_index, :count]
+            output[..., local_node] = self._interp_extrapolate(z[..., local_node], x, y).clamp_min(0)
+        return torch.where(available, output, torch.zeros_like(output)), available
