@@ -1,4 +1,4 @@
-"""Diagnose P3 delta-Z collapse without modifying training state."""
+"""Diagnose P3 independent delta-Z prediction without modifying training state."""
 from __future__ import annotations
 
 import argparse
@@ -8,10 +8,6 @@ from pathlib import Path
 import sys
 from typing import Iterable
 
-# Allow direct execution from the repository root via
-# ``python scripts/diagnose_p3_z.py ...``.  When a file inside ``scripts/`` is
-# executed directly, Python otherwise places only that directory at sys.path[0]
-# and cannot resolve top-level project packages such as ``scripts``/``trainers``.
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -23,14 +19,19 @@ from trainers import Trainer
 
 
 def _masked_values(value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    valid = mask.bool()
-    return value[valid].detach().float().cpu()
+    return value[mask.bool()].detach().float().cpu()
 
 
 def _summary(value: torch.Tensor) -> dict[str, float | int]:
     value = value.float().reshape(-1)
     if not value.numel():
-        return {"count": 0, "mean": float("nan"), "std": float("nan"), "min": float("nan"), "max": float("nan")}
+        return {
+            "count": 0,
+            "mean": float("nan"),
+            "std": float("nan"),
+            "min": float("nan"),
+            "max": float("nan"),
+        }
     return {
         "count": int(value.numel()),
         "mean": float(value.mean()),
@@ -66,8 +67,7 @@ def _collect_validation(
     model.eval()
     targets: list[torch.Tensor] = []
     predictions: list[torch.Tensor] = []
-    physical: list[torch.Tensor] = []
-    residuals: list[torch.Tensor] = []
+    consistency: list[torch.Tensor] = []
     q_predictions: list[torch.Tensor] = []
     reference_total = 0
     reference_valid = 0
@@ -79,28 +79,33 @@ def _collect_validation(
             batch = batch.to(trainer.device)
             out = model(batch)
             diagnostics = out.get("diagnostics", {})
-            if "physical_delta_z_m" not in diagnostics:
-                raise RuntimeError("checkpoint/model没有P3 physical_delta_z_m diagnostics")
-            if "stage_memory_residual_m" not in diagnostics:
-                raise RuntimeError("checkpoint/model没有P3 stage_memory_residual_m diagnostics")
+            if "qz_consistency_delta_z_m" not in diagnostics:
+                raise RuntimeError(
+                    "checkpoint/model没有qz_consistency_delta_z_m diagnostics"
+                )
             mask = batch.z_target_mask.bool()
             targets.append(_masked_values(batch.z_target, mask))
             predictions.append(_masked_values(out["z"], mask))
-            physical.append(_masked_values(diagnostics["physical_delta_z_m"], mask))
-            residuals.append(_masked_values(diagnostics["stage_memory_residual_m"], mask))
-            q_predictions.append(_masked_values(out["q"], batch.q_target_mask.bool()))
+            consistency.append(
+                _masked_values(diagnostics["qz_consistency_delta_z_m"], mask)
+            )
+            q_predictions.append(
+                _masked_values(out["q"], batch.q_target_mask.bool())
+            )
             if batch.z_reference_mask is not None:
                 reference_total += int(batch.z_reference_mask.numel())
                 reference_valid += int(batch.z_reference_mask.sum().item())
             batches += 1
     target = _concat(targets)
     prediction = _concat(predictions)
-    physical_delta = _concat(physical)
-    residual = _concat(residuals)
+    consistency_delta = _concat(consistency)
     q_prediction = _concat(q_predictions)
-    if target.numel() != prediction.numel() or target.numel() != physical_delta.numel() or target.numel() != residual.numel():
+    if not (
+        target.numel() == prediction.numel() == consistency_delta.numel()
+    ):
         raise RuntimeError("Z诊断张量有效元素数量不一致")
     error = prediction - target
+    consistency_gap = prediction - consistency_delta
     return {
         "batches": batches,
         "z_reference_valid_fraction": (
@@ -108,14 +113,13 @@ def _collect_validation(
         ),
         "z_target": _summary(target),
         "z_prediction": _summary(prediction),
-        "physical_delta": _summary(physical_delta),
-        "stage_residual": _summary(residual),
+        "qz_consistency_delta": _summary(consistency_delta),
         "z_error": _summary(error),
         "z_mae_m": float(error.abs().mean()) if error.numel() else float("nan"),
+        "qz_consistency_gap": _summary(consistency_gap),
         "corr_prediction_target": _corr(prediction, target),
-        "corr_physical_target": _corr(physical_delta, target),
-        "corr_residual_target": _corr(residual, target),
-        "corr_residual_target_minus_physical": _corr(residual, target - physical_delta),
+        "corr_consistency_target": _corr(consistency_delta, target),
+        "corr_prediction_consistency": _corr(prediction, consistency_delta),
         "q_prediction": _summary(q_prediction),
     }
 
@@ -154,17 +158,19 @@ def _gradient_diagnostic(trainer: Trainer, loader: Iterable) -> dict[str, object
     result = {
         "loss": float(loss.detach().cpu()),
         "parts": parts,
-        "stage_residual_head": group_stats("stage_residual_head"),
+        "independent_z_head": group_stats("independent_z_head"),
+        "stage_history_head": group_stats("state_initializer.stage_history_head"),
         "observation": group_stats("observation"),
         "state_initializer": group_stats("state_initializer"),
         "runoff": group_stats("runoff"),
+        "routing": group_stats("routing"),
     }
     trainer.optimizer.zero_grad(set_to_none=True)
     return result
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="只读诊断P3 delta-Z塌缩")
+    parser = argparse.ArgumentParser(description="只读诊断P3 independent delta-Z")
     parser.add_argument("--config", required=True)
     parser.add_argument("--dataset-root", required=True)
     parser.add_argument("--graph-id", default=None)
@@ -182,8 +188,12 @@ def main() -> None:
     checkpoint = trainer.load_weights(checkpoint_path, strict=True)
     report = {
         "checkpoint": str(checkpoint_path.resolve()),
-        "checkpoint_epoch": checkpoint.get("epoch") if isinstance(checkpoint, dict) else None,
-        "validation": _collect_validation(trainer, validation_loader, args.max_batches),
+        "checkpoint_epoch": (
+            checkpoint.get("epoch") if isinstance(checkpoint, dict) else None
+        ),
+        "validation": _collect_validation(
+            trainer, validation_loader, args.max_batches
+        ),
         "gradient": _gradient_diagnostic(trainer, train_loader),
     }
     print(json.dumps(report, ensure_ascii=False, indent=2, allow_nan=True))
