@@ -1,12 +1,13 @@
 """One-batch smoke test for the revised rating-aligned P3.
 
-No optimizer step, checkpoint write, or training log write is performed.
+No optimizer step, checkpoint write, or training log write is performed.  The
+backward pass uses only Z level/slope terms so nonzero runoff/routing gradients
+specifically verify the new Z -> rating(Q) -> Q gradient bridge.
 """
 from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
 
 import torch
 
@@ -16,13 +17,15 @@ from scripts.p3_rating_aligned_runtime import setup_training_rating_aligned
 
 def _grad_norm(module: torch.nn.Module) -> tuple[float, int]:
     squared = 0.0
-    tensors = 0
+    nonzero_tensors = 0
     for parameter in module.parameters():
         if parameter.grad is None:
             continue
-        tensors += 1
-        squared += float(parameter.grad.detach().float().square().sum().item())
-    return squared ** 0.5, tensors
+        value = parameter.grad.detach().float()
+        if bool((value != 0).any()):
+            nonzero_tensors += 1
+        squared += float(value.square().sum().item())
+    return squared ** 0.5, nonzero_tensors
 
 
 def main() -> None:
@@ -57,15 +60,32 @@ def main() -> None:
 
     loss_engine = FloodMultitaskLoss(cfg)
     statistics = loss_engine.batch_statistics(out, batch)
-    total_loss = loss_engine.combine(statistics)
-    if not torch.isfinite(total_loss):
-        raise FloatingPointError("smoke loss出现NaN/Inf")
-    total_loss.backward()
+    coefficients = loss_engine.coefficients()
+    reference = out["z"].reshape(-1)[:0].sum()
+    z_only_loss = reference * 0.0
+    z_terms_used = 0
+    for name in ("z_level", "z_slope"):
+        term = statistics[name]
+        if term.denominator and coefficients[name] > 0:
+            z_only_loss = (
+                z_only_loss
+                + coefficients[name] * term.numerator / int(term.denominator)
+            )
+            z_terms_used += 1
+    if z_terms_used == 0:
+        raise RuntimeError("抽到的TRAIN batch没有有效Z监督，请重新运行smoke")
+    if not torch.isfinite(z_only_loss):
+        raise FloatingPointError("smoke Z-only loss出现NaN/Inf")
+    z_only_loss.backward()
 
     runoff_norm, runoff_tensors = _grad_norm(model.runoff)
     routing_norm, routing_tensors = _grad_norm(model.routing)
     initializer_norm, initializer_tensors = _grad_norm(model.state_initializer)
     residual_norm, residual_tensors = _grad_norm(model.independent_z_head)
+    if runoff_norm <= 0.0:
+        raise RuntimeError(
+            "Z-only backward没有到达runoff参数；rating(Q)梯度桥未生效"
+        )
 
     rating_available = diagnostics["rating_available"].detach().bool()
     anchor_source = diagnostics["q_origin_anchor_source"].detach().cpu()
@@ -82,17 +102,17 @@ def main() -> None:
             "exact_q_t0": int((anchor_source == 1).sum().item()),
             "inverse_rating_from_z_t0": int((anchor_source == 2).sum().item()),
         },
-        "loss": float(total_loss.detach().item()),
-        "gradient_norms": {
-            "runoff": {"l2": runoff_norm, "nonzero_or_present_tensors": runoff_tensors},
-            "routing": {"l2": routing_norm, "nonzero_or_present_tensors": routing_tensors},
+        "z_only_loss": float(z_only_loss.detach().item()),
+        "z_only_gradient_norms": {
+            "runoff": {"l2": runoff_norm, "nonzero_tensors": runoff_tensors},
+            "routing": {"l2": routing_norm, "nonzero_tensors": routing_tensors},
             "state_initializer": {
                 "l2": initializer_norm,
-                "nonzero_or_present_tensors": initializer_tensors,
+                "nonzero_tensors": initializer_tensors,
             },
             "z_residual_head": {
                 "l2": residual_norm,
-                "nonzero_or_present_tensors": residual_tensors,
+                "nonzero_tensors": residual_tensors,
             },
         },
         "rating_fit": cfg["_runtime"]["rating_curves"],
