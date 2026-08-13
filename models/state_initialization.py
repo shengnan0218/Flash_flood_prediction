@@ -1,7 +1,7 @@
 """Learn antecedent hydrological states from pre-forecast observations.
 
 The initializer is deliberately separated from the physical transition models.
-It uses only the history window available at forecast origin, then produces
+It uses only information available at forecast origin, then produces
 non-negative catchment storages and non-negative reach discharge states. The
 subsequent rainfall-runoff and routing evolution remains governed by the
 existing mass-conserving WaterBalanceCell and kinematic-wave solver.
@@ -13,22 +13,19 @@ from torch import nn
 
 
 class HydrologicalStateInitializer(nn.Module):
-    """Encode observed history into WaterBalanceLSTM/routing initial states.
+    """Encode observed history plus an explicit forecast-origin Q anchor.
 
-    Node history is encoded independently for each graph node with a shared
-    LSTM, matching the recurrent family already used by the runoff module.
-    Static attributes are fused after the temporal encoder. Fast/slow storages
-    are expressed in mm and constrained non-negative with Softplus. For each
-    directed edge the initializer predicts a non-negative discharge in m3/s;
-    the routing module converts that discharge to a physically consistent
-    initial reach volume using its own kinematic-wave relation.
+    The recurrent history encoder remains the existing LSTM family.  P3's
+    forecast-origin anchor is fused *after* that encoder as two extra physical
+    descriptors per node: log(1+Q0) and an availability flag.  Q0 is supplied
+    by the hybrid model from the exact t0 discharge observation when available,
+    otherwise from a TRAIN-only rating-curve inversion of observed Z0.  If
+    neither exists, the availability flag is zero and the learned history state
+    remains solely responsible for initialization.
 
-    P3 additionally exposes a dedicated ``history_context`` for the independent
-    Z prediction path.  Unlike the Q/storage recurrent context, this stage
-    context preserves every hourly history input in its original temporal order:
-    the complete H x D history is flattened directly and passed through a small
-    feed-forward encoder.  No temporal averaging/pooling is applied, so short
-    flash-flood rise/peak/recession signatures remain available to the Z head.
+    A dedicated feed-forward stage-history context still preserves all hourly
+    inputs in order for the small Z residual path; no GRU or temporal pooling is
+    introduced.
     """
 
     def __init__(
@@ -53,8 +50,9 @@ class HydrologicalStateInitializer(nn.Module):
             hidden_dim,
             batch_first=True,
         )
+        # +2 = explicit physical Q0 descriptor + availability flag.
         self.node_fusion = nn.Sequential(
-            nn.Linear(hidden_dim + node_static_dim, hidden_dim),
+            nn.Linear(hidden_dim + node_static_dim + 2, hidden_dim),
             nn.SiLU(),
         )
         self.h_head = nn.Linear(hidden_dim, hidden_dim)
@@ -68,9 +66,6 @@ class HydrologicalStateInitializer(nn.Module):
         )
         self.positive = nn.Softplus()
 
-        # Dedicated stage-history encoder: preserve all hourly values and their
-        # exact order.  For the formal P3 contract this is 24 x D inputs per
-        # node, with no 3-hour binning or adaptive averaging.
         stage_input_dim = self.history_length * self.temporal_input_dim
         self.stage_history_head = nn.Sequential(
             nn.Linear(stage_input_dim, hidden_dim),
@@ -85,7 +80,6 @@ class HydrologicalStateInitializer(nn.Module):
         return torch.sign(value) * torch.log1p(value.abs())
 
     def _stage_history_context(self, sequence: torch.Tensor) -> torch.Tensor:
-        """Encode every hourly history feature without temporal aggregation."""
         if sequence.ndim != 3:
             raise ValueError("stage history sequence必须为[B*N,H,D]")
         if sequence.shape[1] != self.history_length:
@@ -97,8 +91,7 @@ class HydrologicalStateInitializer(nn.Module):
                 "stage history特征维应为"
                 f"{self.temporal_input_dim}，实际={sequence.shape[2]}"
             )
-        flattened = sequence.reshape(sequence.shape[0], -1)
-        return self.stage_history_head(flattened)
+        return self.stage_history_head(sequence.reshape(sequence.shape[0], -1))
 
     def forward(
         self,
@@ -106,6 +99,8 @@ class HydrologicalStateInitializer(nn.Module):
         node_static: torch.Tensor,
         edge_index: torch.Tensor,
         edge_static: torch.Tensor,
+        q_origin_anchor: torch.Tensor | None = None,
+        q_origin_anchor_available: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         if history_features.ndim != 4:
             raise ValueError("history_features必须为[B,H,N,D]")
@@ -134,16 +129,27 @@ class HydrologicalStateInitializer(nn.Module):
         ):
             raise ValueError("edge_static必须为[E,edge_static_dim]")
 
+        if q_origin_anchor is None:
+            q_origin_anchor = history_features.new_zeros((batch, nodes)).float()
+        if q_origin_anchor_available is None:
+            q_origin_anchor_available = torch.zeros(
+                (batch, nodes), dtype=torch.bool, device=history_features.device
+            )
+        if q_origin_anchor.shape != (batch, nodes):
+            raise ValueError("q_origin_anchor必须为[B,N]")
+        if q_origin_anchor_available.shape != (batch, nodes):
+            raise ValueError("q_origin_anchor_available必须为[B,N]")
+        if not torch.isfinite(q_origin_anchor).all() or (q_origin_anchor < 0).any():
+            raise ValueError("q_origin_anchor必须为有限非负流量")
+
         sequence = (
             history_features.float()
             .permute(0, 2, 1, 3)
             .reshape(batch * nodes, history, -1)
         )
-
-        # Z-specific context preserves the complete hourly sequence.  It is
-        # independent of the Q-oriented recurrent context below.
-        stage_context = self._stage_history_context(sequence)
-        stage_context = stage_context.reshape(batch, nodes, self.hidden_dim)
+        stage_context = self._stage_history_context(sequence).reshape(
+            batch, nodes, self.hidden_dim
+        )
 
         _, (encoded_h, encoded_c) = self.history_encoder(sequence)
         encoded_h = encoded_h[-1].reshape(batch, nodes, self.hidden_dim)
@@ -151,14 +157,19 @@ class HydrologicalStateInitializer(nn.Module):
 
         static_node = self._compressed_static(node_static)
         static_node = static_node.unsqueeze(0).expand(batch, -1, -1)
-        context = self.node_fusion(torch.cat([encoded_h, static_node], dim=-1))
+        q_descriptor = torch.stack(
+            (
+                torch.log1p(q_origin_anchor.float()),
+                q_origin_anchor_available.to(history_features.dtype),
+            ),
+            dim=-1,
+        )
+        context = self.node_fusion(
+            torch.cat([encoded_h, static_node, q_descriptor], dim=-1)
+        )
 
-        # Initialize the downstream WaterBalanceLSTM recurrent state from the
-        # same LSTM family. encoded_c is retained explicitly so the initializer
-        # does not discard the history encoder's memory-cell information.
         h0 = torch.tanh(self.h_head(context))
-        c_context = context + encoded_c
-        c0 = torch.tanh(self.c_head(c_context))
+        c0 = torch.tanh(self.c_head(context + encoded_c))
         storage = self.positive(self.storage_head(context))
         storage_fast = storage[..., 0]
         storage_slow = storage[..., 1]
@@ -182,4 +193,6 @@ class HydrologicalStateInitializer(nn.Module):
             "storage_slow_mm": storage_slow,
             "edge_discharge_m3s": edge_discharge,
             "history_context": stage_context,
+            "q_origin_anchor_m3s": q_origin_anchor,
+            "q_origin_anchor_available": q_origin_anchor_available,
         }
