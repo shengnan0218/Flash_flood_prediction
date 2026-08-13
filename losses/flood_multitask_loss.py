@@ -1,13 +1,11 @@
 """Mask-safe legacy and flood-specific multi-task losses.
 
-For hydrologic-event full-pass TRAIN, every retained window is visited exactly
-once per epoch and carries a deterministic graph/event/window weight.  The
-weight changes loss contribution only; it never controls whether a sample is
-seen.  Q point/peak/volume and Z level/slope all honour the same TRAIN-only
-sample weight.  Validation/test samples keep unit weight.  Physical errors are
-divided by explicit TRAIN-only scales supplied in ``cfg['_runtime']``; the
-strict Q-normalization experiment selects a per-graph scale without changing
-physical model tensors.
+The multi-task discharge objective is balanced at sample level.  Each Q
+window first produces one point/peak/volume value, after which the TRAIN-only
+graph-event sample weight is applied.  Water-level level and first-difference
+terms retain valid-element means.  Physical errors are divided by explicit
+TRAIN-only scales supplied in ``cfg['_runtime']``; the strict Q-normalization
+experiment selects a per-graph scale without changing physical model tensors.
 """
 from __future__ import annotations
 
@@ -131,25 +129,6 @@ def _weighted_sample_term(
     return LossTerm(numerator, count)
 
 
-def _weighted_element_term(
-    elements: torch.Tensor,
-    mask: torch.Tensor,
-    weights: torch.Tensor,
-    reference: torch.Tensor,
-) -> LossTerm:
-    """Weight each sample's valid elements without changing the valid count."""
-
-    if elements.shape != mask.shape or elements.shape[0] != weights.shape[0]:
-        raise ValueError("逐元素loss/mask与sample_weight的batch维不一致")
-    valid = mask.bool()
-    count = int(valid.sum().item())
-    if not count:
-        return LossTerm(reference.reshape(-1)[:0].sum(), 0)
-    shape = (weights.shape[0],) + (1,) * (elements.ndim - 1)
-    weighted = elements * weights.view(shape)
-    return LossTerm(weighted[valid].sum(), count)
-
-
 def water_level_first_differences(
     prediction: torch.Tensor,
     target: torch.Tensor,
@@ -157,7 +136,13 @@ def water_level_first_differences(
     history: torch.Tensor,
     history_mask: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build causal Z first differences and their strict mask."""
+    """Build causal Z first differences and their strict mask.
+
+    Forecast hour 1 subtracts the latest valid observed Z in the history.  For
+    later hours both prediction and observation subtract their own preceding
+    forecast-hour value; both adjacent target masks must be valid.  If no
+    history Z exists, only the first-hour slope mask is disabled.
+    """
 
     valid_target = _checked_mask(prediction, target, target_mask)
     if prediction.ndim != 3:
@@ -206,7 +191,11 @@ def delta_z_first_differences(
     target: torch.Tensor,
     target_mask: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """First differences for an already causal ΔZ(t+h) trajectory."""
+    """First differences for an already causal ΔZ(t+h) trajectory.
+
+    The h1 predecessor is exactly zero (= ΔZ at t0), while later horizons use
+    adjacent forecast values.  No absolute history value is subtracted again.
+    """
 
     valid = _checked_mask(prediction, target, target_mask)
     zero_prediction = torch.zeros_like(prediction[:, :1])
@@ -232,7 +221,9 @@ class FloodMultitaskLoss:
         self.mode = str(loss_cfg.get("mode", "legacy"))
         self.q_scale_mode = str(loss_cfg.get("q_scale_mode", "global"))
         self.z_target_mode = str(loss_cfg.get("z_target_mode", "absolute"))
-        self.delta_z_scale_mode = str(loss_cfg.get("delta_z_scale_mode", "global"))
+        self.delta_z_scale_mode = str(
+            loss_cfg.get("delta_z_scale_mode", "global")
+        )
         if self.mode not in {"legacy", "multitask"}:
             raise ValueError(f"loss.mode必须是legacy/multitask，实际={self.mode!r}")
         if self.q_scale_mode not in {"global", "per_graph"}:
@@ -244,6 +235,8 @@ class FloodMultitaskLoss:
             raise ValueError(f"未知z_target_mode={self.z_target_mode!r}")
 
     def scales(self) -> tuple[float, float]:
+        """Return the unchanged global TRAIN scales used outside Q supervision."""
+
         runtime_scales = self.cfg.get("_runtime", {}).get("loss_scales", {})
         return (
             _positive_scale(runtime_scales, "discharge"),
@@ -259,12 +252,14 @@ class FloodMultitaskLoss:
         graph_scales = runtime_scales.get("discharge_by_graph")
         if not isinstance(graph_scales, Mapping) or graph_id not in graph_scales:
             raise ValueError(
-                f"GRAPH_ID={graph_id}: 缺少TRAIN-only per-graph Q loss scale；禁止回退global std"
+                f"GRAPH_ID={graph_id}: 缺少TRAIN-only per-graph Q loss scale；"
+                "禁止回退global std"
             )
         value = float(graph_scales[graph_id])
         if not math.isfinite(value) or value <= 0:
             raise ValueError(
-                f"GRAPH_ID={graph_id}: per-graph Q loss scale必须为有限正数，实际={value}"
+                f"GRAPH_ID={graph_id}: per-graph Q loss scale必须为有限正数，"
+                f"实际={value}"
             )
         return value
 
@@ -274,7 +269,9 @@ class FloodMultitaskLoss:
             return global_z_scale
         station_id = _single_target_station_id(batch, batch_size)
         station_scales = (
-            self.cfg.get("_runtime", {}).get("loss_scales", {}).get("delta_z_by_station")
+            self.cfg.get("_runtime", {})
+            .get("loss_scales", {})
+            .get("delta_z_by_station")
         )
         if not isinstance(station_scales, Mapping) or station_id not in station_scales:
             raise ValueError(
@@ -364,7 +361,7 @@ class FloodMultitaskLoss:
                 z_target / global_z_scale,
                 z_mask,
             )
-            zero = q_prediction.reshape(-1)[:0].sum() + z_prediction.reshape(-1)[:0].sum()
+            zero = (q_prediction.reshape(-1)[:0].sum() + z_prediction.reshape(-1)[:0].sum())
             return {
                 "q_point": LossTerm(q_sum, q_count),
                 "q_peak": LossTerm(zero, 0),
@@ -374,10 +371,13 @@ class FloodMultitaskLoss:
             }
 
         batch_size = q_prediction.shape[0]
-        q_scale = self.q_scale_for_batch(batch, batch_size) if q_mask.any() else global_q_scale
+        q_scale = (
+            self.q_scale_for_batch(batch, batch_size)
+            if q_mask.any()
+            else global_q_scale
+        )
         z_scale = self.z_scale_for_batch(batch, batch_size) if z_mask.any() else global_z_scale
         weights = _sample_weights(batch, batch_size, q_prediction)
-
         q_active = q_mask.reshape(batch_size, -1).any(dim=1)
         valid_counts = q_mask.reshape(batch_size, -1).sum(dim=1)
         safe_q_prediction = torch.where(q_mask, q_prediction, torch.zeros_like(q_prediction))
@@ -391,9 +391,7 @@ class FloodMultitaskLoss:
             / valid_counts.clamp_min(1).to(q_point_elements.dtype)
         )
         if self.z_target_mode == "delta_from_t0":
-            q_point = _weighted_element_term(
-                q_point_elements, q_mask, weights, q_prediction
-            )
+            q_point = LossTerm(q_point_elements[q_mask].sum(), int(q_mask.sum().item()))
         else:
             q_point = _weighted_sample_term(
                 q_point_per_sample, q_active, weights, q_prediction
@@ -402,8 +400,12 @@ class FloodMultitaskLoss:
         negative_infinity = torch.full_like(q_prediction, float("-inf"))
         q_peak_prediction = torch.where(q_mask, q_prediction, negative_infinity).reshape(batch_size, -1).amax(dim=1)
         q_peak_target = torch.where(q_mask, q_target, negative_infinity).reshape(batch_size, -1).amax(dim=1)
-        q_peak_prediction = torch.where(q_active, q_peak_prediction, torch.zeros_like(q_peak_prediction))
-        q_peak_target = torch.where(q_active, q_peak_target, torch.zeros_like(q_peak_target))
+        q_peak_prediction = torch.where(
+            q_active, q_peak_prediction, torch.zeros_like(q_peak_prediction)
+        )
+        q_peak_target = torch.where(
+            q_active, q_peak_target, torch.zeros_like(q_peak_target)
+        )
         q_peak_error = (q_peak_prediction - q_peak_target) / q_scale
         q_peak = _weighted_sample_term(
             q_peak_error.square(), q_active, weights, q_prediction
@@ -420,18 +422,9 @@ class FloodMultitaskLoss:
             q_volume_error.square(), q_active, weights, q_prediction
         )
 
-        z_error = torch.where(
-            z_mask,
-            (z_prediction - z_target) / z_scale,
-            torch.zeros_like(z_prediction),
+        z_level_sum, z_level_count = masked_huber_stats(
+            z_prediction / z_scale, z_target / z_scale, z_mask
         )
-        z_level_elements = F.huber_loss(
-            z_error, torch.zeros_like(z_error), delta=1.0, reduction="none"
-        )
-        z_level = _weighted_element_term(
-            z_level_elements, z_mask, weights, z_prediction
-        )
-
         if self.z_target_mode == "delta_from_t0":
             slope_prediction, slope_target, slope_mask = delta_z_first_differences(
                 z_prediction, z_target, z_mask
@@ -444,23 +437,17 @@ class FloodMultitaskLoss:
                 batch.z_history,
                 batch.z_mask,
             )
-        slope_error = torch.where(
+        z_slope_sum, z_slope_count = masked_huber_stats(
+            slope_prediction / z_scale,
+            slope_target / z_scale,
             slope_mask,
-            (slope_prediction - slope_target) / z_scale,
-            torch.zeros_like(slope_prediction),
-        )
-        z_slope_elements = F.huber_loss(
-            slope_error, torch.zeros_like(slope_error), delta=1.0, reduction="none"
-        )
-        z_slope = _weighted_element_term(
-            z_slope_elements, slope_mask, weights, z_prediction
         )
         return {
             "q_point": q_point,
             "q_peak": q_peak,
             "q_volume": q_volume,
-            "z_level": z_level,
-            "z_slope": z_slope,
+            "z_level": LossTerm(z_level_sum, z_level_count),
+            "z_slope": LossTerm(z_slope_sum, z_slope_count),
         }
 
     def combine(
