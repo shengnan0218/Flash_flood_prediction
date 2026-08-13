@@ -1,0 +1,22 @@
+_base_: hunan_p3_state_init_single_q611e0340_event_domain.yaml
+
+# P3 calibrated-rating revision.
+# Runtime semantics are activated only by train_hunan_p3_rating_calibrated.py:
+# - TRAIN-only station-aware FLOW input normalization;
+# - TRAIN-only relative Z(t)-Z(t0) normalization aligned with delta-Z loss scale;
+# - existing Q0-informed state initialization is preserved unchanged;
+# - simultaneous TRAIN Q/Z observations calibrate a frozen monotone piecewise-
+#   linear station Q->Z function before model training;
+# - there is NO trainable neural Z residual head in this experiment;
+# - every valid Z loss backpropagates only through the frozen rating(Q) mapping
+#   into the hydrologic Q prediction.
+# Optimizer/LR/batch/loss weights/sampler/solver/100-epoch budget and future-
+# rainfall persistence remain inherited and unchanged.
+
+training:
+  checkpoint: outputs/hunan_p3_state_init_single_q611e0340_event_domain_rating_calibrated_best.pt
+  final_checkpoint: outputs/hunan_p3_state_init_single_q611e0340_event_domain_rating_calibrated_epoch100.pt
+  log_csv: outputs/hunan_p3_state_init_single_q611e0340_event_domain_rating_calibrated_train.csv
+
+hyperparameter_optimization:
+  enabled: false
