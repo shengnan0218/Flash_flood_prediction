@@ -10,11 +10,16 @@ import argparse
 import csv
 import json
 import math
+import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
 import torch
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
 from scripts.p3_rating_calibrated_runtime import setup_training_rating_calibrated
 
