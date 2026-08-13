@@ -87,6 +87,7 @@ class HybridFloodModel(nn.Module):
                 int(cfg["node_static_dim"]),
                 int(cfg["edge_static_dim"]),
                 hidden,
+                self.history,
             )
         else:
             self.state_initializer = None
