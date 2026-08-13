@@ -19,7 +19,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "湖南P3 calibrated-rating训练：TRAIN-only输入归一化、Q0-informed state init、"
-            "冻结单调Q->Z标定函数、无neural Z residual"
+            "冻结低自由度单调Q->Z标定函数、无neural Z residual"
         )
     )
     parser.add_argument(
@@ -53,6 +53,26 @@ def main() -> None:
         for station, values in station_fits.items()
         if bool(values.get("usable_calibrated", False))
     }
+    unusable = sorted(set(station_fits) - set(usable))
+    if unusable:
+        raise RuntimeError(
+            "calibrated-rating P3要求每个active outlet都有TRAIN-only可用rating curve；"
+            f"当前不可用站点={unusable}"
+        )
+
+    sampling_mode = getattr(
+        train_loader.dataset, "train_sampling_mode", "legacy_or_unweighted"
+    )
+    sampler_name = type(train_loader.batch_sampler).__name__
+    weighted_cfg = bool(cfg.get("train_sampling", {}).get("enabled", False))
+    replacement_sampling = "Weighted" in sampler_name
+    if sampling_mode == "event_full_pass":
+        if weighted_cfg or replacement_sampling:
+            raise RuntimeError(
+                "hydrologic event-domain TRAIN必须full-pass且无replacement sampling；"
+                f"config_weighted={weighted_cfg}, sampler={sampler_name}"
+            )
+
     print(
         json.dumps(
             {
@@ -63,17 +83,18 @@ def main() -> None:
                 "graph_id": cfg["data"].get("graph_id"),
                 "future_rainfall_mode": cfg["data"]["future_rainfall_mode"],
                 "input_normalization": "TRAIN-only station-aware FLOW + relative Z(t)-Z(t0)",
-                "z_observation": "frozen TRAIN-calibrated monotone piecewise-linear rating(Q); no neural residual",
+                "z_observation": (
+                    "frozen TRAIN-calibrated low-DOF monotone piecewise-linear rating(Q); "
+                    "global TRAIN OLS-slope extrapolation; no neural residual"
+                ),
                 "train_samples": len(train_loader.dataset),
                 "validation_samples": len(validation_loader.dataset),
                 "train_events": _event_count(train_loader),
                 "validation_events": _event_count(validation_loader),
-                "train_weighted_sampling": bool(
-                    cfg.get("train_sampling", {}).get("enabled", False)
-                ),
-                "train_sampling_mode": getattr(
-                    train_loader.dataset, "train_sampling_mode", "legacy_or_unweighted"
-                ),
+                "train_sampling_mode": sampling_mode,
+                "train_batch_sampler": sampler_name,
+                "train_weighted_sampling": weighted_cfg,
+                "train_replacement_sampling": replacement_sampling,
                 "calibrated_rating_station_count": len(station_fits),
                 "usable_calibrated_rating_station_count": len(usable),
                 "rating_fits": usable,
