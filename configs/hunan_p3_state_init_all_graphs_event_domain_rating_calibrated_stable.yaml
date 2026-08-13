@@ -1,13 +1,17 @@
 _base_: hunan_p3_state_init_all_graphs_event_domain_rating_calibrated.yaml
 
-# Stable all-graph calibrated P3 after the full-domain audit.
-# Runtime code now uses:
-# - event-domain TRAIN full pass: every retained TRAIN window exactly once per epoch;
-#   ordinary order shuffle only, no weighting and no replacement sampling;
-# - TRAIN-only low-DOF monotone rating calibration from Q-quantile aggregation;
-# - station-global TRAIN OLS slope for rating extrapolation outside calibrated Q range;
-# - no neural Z residual head.
-# All hydrologic model/loss/optimizer/LR/batch/solver settings remain inherited.
+# Stable all-graph calibrated P3.
+# Event-domain TRAIN semantics:
+# - every retained TRAIN window is visited exactly once per epoch;
+# - ordinary within-graph/batch order shuffle only;
+# - no weighted/replacement sampling;
+# - the original graph/event/window balancing formula is retained as a
+#   deterministic TRAIN-only sample_weight applied to all Q/Z loss terms.
+# Thus each graph has equal total training mass, each event within a graph has
+# equal total mass, and extra sliding windows only divide an event's fixed mass.
+# Rating calibration remains TRAIN-only low-DOF monotone PWL with station-global
+# TRAIN OLS-slope extrapolation; there is no neural Z residual head.
+# All hydrologic model/optimizer/LR/batch/solver/100-epoch settings are inherited.
 train_sampling:
   enabled: false
 
