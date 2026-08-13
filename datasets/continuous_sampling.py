@@ -12,10 +12,7 @@ from typing import Any, Mapping
 
 import torch
 
-from .hunan import (
-    HunanContinuousDataset as _BaseHunanContinuousDataset,
-    event_graph_balancing_weights,
-)
+from .hunan import HunanContinuousDataset as _BaseHunanContinuousDataset
 
 
 class HunanContinuousDataset(_BaseHunanContinuousDataset):
@@ -50,7 +47,7 @@ class HunanContinuousDataset(_BaseHunanContinuousDataset):
     @property
     def train_sampling_mode(self) -> str:
         domain = str(self._continuous_schema.get("sampling_domain", "")).strip()
-        return "event_balanced" if domain == "hydrologic_events_v1" else "response_weighted"
+        return "event_full_pass" if domain == "hydrologic_events_v1" else "response_weighted"
 
     def _active_station_ids(self) -> set[str]:
         return {
@@ -69,25 +66,19 @@ class HunanContinuousDataset(_BaseHunanContinuousDataset):
         minimum_weight: float,
         maximum_weight: float,
     ) -> torch.Tensor:
-        if self.train_sampling_mode != "event_balanced":
-            return super().hydrologic_sampling_weights(
-                q_scales=q_scales,
-                delta_z_scales=delta_z_scales,
-                response_strength=response_strength,
-                response_cap=response_cap,
-                minimum_weight=minimum_weight,
-                maximum_weight=maximum_weight,
+        """Retain weighted sampling only for historical full-record continuous data."""
+        if self.train_sampling_mode == "event_full_pass":
+            raise RuntimeError(
+                "hydrologic_events_v1禁止weighted/replacement sampling；"
+                "TRAIN必须每epoch完整遍历一次event-domain sample_index，仅shuffle顺序"
             )
-        if self.split != "TRAIN":
-            raise ValueError("event-balanced sampling只能用于TRAIN")
-        graph_ids = [sample.graph_id for sample in self._samples]
-        event_ids = [sample.event_id for sample in self._samples]
-        if any(not event_id.strip() for event_id in event_ids):
-            raise ValueError(
-                "sampling_domain=hydrologic_events_v1要求每个TRAIN sample都有非空EVENT_ID"
-            )
-        return torch.tensor(
-            event_graph_balancing_weights(graph_ids, event_ids), dtype=torch.float32
+        return super().hydrologic_sampling_weights(
+            q_scales=q_scales,
+            delta_z_scales=delta_z_scales,
+            response_strength=response_strength,
+            response_cap=response_cap,
+            minimum_weight=minimum_weight,
+            maximum_weight=maximum_weight,
         )
 
     def train_rating_curve_statistics(self) -> dict[str, Any]:
@@ -282,7 +273,6 @@ class HunanContinuousDataset(_BaseHunanContinuousDataset):
                 ) or raw_std < delta_z_scale_floor_m,
             }
 
-        # Supervised outlet inputs exactly reuse loss normalization semantics.
         for graph_id, q_statistics in target_stats["q_by_graph"].items():
             station = self._graphs[graph_id].outlet_id
             raw_std = float(q_statistics["std_m3s"])
@@ -377,6 +367,5 @@ class HunanContinuousDataset(_BaseHunanContinuousDataset):
                 features[..., feature_index] = torch.where(
                     effective, normalized, torch.zeros_like(normalized)
                 )
-            # RAIN_MM and explicit mask channels retain the frozen base transform.
         batch.dynamic_node_features = features
         return batch
