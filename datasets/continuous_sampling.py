@@ -12,7 +12,10 @@ from typing import Any, Mapping
 
 import torch
 
-from .hunan import HunanContinuousDataset as _BaseHunanContinuousDataset
+from .hunan import (
+    HunanContinuousDataset as _BaseHunanContinuousDataset,
+    event_graph_balancing_weights,
+)
 
 
 class HunanContinuousDataset(_BaseHunanContinuousDataset):
@@ -40,14 +43,48 @@ class HunanContinuousDataset(_BaseHunanContinuousDataset):
             else None
         )
         self._rating_curve_statistics_cache: dict[str, Any] | None = None
+        self._event_loss_weights: torch.Tensor | None = None
         super().__init__(*args, **kwargs)
         if self.dynamic_normalization_mode == "train_aligned" and not self.normalize_dynamic:
             raise ValueError("train_aligned输入归一化要求normalize_dynamic=true")
+        if self.split == "TRAIN" and self.train_sampling_mode == "event_full_pass":
+            graph_ids = [sample.graph_id for sample in self._samples]
+            event_ids = [sample.event_id for sample in self._samples]
+            self._event_loss_weights = torch.tensor(
+                event_graph_balancing_weights(graph_ids, event_ids),
+                dtype=torch.float32,
+            )
 
     @property
     def train_sampling_mode(self) -> str:
         domain = str(self._continuous_schema.get("sampling_domain", "")).strip()
         return "event_full_pass" if domain == "hydrologic_events_v1" else "response_weighted"
+
+    @property
+    def train_loss_weight_mode(self) -> str:
+        if self.split == "TRAIN" and self.train_sampling_mode == "event_full_pass":
+            return "deterministic_graph_event_window_balance"
+        return "unit_or_legacy"
+
+    def event_loss_weight_statistics(self) -> dict[str, float | int | str]:
+        weights = self._event_loss_weights
+        if weights is None:
+            return {
+                "mode": self.train_loss_weight_mode,
+                "count": len(self),
+                "mean": 1.0,
+                "minimum": 1.0,
+                "maximum": 1.0,
+            }
+        return {
+            "mode": self.train_loss_weight_mode,
+            "count": int(weights.numel()),
+            "mean": float(weights.mean().item()),
+            "minimum": float(weights.min().item()),
+            "maximum": float(weights.max().item()),
+            "graph_count": len({sample.graph_id for sample in self._samples}),
+            "event_count": len({sample.event_id for sample in self._samples}),
+        }
 
     def _active_station_ids(self) -> set[str]:
         return {
@@ -70,7 +107,8 @@ class HunanContinuousDataset(_BaseHunanContinuousDataset):
         if self.train_sampling_mode == "event_full_pass":
             raise RuntimeError(
                 "hydrologic_events_v1禁止weighted/replacement sampling；"
-                "TRAIN必须每epoch完整遍历一次event-domain sample_index，仅shuffle顺序"
+                "TRAIN必须每epoch完整遍历一次event-domain sample_index，仅shuffle顺序；"
+                "graph/event/window平衡通过确定性sample_weight进入loss"
             )
         return super().hydrologic_sampling_weights(
             q_scales=q_scales,
@@ -323,6 +361,8 @@ class HunanContinuousDataset(_BaseHunanContinuousDataset):
 
     def __getitem__(self, index: int):
         batch = super().__getitem__(index)
+        if self._event_loss_weights is not None:
+            batch.sample_weight = self._event_loss_weights[index].clone()
         if self.dynamic_normalization_mode != "train_aligned":
             return batch
         if self._aligned_input_statistics is None:
