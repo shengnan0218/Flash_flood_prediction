@@ -19,21 +19,7 @@ from .hunan import (
 
 
 class HunanContinuousDataset(_BaseHunanContinuousDataset):
-    """Continuous-format dataset with split-safe P3 runtime adapters.
-
-    ``dynamic_normalization_mode='global'`` preserves the historical loader
-    exactly. ``'train_aligned'`` is the new P3 mode:
-
-    * FLOW history uses TRAIN-only station statistics; for every supervised
-      outlet the mean/scale are exactly the TRAIN Q-supervision mean and the
-      same floored per-graph std used by Q loss.
-    * WATER_LEVEL history is represented as Z(t)-Z(t0), never absolute datum,
-      and divided by a TRAIN-only station scale. For supervised outlets this is
-      exactly the same floored per-station delta-Z scale used by Z loss.
-
-    TRAIN statistics are fitted once by ``scripts.common`` and then injected
-    unchanged into VALIDATION/TEST. No evaluated split contributes statistics.
-    """
+    """Continuous-format dataset with split-safe P3 runtime adapters."""
 
     _NORMALIZATION_MODES = {"global", "train_aligned"}
 
@@ -66,6 +52,13 @@ class HunanContinuousDataset(_BaseHunanContinuousDataset):
         domain = str(self._continuous_schema.get("sampling_domain", "")).strip()
         return "event_balanced" if domain == "hydrologic_events_v1" else "response_weighted"
 
+    def _active_station_ids(self) -> set[str]:
+        return {
+            node.station_id
+            for graph_id in self.graph_ids
+            for node in self._graphs[graph_id].nodes
+        }
+
     def hydrologic_sampling_weights(
         self,
         *,
@@ -76,8 +69,6 @@ class HunanContinuousDataset(_BaseHunanContinuousDataset):
         minimum_weight: float,
         maximum_weight: float,
     ) -> torch.Tensor:
-        """Return TRAIN weights appropriate for the dataset sampling domain."""
-
         if self.train_sampling_mode != "event_balanced":
             return super().hydrologic_sampling_weights(
                 q_scales=q_scales,
@@ -87,7 +78,6 @@ class HunanContinuousDataset(_BaseHunanContinuousDataset):
                 minimum_weight=minimum_weight,
                 maximum_weight=maximum_weight,
             )
-
         if self.split != "TRAIN":
             raise ValueError("event-balanced sampling只能用于TRAIN")
         graph_ids = [sample.graph_id for sample in self._samples]
@@ -97,30 +87,20 @@ class HunanContinuousDataset(_BaseHunanContinuousDataset):
                 "sampling_domain=hydrologic_events_v1要求每个TRAIN sample都有非空EVENT_ID"
             )
         return torch.tensor(
-            event_graph_balancing_weights(graph_ids, event_ids),
-            dtype=torch.float32,
+            event_graph_balancing_weights(graph_ids, event_ids), dtype=torch.float32
         )
 
     def train_rating_curve_statistics(self) -> dict[str, Any]:
-        """Fit one TRAIN-only linear Q->Z relation per supervised outlet.
-
-        Only unique forecast-target timestamps with simultaneous valid Q and Z
-        observations are used. Sliding-window duplication therefore cannot
-        change the fit. Nothing is removed as an outlier here; QC remains a
-        frozen data fact and the fit is deliberately auditable.
-        """
-
+        """Fit one TRAIN-only linear Q->Z relation per supervised outlet."""
         if self.split != "TRAIN":
             raise ValueError("rating curve只能从TRAIN拟合")
         if self._rating_curve_statistics_cache is not None:
             return self._rating_curve_statistics_cache
-
         horizons = torch.arange(1, self.forecast_hours + 1, dtype=torch.long)
         by_station: dict[str, dict[str, Any]] = {}
         samples_by_graph: dict[str, list[Any]] = {}
         for sample in self._samples:
             samples_by_graph.setdefault(sample.graph_id, []).append(sample)
-
         for graph_id, samples in samples_by_graph.items():
             graph = self._graphs[graph_id]
             outlet = next(node.node_index for node in graph.nodes if node.is_outlet)
@@ -138,7 +118,6 @@ class HunanContinuousDataset(_BaseHunanContinuousDataset):
                     & dynamic.water_level_mask[future, outlet]
                 )
                 used[future[simultaneous]] = True
-
             valid_indices = used.nonzero(as_tuple=False).flatten()
             q = dynamic.flow[valid_indices, outlet].to(torch.float64)
             z = dynamic.water_level[valid_indices, outlet].to(torch.float64)
@@ -189,7 +168,6 @@ class HunanContinuousDataset(_BaseHunanContinuousDataset):
                 "z_max_m": float(z.max().item()),
                 "usable_linear": usable,
             }
-
         self._rating_curve_statistics_cache = {
             "mode": "train_unique_target_timestamp_linear_ols",
             "computed_from_split": "TRAIN",
@@ -203,20 +181,11 @@ class HunanContinuousDataset(_BaseHunanContinuousDataset):
         q_scale_floor_m3s: float,
         delta_z_scale_floor_m: float,
     ) -> dict[str, Any]:
-        """Fit TRAIN-only station-aware input statistics for P3.
-
-        Outlet FLOW and delta-Z scales are deliberately overwritten by the exact
-        supervision statistics used by the loss. Upstream/non-target stations
-        use their own TRAIN history statistics rather than a province-wide
-        scale. Missing variables never fall back to another station/global std;
-        they are recorded as unavailable and remain masked at runtime.
-        """
-
+        """Fit TRAIN-only station-aware FLOW and relative-Z input statistics."""
         if self.split != "TRAIN":
             raise ValueError("aligned input statistics只能从TRAIN计算")
         if q_scale_floor_m3s <= 0 or delta_z_scale_floor_m <= 0:
             raise ValueError("input normalization floors必须为正")
-
         target_stats = self.train_target_statistics()
         flow_by_station: dict[str, dict[str, Any]] = {}
         dz_by_station: dict[str, dict[str, Any]] = {}
@@ -224,7 +193,6 @@ class HunanContinuousDataset(_BaseHunanContinuousDataset):
         for sample in self._samples:
             samples_by_graph.setdefault(sample.graph_id, []).append(sample)
 
-        # First fit per-station history statistics on unique TRAIN history hours.
         for graph_id, samples in samples_by_graph.items():
             graph = self._graphs[graph_id]
             dynamic = self._dynamic[graph_id]
@@ -238,7 +206,11 @@ class HunanContinuousDataset(_BaseHunanContinuousDataset):
                 flow = dynamic.flow[valid, node.node_index].to(torch.float64)
                 if flow.numel():
                     mean = float(flow.mean().item())
-                    raw_std = float(flow.std(unbiased=False).item()) if flow.numel() > 1 else 0.0
+                    raw_std = (
+                        float(flow.std(unbiased=False).item())
+                        if flow.numel() > 1
+                        else 0.0
+                    )
                     scale = max(raw_std, float(q_scale_floor_m3s))
                 else:
                     mean = 0.0
@@ -250,16 +222,17 @@ class HunanContinuousDataset(_BaseHunanContinuousDataset):
                     "mean_m3s": mean,
                     "raw_std_m3s": raw_std,
                     "scale_m3s": scale,
-                    "floor_applied": (not math.isfinite(raw_std)) or raw_std < q_scale_floor_m3s,
+                    "floor_applied": (
+                        not math.isfinite(raw_std)
+                    ) or raw_std < q_scale_floor_m3s,
                 }
                 previous = flow_by_station.get(station)
                 if previous is None or candidate["valid_unique_point_count"] > previous["valid_unique_point_count"]:
                     flow_by_station[station] = candidate
 
-        # Relative Z history scale. It is intentionally centered at zero because
-        # the model input is Z(t)-Z(t0), matching the forecast target semantics.
+        active_stations = self._active_station_ids()
         z_moments: dict[str, list[float]] = {
-            station: [0.0, 0.0, 0.0] for station in self.station_ids
+            station: [0.0, 0.0, 0.0] for station in active_stations
         }
         for graph_id, samples in samples_by_graph.items():
             graph = self._graphs[graph_id]
@@ -287,7 +260,6 @@ class HunanContinuousDataset(_BaseHunanContinuousDataset):
                     moments[0] += float(selected.numel())
                     moments[1] += float(selected.sum().item())
                     moments[2] += float(selected.square().sum().item())
-
         for station, (count_value, total, squared) in z_moments.items():
             count = int(count_value)
             if count > 1:
@@ -305,10 +277,12 @@ class HunanContinuousDataset(_BaseHunanContinuousDataset):
                     raw_std if math.isfinite(raw_std) else 0.0,
                     float(delta_z_scale_floor_m),
                 ),
-                "floor_applied": (not math.isfinite(raw_std)) or raw_std < delta_z_scale_floor_m,
+                "floor_applied": (
+                    not math.isfinite(raw_std)
+                ) or raw_std < delta_z_scale_floor_m,
             }
 
-        # Exact alignment for supervised outlets: same statistics/scales as loss.
+        # Supervised outlet inputs exactly reuse loss normalization semantics.
         for graph_id, q_statistics in target_stats["q_by_graph"].items():
             station = self._graphs[graph_id].outlet_id
             raw_std = float(q_statistics["std_m3s"])
@@ -330,7 +304,6 @@ class HunanContinuousDataset(_BaseHunanContinuousDataset):
                 "scale_m": max(raw_std, float(delta_z_scale_floor_m)),
                 "floor_applied": raw_std < delta_z_scale_floor_m,
             }
-
         return {
             "mode": "train_aligned",
             "computed_from_split": "TRAIN",
@@ -339,19 +312,18 @@ class HunanContinuousDataset(_BaseHunanContinuousDataset):
         }
 
     def set_aligned_input_statistics(self, statistics: Mapping[str, Any]) -> None:
-        """Attach already-fitted TRAIN statistics to any split without refit."""
-
         if self.dynamic_normalization_mode != "train_aligned":
             raise ValueError("仅train_aligned dataset允许注入aligned statistics")
         flow = statistics.get("flow_by_station")
         level = statistics.get("relative_z_by_station")
         if not isinstance(flow, Mapping) or not isinstance(level, Mapping):
             raise ValueError("aligned input statistics缺少flow_by_station/relative_z_by_station")
-        missing_flow = sorted(set(self.station_ids) - set(flow))
-        missing_level = sorted(set(self.station_ids) - set(level))
+        required = self._active_station_ids()
+        missing_flow = sorted(required - set(flow))
+        missing_level = sorted(required - set(level))
         if missing_flow or missing_level:
             raise ValueError(
-                "TRAIN aligned statistics未覆盖当前split站点: "
+                "TRAIN aligned statistics未覆盖当前active graph站点: "
                 f"FLOW缺少={missing_flow}, Z缺少={missing_level}"
             )
         self._aligned_input_statistics = dict(statistics)
@@ -367,7 +339,6 @@ class HunanContinuousDataset(_BaseHunanContinuousDataset):
             raise RuntimeError(
                 f"{self.split} train_aligned dataset尚未注入TRAIN input statistics"
             )
-
         features = batch.dynamic_node_features.clone()
         flow_statistics = self._aligned_input_statistics["flow_by_station"]
         z_statistics = self._aligned_input_statistics["relative_z_by_station"]
@@ -389,10 +360,11 @@ class HunanContinuousDataset(_BaseHunanContinuousDataset):
             dtype=batch.z_history.dtype,
             device=batch.z_history.device,
         )
-
         for feature_index, feature in enumerate(self.dynamic_features):
             if feature == "FLOW":
-                normalized = (batch.q_history - flow_mean.unsqueeze(0)) / flow_scale.unsqueeze(0)
+                normalized = (
+                    batch.q_history - flow_mean.unsqueeze(0)
+                ) / flow_scale.unsqueeze(0)
                 features[..., feature_index] = torch.where(
                     batch.q_mask, normalized, torch.zeros_like(normalized)
                 )
@@ -405,7 +377,6 @@ class HunanContinuousDataset(_BaseHunanContinuousDataset):
                 features[..., feature_index] = torch.where(
                     effective, normalized, torch.zeros_like(normalized)
                 )
-            # RAIN_MM and explicit mask channels deliberately retain the frozen
-            # historical transformation from the base adapter.
+            # RAIN_MM and explicit mask channels retain the frozen base transform.
         batch.dynamic_node_features = features
         return batch
