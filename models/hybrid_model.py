@@ -1,13 +1,17 @@
 """Hybrid rainfall-runoff, directed-routing, and observation model."""
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Mapping, Sequence
 
 import torch
 from torch import nn
 
 from data.schema import validate_batch
-from models.observation import IndependentDeltaZHead, MonotonicQZObservation
+from models.observation import (
+    IndependentDeltaZHead,
+    MonotonicQZObservation,
+    TrainFittedLinearRating,
+)
 from models.routing import KinematicWaveGNN, PureDirectedGNN
 from models.runoff import PureLSTMRunoff, WaterBalanceLSTM
 from models.state_initialization import HydrologicalStateInitializer
@@ -28,9 +32,7 @@ class HybridFloodModel(nn.Module):
         self.z_target_mode = str(cfg.get("loss", {}).get("z_target_mode", "absolute"))
         state_cfg = cfg.get("state_initialization", {})
         self.use_state_initialization = bool(state_cfg.get("enabled", False))
-        self.state_initialization_mode = str(
-            state_cfg.get("mode", "forecast_origin")
-        )
+        self.state_initialization_mode = str(state_cfg.get("mode", "forecast_origin"))
         if self.use_state_initialization and self.state_initialization_mode != "forecast_origin":
             raise ValueError("当前state_initialization仅支持mode='forecast_origin'")
         self.expected = {
@@ -75,13 +77,9 @@ class HybridFloodModel(nn.Module):
 
         if self.use_state_initialization:
             if runoff_mode != "water_balance_lstm":
-                raise ValueError(
-                    "P3 state initialization当前要求runoff_mode=water_balance_lstm"
-                )
+                raise ValueError("P3 state initialization当前要求runoff_mode=water_balance_lstm")
             if routing_mode != "kinematic_wave_gnn":
-                raise ValueError(
-                    "P3 state initialization当前要求routing_mode=kinematic_wave_gnn"
-                )
+                raise ValueError("P3 state initialization当前要求routing_mode=kinematic_wave_gnn")
             self.state_initializer = HydrologicalStateInitializer(
                 runoff_input_dim,
                 int(cfg["node_static_dim"]),
@@ -92,10 +90,14 @@ class HybridFloodModel(nn.Module):
         else:
             self.state_initializer = None
 
-        # Monotonic Q-Z is retained as a hydraulic consistency relation.  It no
-        # longer generates the primary P3 delta-Z prediction.
+        # Legacy/non-P3 observation mapping is retained unchanged.
         self.observation = MonotonicQZObservation(stations)
         if self.use_state_initialization and self.z_target_mode == "delta_from_t0":
+            # P3 revised architecture: TRAIN-fitted physical rating relation is
+            # the primary Z path; this feed-forward head is only a residual.
+            self.rating_curve: TrainFittedLinearRating | None = TrainFittedLinearRating(
+                stations
+            )
             self.independent_z_head: nn.Module | None = IndependentDeltaZHead(
                 hidden,
                 hidden,
@@ -103,11 +105,28 @@ class HybridFloodModel(nn.Module):
                 stations,
             )
         else:
+            self.rating_curve = None
             self.independent_z_head = None
 
-    def _temporal_inputs(
-        self, batch: Any
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def configure_rating_curves(
+        self,
+        statistics: Mapping[str, Any],
+        station_ids: Sequence[str],
+    ) -> None:
+        """Install frozen TRAIN-only rating coefficients into the P3 model."""
+        if self.rating_curve is None:
+            raise RuntimeError("当前模型没有P3 TRAIN-fitted rating curve")
+        mapping = {str(station): index for index, station in enumerate(station_ids)}
+        if len(mapping) != len(station_ids):
+            raise ValueError("station_ids含重复值，无法配置rating curve")
+        if len(mapping) != self.rating_curve.num_stations:
+            raise ValueError(
+                "rating station catalogue数量与模型不一致: "
+                f"data={len(mapping)}, model={self.rating_curve.num_stations}"
+            )
+        self.rating_curve.configure(statistics, mapping)
+
+    def _temporal_inputs(self, batch: Any) -> tuple[torch.Tensor, torch.Tensor]:
         history = batch.dynamic_node_features.shape[1]
         total = history + self.horizon
         if batch.rainfall.shape[1] < total:
@@ -155,7 +174,6 @@ class HybridFloodModel(nn.Module):
     def _latest_observed_history(
         values: torch.Tensor, mask: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return the latest valid history value per batch/node and availability."""
         if values.ndim != 3 or mask.shape != values.shape:
             raise ValueError("history values/mask必须同为[B,H,N]")
         valid = mask.bool() & torch.isfinite(values)
@@ -164,16 +182,13 @@ class HybridFloodModel(nn.Module):
         positions = positions.expand(batch, -1, nodes)
         last = positions.masked_fill(~valid, -1).amax(dim=1)
         available = last >= 0
-        gather_index = last.clamp_min(0).unsqueeze(1)
-        latest = values.gather(1, gather_index).squeeze(1)
-        latest = torch.where(available, latest, torch.zeros_like(latest))
-        return latest, available
+        latest = values.gather(1, last.clamp_min(0).unsqueeze(1)).squeeze(1)
+        return torch.where(available, latest, torch.zeros_like(latest)), available
 
     @staticmethod
     def _recent_observed_trend(
         values: torch.Tensor, mask: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return last-valid minus previous-valid observation per batch/node."""
         if values.ndim != 3 or mask.shape != values.shape:
             raise ValueError("trend values/mask必须同为[B,H,N]")
         valid = mask.bool() & torch.isfinite(values)
@@ -194,13 +209,43 @@ class HybridFloodModel(nn.Module):
         )
         return trend, has_pair
 
+    def _forecast_origin_q_anchor(
+        self, batch: Any
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Priority: exact Q(t0) > inverse rating from exact Z(t0) > learned state."""
+        if self.rating_curve is None:
+            raise RuntimeError("P3 Q anchor要求TRAIN-fitted rating curve")
+        q0 = batch.q_history[:, -1]
+        q0_valid = batch.q_mask[:, -1].bool() & torch.isfinite(q0)
+        exact_q = torch.where(q0_valid, q0, torch.zeros_like(q0)).clamp_min(0)
+
+        z_reference = getattr(batch, "z_reference", None)
+        z_reference_mask = getattr(batch, "z_reference_mask", None)
+        if z_reference is None or z_reference_mask is None:
+            raise RuntimeError("P3 Q anchor要求exact forecast-origin z_reference")
+        z_valid = z_reference_mask.bool() & torch.isfinite(z_reference)
+        inverse_q, rating_available = self.rating_curve.inverse_from_z(
+            torch.where(z_valid, z_reference, torch.zeros_like(z_reference)),
+            getattr(batch, "station_index", None),
+        )
+        inverse_available = (~q0_valid) & z_valid & rating_available
+        anchor = torch.where(q0_valid, exact_q, torch.where(inverse_available, inverse_q, torch.zeros_like(q0)))
+        available = q0_valid | inverse_available
+        source_code = torch.zeros_like(anchor, dtype=torch.int8)
+        source_code = torch.where(q0_valid, torch.ones_like(source_code), source_code)
+        source_code = torch.where(
+            inverse_available,
+            torch.full_like(source_code, 2),
+            source_code,
+        )
+        return anchor, available, source_code
+
     @staticmethod
     def _initial_node_channel_storage(
         batch: Any,
         routing_diagnostics: dict[str, torch.Tensor],
         reference: torch.Tensor,
     ) -> torch.Tensor:
-        """Map initialized edge volumes to the same node-storage convention as routing."""
         batch_size, _, nodes = reference.shape
         node_storage = torch.zeros(
             batch_size, nodes, device=reference.device, dtype=reference.dtype
@@ -217,58 +262,56 @@ class HybridFloodModel(nn.Module):
             node_storage.index_add_(1, destination, edge_storage)
         return node_storage
 
-    def _independent_forecast_origin_z(
+    def _rating_backed_forecast_origin_z(
         self,
         batch: Any,
         q_future: torch.Tensor,
         channel_future: torch.Tensor | None,
         routing_diagnostics: dict[str, torch.Tensor],
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """Predict delta-Z independently and expose monotone Q-Z consistency target."""
-        if self.independent_z_head is None:
-            raise RuntimeError("P3 delta-Z独立预测头未构建")
-        q_origin, q_origin_available = self._latest_observed_history(
-            batch.q_history, batch.q_mask
-        )
-        initial_channel = self._initial_node_channel_storage(
-            batch, routing_diagnostics, q_future
-        )
-
-        # This monotone relation is now only a weak physical consistency target.
-        future_level_response = self.observation(
-            q_future,
-            channel_future,
-            getattr(batch, "station_index", None),
-        )
-        origin_level_response = self.observation(
-            q_origin.unsqueeze(1),
-            initial_channel.unsqueeze(1),
-            getattr(batch, "station_index", None),
-        )
-        consistency_delta = future_level_response - origin_level_response
+        """Primary rating(Q) delta-Z plus a small independent residual correction."""
+        if self.independent_z_head is None or self.rating_curve is None:
+            raise RuntimeError("P3 rating-backed delta-Z模块未构建")
 
         z_reference = getattr(batch, "z_reference", None)
         z_reference_mask = getattr(batch, "z_reference_mask", None)
         if z_reference is None or z_reference_mask is None:
-            raise RuntimeError("P3 independent delta-Z要求forecast-origin z_reference")
-        if z_reference.ndim != 2 or z_reference.shape != q_origin.shape:
-            raise ValueError("z_reference必须为[B,N]并与forecast-origin Q一致")
-        if z_reference_mask.shape != z_reference.shape:
-            raise ValueError("z_reference_mask必须与z_reference同形状")
+            raise RuntimeError("P3 rating-backed delta-Z要求forecast-origin z_reference")
         reference_valid = z_reference_mask.bool() & torch.isfinite(z_reference)
         reference = torch.where(reference_valid, z_reference, torch.zeros_like(z_reference))
-        recent_trend, recent_trend_valid = self._recent_observed_trend(
-            batch.z_history, batch.z_mask
+
+        q_anchor = routing_diagnostics.get("q_origin_anchor_m3s")
+        q_anchor_available = routing_diagnostics.get("q_origin_anchor_available")
+        if q_anchor is None or q_anchor_available is None:
+            raise RuntimeError("P3 Z路径缺少forecast-origin Q anchor diagnostics")
+        initial_channel = self._initial_node_channel_storage(
+            batch, routing_diagnostics, q_future
         )
         history_context = routing_diagnostics.get("history_context")
         if history_context is None:
-            raise RuntimeError("P3 independent delta-Z缺少stage history_context")
+            raise RuntimeError("P3 residual delta-Z缺少stage history_context")
+        recent_trend, recent_trend_valid = self._recent_observed_trend(
+            batch.z_history, batch.z_mask
+        )
 
-        z_delta = self.independent_z_head(
+        # Main physical/statistical path. Do NOT detach q_future: Z supervision
+        # is intentionally allowed to improve latent discharge when Q is absent.
+        rating_level, station_rating_available = self.rating_curve(
+            q_future, getattr(batch, "station_index", None)
+        )
+        rating_valid = reference_valid & station_rating_available.view(1, -1)
+        rating_delta = rating_level - reference.unsqueeze(1)
+        rating_delta = torch.where(
+            rating_valid.unsqueeze(1), rating_delta, torch.zeros_like(rating_delta)
+        )
+
+        # Residual path keeps detached hydraulic explanatory features internally,
+        # so rating(Q) remains the only primary Z->Q gradient bridge.
+        residual = self.independent_z_head(
             history_context,
             q_future,
-            q_origin,
-            q_origin_available,
+            q_anchor,
+            q_anchor_available,
             channel_future,
             initial_channel,
             reference,
@@ -277,18 +320,26 @@ class HybridFloodModel(nn.Module):
             recent_trend_valid,
             getattr(batch, "station_index", None),
         )
+        z_delta = torch.where(
+            rating_valid.unsqueeze(1),
+            rating_delta + residual,
+            residual,
+        )
+        z_delta = torch.where(
+            reference_valid.unsqueeze(1), z_delta, torch.zeros_like(z_delta)
+        )
         absolute_future = reference.unsqueeze(1) + z_delta
         diagnostics = {
-            "forecast_origin_q_m3s": q_origin,
-            "forecast_origin_q_available": q_origin_available,
-            "initial_node_channel_storage_m3": initial_channel,
-            "forecast_origin_level_response": origin_level_response.squeeze(1),
+            "forecast_origin_q_m3s": q_anchor,
+            "forecast_origin_q_available": q_anchor_available,
             "forecast_origin_z_m": reference,
             "forecast_origin_z_available": reference_valid,
             "recent_z_trend_m_per_step": recent_trend,
             "recent_z_trend_available": recent_trend_valid,
-            "independent_delta_z_m": z_delta,
-            "qz_consistency_delta_z_m": consistency_delta,
+            "rating_available": rating_valid,
+            "rating_delta_z_m": rating_delta,
+            "z_residual_delta_m": residual,
+            "independent_delta_z_m": residual,
             "absolute_z_forecast_m": absolute_future,
         }
         return z_delta, diagnostics
@@ -305,11 +356,22 @@ class HybridFloodModel(nn.Module):
         history_features = features[:, : self.history]
         future_features = features[:, self.history : self.history + self.horizon]
         future_rainfall = rainfall[:, self.history : self.history + self.horizon]
+
+        if self.rating_curve is not None and self.z_target_mode == "delta_from_t0":
+            q_anchor, q_anchor_available, q_anchor_source = self._forecast_origin_q_anchor(batch)
+        else:
+            batch_size, _, nodes = batch.q_history.shape
+            q_anchor = batch.q_history.new_zeros((batch_size, nodes))
+            q_anchor_available = torch.zeros_like(q_anchor, dtype=torch.bool)
+            q_anchor_source = torch.zeros_like(q_anchor, dtype=torch.int8)
+
         state = self.state_initializer(
             history_features,
             batch.node_static,
             batch.edge_index,
             batch.edge_static,
+            q_origin_anchor=q_anchor,
+            q_origin_anchor_available=q_anchor_available,
         )
         q_lateral, runoff_diagnostics = self.runoff(
             future_features,
@@ -338,6 +400,10 @@ class HybridFloodModel(nn.Module):
             "initial_runoff_hidden_h": state["h0"],
             "initial_runoff_hidden_c": state["c0"],
             "history_context": state["history_context"],
+            "q_origin_anchor_m3s": q_anchor,
+            "q_origin_anchor_available": q_anchor_available,
+            # 0=learned only, 1=exact Q(t0), 2=rating inverse from exact Z(t0).
+            "q_origin_anchor_source": q_anchor_source,
         }
         return q_lateral, q_all, diagnostics
 
@@ -354,7 +420,7 @@ class HybridFloodModel(nn.Module):
             )
             channel_all = diagnostics.get("node_channel_storage")
             if self.z_target_mode == "delta_from_t0":
-                z_all, z_diagnostics = self._independent_forecast_origin_z(
+                z_all, z_diagnostics = self._rating_backed_forecast_origin_z(
                     batch, q_all, channel_all, diagnostics
                 )
                 diagnostics.update(z_diagnostics)
