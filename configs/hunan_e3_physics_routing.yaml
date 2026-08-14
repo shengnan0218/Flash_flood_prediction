@@ -2,5 +2,5 @@ _base_: hunan_e4.yaml
 runoff_mode: pure_lstm
 routing_mode: kinematic_wave_gnn
 training:
-  checkpoint: outputs/hunan_e3_best.pt
-  log_csv: outputs/hunan_e3_train.csv
+  checkpoint: outputs/hunan_e3_v8_best.pt
+  log_csv: outputs/hunan_e3_v8_train.csv
