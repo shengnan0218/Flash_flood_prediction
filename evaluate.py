@@ -15,6 +15,7 @@ from scripts.v8_training import (
 from trainers import Trainer
 from trainers.v8_trainer import V8Trainer
 from metrics.p2_event_evaluation import evaluate_p2_flood_events
+from metrics.v8_station_evaluation import evaluate_v8_station_aware
 
 
 def _json_safe(value):
@@ -53,7 +54,10 @@ def main() -> None:
     )
     parser.add_argument(
         "--output-dir",
-        help="legacy P2 Q/Z/Delta-Z逐点和分组指标输出目录",
+        help=(
+            "评价明细输出目录。v8输出evaluation_summary.json、station_metrics.csv、"
+            "graph_metrics.csv、event_station_metrics.csv和lead_time_metrics.csv"
+        ),
     )
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument(
@@ -66,10 +70,10 @@ def main() -> None:
         choices=["VALIDATION", "TEST"],
         default="TEST",
     )
-    parser.add_argument("--output", help="可选JSON指标输出路径")
+    parser.add_argument("--output", help="可选顶层JSON结果输出路径")
     parser.add_argument(
         "--diagnostics-dir",
-        help="legacy正式诊断输出目录；v8当前不调用旧station=node诊断器",
+        help="legacy正式诊断输出目录；v8请使用--output-dir",
     )
     args = parser.parse_args()
 
@@ -77,6 +81,8 @@ def main() -> None:
     if use_v8:
         if args.event_sample_index:
             parser.error("v8已冻结event/sample domain，不接受--event-sample-index")
+        if args.diagnostics_dir:
+            parser.error("v8 station-aware评价请使用--output-dir，不使用--diagnostics-dir")
         cfg, model, loader, device = setup_v8_evaluation(
             args.config,
             split=args.split,
@@ -84,20 +90,53 @@ def main() -> None:
             graph_id=args.graph_id,
         )
         trainer = V8Trainer(model, cfg, device)
-        checkpoint_validator = validate_v8_checkpoint_config
-    else:
-        cfg, model, loader, device = setup_evaluation(
-            args.config,
-            split=args.split,
-            dataset_root=args.dataset_root,
-            graph_id=args.graph_id,
-            sample_index_path=args.event_sample_index,
+        checkpoint = trainer.load_weights(args.checkpoint)
+        validate_v8_checkpoint_config(checkpoint, cfg)
+        checkpoint_path = Path(args.checkpoint).expanduser().resolve()
+        output_dir = args.output_dir or (
+            checkpoint_path.parent
+            / f"{checkpoint_path.stem}_{args.split.lower()}_v8_evaluation"
         )
-        trainer = Trainer(model, cfg, device)
-        checkpoint_validator = validate_checkpoint_config
+        evaluation = evaluate_v8_station_aware(
+            trainer,
+            loader,
+            output_dir,
+            split=args.split,
+            checkpoint=args.checkpoint,
+        )
+        result = {
+            "split": args.split,
+            "samples": len(loader.dataset),
+            "graphs": list(getattr(loader.dataset, "graph_ids", ())),
+            "target_variable": cfg["data"]["target_variable"],
+            "data_contract": (
+                cfg.get("_runtime", {}).get("data_contract", {}).get(
+                    "contract", "unknown"
+                )
+            ),
+            "checkpoint": str(checkpoint_path),
+            "evaluation_dir": evaluation["output_dir"],
+            "evaluation_files": evaluation["files"],
+            "metrics": evaluation["summary"],
+        }
+        text = json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False)
+        if args.output:
+            output = Path(args.output).expanduser().resolve()
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(text + "\n", encoding="utf-8")
+        print(text)
+        return
 
+    cfg, model, loader, device = setup_evaluation(
+        args.config,
+        split=args.split,
+        dataset_root=args.dataset_root,
+        graph_id=args.graph_id,
+        sample_index_path=args.event_sample_index,
+    )
+    trainer = Trainer(model, cfg, device)
     checkpoint = trainer.load_weights(args.checkpoint)
-    checkpoint_validator(checkpoint, cfg)
+    validate_checkpoint_config(checkpoint, cfg)
 
     if args.event_sample_index:
         if args.split != "TEST":
@@ -126,12 +165,7 @@ def main() -> None:
         print(text)
         return
 
-    # The legacy validation-diagnostics accumulator assumes gauge=node.  v8
-    # keeps Nobs sparse and therefore uses the generic physical-unit metrics
-    # here; station-aware v8 diagnostics can be added without changing training.
-    formal_legacy_evaluation = (
-        cfg.get("data", {}).get("mode") == "hunan" and not use_v8
-    )
+    formal_legacy_evaluation = cfg.get("data", {}).get("mode") == "hunan"
     metrics = trainer.evaluate(
         loader,
         include_group_details=True,
