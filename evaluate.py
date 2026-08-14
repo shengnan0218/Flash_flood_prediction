@@ -1,4 +1,4 @@
-"""Evaluate model weights on the independent Hunan TEST split."""
+"""Evaluate model weights on the independent Hunan VALIDATION/TEST split."""
 from __future__ import annotations
 
 import argparse
@@ -6,11 +6,14 @@ import json
 import math
 from pathlib import Path
 
-from scripts.common import (
-    setup_evaluation,
-    validate_checkpoint_config,
+from scripts.common import setup_evaluation, validate_checkpoint_config
+from scripts.v8_training import (
+    is_v8_requested,
+    setup_v8_evaluation,
+    validate_v8_checkpoint_config,
 )
 from trainers import Trainer
+from trainers.v8_trainer import V8Trainer
 from metrics.p2_event_evaluation import evaluate_p2_flood_events
 
 
@@ -36,48 +39,66 @@ def _contains_none(value) -> bool:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="默认仅在 TEST 事件上评估；不会恢复 optimizer 状态"
+        description="默认在独立TEST划分评估；自动识别legacy与v8数据契约"
     )
     parser.add_argument(
-        "--config", default=str(Path(__file__).resolve().parent / "configs" / "hunan_e4.yaml")
+        "--config",
+        default=str(
+            Path(__file__).resolve().parent / "configs" / "hunan_e4.yaml"
+        ),
     )
     parser.add_argument(
         "--event-sample-index",
-        help="P2重新生成的test_flood_event_samples.csv；只引用冻结continuous dynamic",
+        help="legacy P2 test_flood_event_samples.csv；v8不使用此参数",
     )
     parser.add_argument(
         "--output-dir",
-        help="P2 Q/Z/ΔZ逐点和分组指标输出目录",
+        help="legacy P2 Q/Z/Delta-Z逐点和分组指标输出目录",
     )
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument(
         "--dataset-root",
-        help="覆盖配置中的 _model_dataset 根目录（含 graph/dynamic/events/metadata/qc）",
+        help="覆盖配置中的model dataset根目录",
     )
-    parser.add_argument("--graph-id", help="评估指定 GRAPH_ID")
+    parser.add_argument("--graph-id", help="评估指定GRAPH_ID")
     parser.add_argument(
         "--split",
         choices=["VALIDATION", "TEST"],
         default="TEST",
-        help="默认使用从未参与拟合或早停的 TEST 划分",
     )
-    parser.add_argument("--output", help="可选 JSON 指标输出路径")
+    parser.add_argument("--output", help="可选JSON指标输出路径")
     parser.add_argument(
         "--diagnostics-dir",
-        help="逐事件/图/站诊断目录；默认根据--output或checkpoint自动生成",
+        help="legacy正式诊断输出目录；v8当前不调用旧station=node诊断器",
     )
     args = parser.parse_args()
 
-    cfg, model, loader, device = setup_evaluation(
-        args.config,
-        split=args.split,
-        dataset_root=args.dataset_root,
-        graph_id=args.graph_id,
-        sample_index_path=args.event_sample_index,
-    )
-    trainer = Trainer(model, cfg, device)
+    use_v8 = is_v8_requested(args.config, args.dataset_root)
+    if use_v8:
+        if args.event_sample_index:
+            parser.error("v8已冻结event/sample domain，不接受--event-sample-index")
+        cfg, model, loader, device = setup_v8_evaluation(
+            args.config,
+            split=args.split,
+            dataset_root=args.dataset_root,
+            graph_id=args.graph_id,
+        )
+        trainer = V8Trainer(model, cfg, device)
+        checkpoint_validator = validate_v8_checkpoint_config
+    else:
+        cfg, model, loader, device = setup_evaluation(
+            args.config,
+            split=args.split,
+            dataset_root=args.dataset_root,
+            graph_id=args.graph_id,
+            sample_index_path=args.event_sample_index,
+        )
+        trainer = Trainer(model, cfg, device)
+        checkpoint_validator = validate_checkpoint_config
+
     checkpoint = trainer.load_weights(args.checkpoint)
-    validate_checkpoint_config(checkpoint, cfg)
+    checkpoint_validator(checkpoint, cfg)
+
     if args.event_sample_index:
         if args.split != "TEST":
             parser.error("--event-sample-index只允许--split TEST")
@@ -104,12 +125,18 @@ def main() -> None:
             output.write_text(text + "\n", encoding="utf-8")
         print(text)
         return
-    formal_evaluation = cfg.get("data", {}).get("mode") == "hunan"
+
+    # The legacy validation-diagnostics accumulator assumes gauge=node.  v8
+    # keeps Nobs sparse and therefore uses the generic physical-unit metrics
+    # here; station-aware v8 diagnostics can be added without changing training.
+    formal_legacy_evaluation = (
+        cfg.get("data", {}).get("mode") == "hunan" and not use_v8
+    )
     metrics = trainer.evaluate(
         loader,
         include_group_details=True,
-        include_validation_diagnostics=formal_evaluation,
-        include_diagnostic_details=formal_evaluation,
+        include_validation_diagnostics=formal_legacy_evaluation,
+        include_diagnostic_details=formal_legacy_evaluation,
     )
     validation_diagnostics = metrics.pop("_validation_diagnostics", None)
     serialised_metrics = _json_safe(metrics)
@@ -118,6 +145,11 @@ def main() -> None:
         "samples": len(loader.dataset),
         "graphs": list(getattr(loader.dataset, "graph_ids", ())),
         "target_variable": cfg["data"]["target_variable"],
+        "data_contract": (
+            cfg.get("_runtime", {}).get("data_contract", {}).get(
+                "contract", "legacy"
+            )
+        ),
         "checkpoint": str(Path(args.checkpoint).expanduser().resolve()),
         "metrics": serialised_metrics,
     }
@@ -130,9 +162,9 @@ def main() -> None:
                 f"{output_stem.name}_diagnostics"
             )
         else:
-            checkpoint = Path(args.checkpoint).expanduser().resolve()
-            diagnostics_dir = checkpoint.parent / (
-                f"{checkpoint.stem}_{args.split.lower()}_diagnostics"
+            checkpoint_path = Path(args.checkpoint).expanduser().resolve()
+            diagnostics_dir = checkpoint_path.parent / (
+                f"{checkpoint_path.stem}_{args.split.lower()}_diagnostics"
             )
         written = validation_diagnostics.write(
             diagnostics_dir,
@@ -146,8 +178,8 @@ def main() -> None:
         result["diagnostic_files"] = written
     if _contains_none(serialised_metrics):
         result["metric_note"] = (
-            "null 表示该目标没有有效标签，或该指标因零方差等条件无定义；"
-            "请结合 *_valid_count 解读"
+            "null表示该目标没有有效标签，或指标因零方差等条件无定义；"
+            "请结合*_valid_count解读"
         )
     text = json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False)
     if args.output:
