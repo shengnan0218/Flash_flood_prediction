@@ -1,21 +1,32 @@
 _base_: hunan_e4.yaml
 
-# v9: sequential 24 h runoff+routing warm-up + explicit-state Delta-Z head.
-# The same code path is used by E1--E4; YAML switches only runoff/routing physics.
+# v9: sequential 24 h runoff+routing warm-up + V8-style observation state
+# correction + explicit-state Delta-Z head.  E1--E4 share this exact code path;
+# YAML switches only runoff/routing physics.
 model_version: v9
 
 data:
   # v8 tensors inherit the frozen v7 hydrologic-event domain.
   dataset_type: event
 
-# Current Hunan tensors are hourly.  These are physical durations/cadences,
-# not assumptions hard-coded into the v9 model.  A Zhejiang minute loader can
-# later set forcing_step_seconds=60 and target_step_seconds independently.
+# Current Hunan tensors are hourly.  Durations and cadences are physical units,
+# not an assumption that one model step always equals one hour.
+#
+# Time-bin contract:
+# - Step11 rain labelled t is accumulated over [t, t+dt).
+# - Hourly Q/Z labelled t is the last observation retained inside that same bin.
+# - The physical forecast origin is the END of the final history bin.
+# This makes the current frozen tensors internally aligned without a one-hour
+# shift: history label t is a bin label, not an instantaneous forecast-origin
+# timestamp.
 temporal:
   history_duration_seconds: 86400
   forecast_duration_seconds: 21600
   forcing_step_seconds: 3600
   target_step_seconds: 3600
+  rain_interval_anchor: interval_start
+  hydro_hour_bin_anchor: start_label_last_observation_within_bin
+  forecast_origin_anchor: end_of_last_history_bin
 
 state_initialization:
   enabled: true
@@ -24,6 +35,17 @@ state_initialization:
 warmup:
   enabled: true
   initial_state: static_prior
+
+# History observations do not replace the 24 h physics warm-up.  They provide a
+# bounded residual correction at the forecast origin, restoring the useful V8
+# history-informed state mechanism while preserving physical state continuity.
+state_correction:
+  enabled: true
+  mode: v8_history_residual_after_warmup
+  use_qz_history: true
+  correct_channel_storage: true
+  hidden_residual_scale: 0.25
+  storage_log_scale: 0.35
 
 z_head:
   mode: explicit_state_mlp

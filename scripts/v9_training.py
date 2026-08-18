@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from data.device import resolve_device, seed_everything
 from datasets.hydrologic_graph_v8 import (
@@ -18,6 +18,25 @@ from scripts.v8_training import (
     _load_yaml,
     _resolve_root,
 )
+
+
+V9_TIME_SEMANTICS = {
+    "rain_interval_anchor": "interval_start",
+    "hydro_hour_bin_anchor": "start_label_last_observation_within_bin",
+    "forecast_origin_anchor": "end_of_last_history_bin",
+}
+
+# Zhejiang transfer must not reuse Hunan station-specific embeddings/statistics.
+_V9_TRANSFER_EXCLUDED_EXACT = {
+    "q_history_mean",
+    "q_history_scale",
+    "z_history_mean",
+    "z_history_scale",
+    "q_target_mean",
+    "q_target_scale",
+    "dz_target_scale",
+}
+_V9_TRANSFER_EXCLUDED_SUFFIX = "station_embedding.weight"
 
 
 def is_v9_requested(
@@ -39,7 +58,9 @@ def _runtime_config(
     if dataset_root is not None:
         cfg["data"]["dataset_root"] = str(_resolve_root(dataset_root))
     else:
-        cfg["data"]["dataset_root"] = str(_resolve_root(cfg["data"]["dataset_root"]))
+        cfg["data"]["dataset_root"] = str(
+            _resolve_root(cfg["data"]["dataset_root"])
+        )
     if graph_id is not None:
         cfg["data"]["graph_id"] = str(graph_id).strip()
     for key in ("checkpoint", "log_csv", "final_checkpoint"):
@@ -51,7 +72,7 @@ def _runtime_config(
     forcing_step = float(temporal.get("forcing_step_seconds", float("nan")))
     if not math.isfinite(forcing_step) or forcing_step <= 0:
         raise ValueError("v9 temporal.forcing_step_seconds必须>0")
-    # One source of truth for physical dt: routing follows the forcing cadence.
+    # One source of truth for physical dt: routing follows forcing cadence.
     cfg.setdefault("solver", {})["seconds_per_step"] = forcing_step
     _validate_v9_config(cfg)
     return cfg
@@ -98,16 +119,22 @@ def _validate_v9_config(cfg: dict[str, Any]) -> None:
         raise ValueError("history_length必须等于history_duration/forcing_step")
     if int(cfg.get("forecast_horizon", -1)) != target_steps:
         raise ValueError("forecast_horizon必须等于forecast_duration/target_step")
-    # The currently frozen Hunan v8 tensors are hourly 24->6.  The v9 model
-    # itself supports different forcing/target cadence; a Zhejiang/minute loader
-    # can later provide the corresponding longer tensors without changing v9.
+    # Current frozen Hunan tensors are hourly 24->6.  The model itself is
+    # duration/dt aware; a Zhejiang minute loader must provide matching tensors.
     if (history_steps, internal_forecast_steps, target_steps) != (24, 6, 6):
         raise ValueError(
             "当前_hydrologic_graph_v8数据只提供24个history和6个future内部步；"
-            "分钟级浙江数据需要新的同契约loader/tensor，而无需改v9模型"
+            "分钟级浙江数据需要新的同契约loader/tensor，而无需重写v9模型"
         )
+    for key, expected in V9_TIME_SEMANTICS.items():
+        if temporal.get(key) != expected:
+            raise ValueError(
+                f"v9 temporal.{key}必须为{expected!r}，实际={temporal.get(key)!r}"
+            )
 
-    if int(cfg.get("node_static_dim", -1)) != 10 or int(cfg.get("edge_static_dim", -1)) != 2:
+    if int(cfg.get("node_static_dim", -1)) != 10 or int(
+        cfg.get("edge_static_dim", -1)
+    ) != 2:
         raise ValueError("v9 Hunan固定node_static_dim=10、edge_static_dim=2")
     if cfg.get("runoff_mode") not in {"pure_lstm", "water_balance_lstm"}:
         raise ValueError("v9未知runoff_mode")
@@ -122,6 +149,29 @@ def _validate_v9_config(cfg: dict[str, Any]) -> None:
     state = cfg.get("state_initialization", {})
     if not bool(state.get("enabled", False)) or state.get("mode") != "sequential_warmup":
         raise ValueError("v9 state_initialization必须为sequential_warmup")
+    correction = cfg.get("state_correction", {})
+    expected_correction = {
+        "enabled": True,
+        "mode": "v8_history_residual_after_warmup",
+        "use_qz_history": True,
+        "correct_channel_storage": True,
+    }
+    mismatch_correction = {
+        key: correction.get(key)
+        for key, expected in expected_correction.items()
+        if correction.get(key) != expected
+    }
+    if mismatch_correction:
+        raise ValueError(f"v9 state correction冻结设计不一致: {mismatch_correction}")
+    hidden_residual_scale = float(correction.get("hidden_residual_scale", float("nan")))
+    storage_log_scale = float(correction.get("storage_log_scale", float("nan")))
+    if (
+        not math.isfinite(hidden_residual_scale)
+        or not 0 < hidden_residual_scale <= 1.0
+        or not math.isfinite(storage_log_scale)
+        or not 0 < storage_log_scale <= 1.0
+    ):
+        raise ValueError("v9 state correction尺度必须位于(0,1]")
 
     z_head = cfg.get("z_head", {})
     expected_z = {
@@ -143,7 +193,10 @@ def _validate_v9_config(cfg: dict[str, Any]) -> None:
     trend_windows = z_head.get("trend_windows_seconds")
     if not isinstance(trend_windows, list) or len(trend_windows) != 3:
         raise ValueError("v9 z_head.trend_windows_seconds必须含3个物理时长")
-    if any(int(value) <= 0 or int(value) > history_duration for value in trend_windows):
+    if any(
+        int(value) <= 0 or int(value) > history_duration
+        for value in trend_windows
+    ):
         raise ValueError("v9 Z trend window必须位于history duration内")
 
     loss = cfg.get("loss", {})
@@ -177,10 +230,16 @@ def _validate_v9_config(cfg: dict[str, Any]) -> None:
     }
     if wrong:
         raise ValueError(f"v9 loss权重不一致: {wrong}")
+    for key in ("q_scale_floor_m3s", "delta_z_scale_floor_m"):
+        value = float(loss.get(key, float("nan")))
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"v9 loss.{key}必须>0")
     weights = cfg.get("loss_weights", {})
     if (
         not math.isclose(float(weights.get("discharge", float("nan"))), 1.0)
-        or not math.isclose(float(weights.get("water_level", float("nan"))), 1.0)
+        or not math.isclose(
+            float(weights.get("water_level", float("nan"))), 1.0
+        )
     ):
         raise ValueError("v9 Q:Z主任务权重固定1:1")
     if bool(cfg.get("train_sampling", {}).get("enabled", False)):
@@ -197,6 +256,83 @@ def _validate_v9_config(cfg: dict[str, Any]) -> None:
         raise ValueError("当前v9 NPZ cache正式配置固定num_workers=0")
     if int(cfg.get("batch_size", 0)) <= 0 or int(cfg.get("hidden_dim", 0)) <= 0:
         raise ValueError("v9 batch_size/hidden_dim必须>0")
+
+
+def _validate_dataset_time_contract(
+    cfg: dict[str, Any], dataset: HydrologicGraphV8Dataset
+) -> None:
+    """Make the historical hourly-bin convention explicit and auditable.
+
+    Step11 rain is [start,end) and stored under interval start.  The frozen
+    hourly hydro table keeps the last observation within the same labelled hour.
+    Therefore a history label t represents the bin ending at t+1h for physical
+    warm-up purposes, and the forecast origin is the end of the last history bin.
+    No one-hour tensor shift is performed.
+    """
+    declared = dataset.contract.get("timestamp_semantics")
+    if isinstance(declared, Mapping):
+        mismatches = {
+            key: declared.get(key)
+            for key, expected in V9_TIME_SEMANTICS.items()
+            if declared.get(key) != expected
+        }
+        if mismatches:
+            raise ValueError(f"dataset timestamp semantics与v9不一致: {mismatches}")
+    cfg.setdefault("_runtime", {})["timestamp_semantics"] = {
+        **V9_TIME_SEMANTICS,
+        "dataset_declared": isinstance(declared, Mapping),
+        "interpretation": (
+            "history label t is the [t,t+dt) bin; forecast origin is the end "
+            "of the final history bin; targets advance by target_step_seconds"
+        ),
+    }
+
+
+def _apply_v9_scale_floors(cfg: dict[str, Any]) -> None:
+    """Enforce YAML scale floors even though the frozen v8 builder used 1e-6."""
+    runtime = cfg.get("_runtime", {})
+    normal = runtime.get("v8_normalization")
+    if not isinstance(normal, dict):
+        raise ValueError("v9 runtime normalization缺失")
+    station_ids = list(runtime.get("v8_station_ids", ()))
+    q_floor = float(cfg["loss"]["q_scale_floor_m3s"])
+    dz_floor = float(cfg["loss"]["delta_z_scale_floor_m"])
+    raw_q = [float(value) for value in normal["q_target_scale"]]
+    raw_dz = [float(value) for value in normal["dz_target_scale"]]
+    if len(raw_q) != len(station_ids) or len(raw_dz) != len(station_ids):
+        raise ValueError("v9 station scale数量与station catalogue不一致")
+    applied_q = [max(value, q_floor) for value in raw_q]
+    applied_dz = [max(value, dz_floor) for value in raw_dz]
+    normal["q_target_scale"] = applied_q
+    normal["dz_target_scale"] = applied_dz
+    stations = {
+        station: {
+            "q_raw_scale_m3s": raw_q[index],
+            "q_applied_scale_m3s": applied_q[index],
+            "q_floor_applied": raw_q[index] < q_floor,
+            "delta_z_raw_scale_m": raw_dz[index],
+            "delta_z_applied_scale_m": applied_dz[index],
+            "delta_z_floor_applied": raw_dz[index] < dz_floor,
+        }
+        for index, station in enumerate(station_ids)
+    }
+    runtime["target_scale_audit"] = {
+        "computed_from_split": "TRAIN",
+        "source": "v8 dataset_contract per-station scales with v9 runtime floors",
+        "q_scale_floor_m3s": q_floor,
+        "delta_z_scale_floor_m": dz_floor,
+        "stations": stations,
+    }
+
+
+def _finalize_v9_runtime(
+    cfg: dict[str, Any], dataset: HydrologicGraphV8Dataset
+) -> None:
+    _attach_runtime(cfg, dataset)
+    _validate_dataset_time_contract(cfg, dataset)
+    _apply_v9_scale_floors(cfg)
+    cfg["_runtime"]["model_version"] = "v9"
+    cfg["_runtime"]["temporal"] = dict(cfg["temporal"])
 
 
 def setup_v9_training(
@@ -226,9 +362,7 @@ def setup_v9_training(
         tensor_cache=tensor_cache,
     )
     _ensure_split_compatibility(train_dataset, validation_dataset)
-    _attach_runtime(cfg, train_dataset)
-    cfg["_runtime"]["model_version"] = "v9"
-    cfg["_runtime"]["temporal"] = dict(cfg["temporal"])
+    _finalize_v9_runtime(cfg, train_dataset)
     train_loader = build_hydrologic_graph_v8_loader(
         train_dataset,
         batch_size=int(cfg["batch_size"]),
@@ -269,9 +403,7 @@ def setup_v9_evaluation(
         future_rainfall_mode=cfg["data"]["future_rainfall_mode"],
         strict=cfg["data"]["strict_validation"],
     )
-    _attach_runtime(cfg, dataset)
-    cfg["_runtime"]["model_version"] = "v9"
-    cfg["_runtime"]["temporal"] = dict(cfg["temporal"])
+    _finalize_v9_runtime(cfg, dataset)
     loader = build_hydrologic_graph_v8_loader(
         dataset,
         batch_size=int(cfg["batch_size"]),
@@ -306,6 +438,7 @@ def validate_v9_checkpoint_config(
         "temporal",
         "warmup",
         "state_initialization",
+        "state_correction",
         "z_head",
         "solver",
         "physical_bounds",
@@ -322,8 +455,10 @@ def validate_v9_checkpoint_config(
         "z_slope_weight",
         "qz_consistency_weight",
         "q_scale_mode",
+        "q_scale_floor_m3s",
         "z_target_mode",
         "delta_z_scale_mode",
+        "delta_z_scale_floor_m",
     ):
         if saved.get("loss", {}).get(key) != cfg.get("loss", {}).get(key):
             raise ValueError(f"checkpoint与当前v9 loss不兼容: loss.{key}")
@@ -333,5 +468,32 @@ def validate_v9_checkpoint_config(
         raise ValueError("checkpoint与当前v9 dataset_contract.json不一致")
     if saved_contract.get("station_ids") != current_contract.get("station_ids"):
         raise ValueError("checkpoint与当前v9 station catalogue不一致")
-    if resume and saved.get("data", {}).get("graph_id") != cfg.get("data", {}).get("graph_id"):
+    if resume and saved.get("data", {}).get("graph_id") != cfg.get("data", {}).get(
+        "graph_id"
+    ):
         raise ValueError("resume要求data.graph_id与checkpoint完全一致")
+
+
+def extract_v9_transferable_state_dict(
+    checkpoint: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return Hunan->Zhejiang transferable weights only.
+
+    Station embeddings and all station-specific normalization buffers are
+    deliberately excluded.  A Zhejiang adapter must create its own station
+    catalogue and TRAIN-only normalization before loading this dictionary with
+    strict=False and explicitly auditing missing/unexpected keys.
+    """
+    state = checkpoint.get("model") if isinstance(checkpoint, Mapping) else None
+    if not isinstance(state, Mapping):
+        raise ValueError("v9 transfer checkpoint缺少model state_dict")
+    transferable: dict[str, Any] = {}
+    for key, value in state.items():
+        if key in _V9_TRANSFER_EXCLUDED_EXACT:
+            continue
+        if key.endswith(_V9_TRANSFER_EXCLUDED_SUFFIX):
+            continue
+        transferable[key] = value
+    if not transferable:
+        raise ValueError("v9 transfer state_dict为空")
+    return transferable
