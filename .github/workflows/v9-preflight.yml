@@ -34,5 +34,6 @@ jobs:
         run: >-
           pytest -q
           tests/test_hydrologic_graph_v9.py
+          tests/test_v9_runtime_contract.py
           tests/test_kinematic_wave_cfl.py
           tests/test_learned_channel_width.py
