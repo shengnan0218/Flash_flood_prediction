@@ -11,7 +11,7 @@ from scripts.v8_training import (
     setup_v8_training,
     validate_v8_checkpoint_config,
 )
-from scripts.v9_training import (
+from scripts.v9_active import (
     is_v9_requested,
     setup_v9_training,
     validate_v9_checkpoint_config,
@@ -28,12 +28,12 @@ def _event_count(loader) -> int:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="湖南洪水模型训练；自动识别legacy、v8与v9 hydrologic-graph契约"
+        description="湖南洪水模型训练；默认正式入口为E4 v9，仍可显式切换E1-E4/v8/legacy配置"
     )
     parser.add_argument(
         "--config",
         default=str(
-            Path(__file__).resolve().parent / "configs" / "hunan_e4.yaml"
+            Path(__file__).resolve().parent / "configs" / "hunan_e4_v9.yaml"
         ),
     )
     parser.add_argument(
