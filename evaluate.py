@@ -12,7 +12,7 @@ from scripts.v8_training import (
     setup_v8_evaluation,
     validate_v8_checkpoint_config,
 )
-from scripts.v9_training import (
+from scripts.v9_active import (
     is_v9_requested,
     setup_v9_evaluation,
     validate_v9_checkpoint_config,
@@ -47,12 +47,12 @@ def _contains_none(value) -> bool:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="默认在独立TEST划分评估；自动识别legacy、v8与v9数据契约"
+        description="默认以E4 v9在独立TEST划分评估；仍可显式切换legacy/v8/v9配置"
     )
     parser.add_argument(
         "--config",
         default=str(
-            Path(__file__).resolve().parent / "configs" / "hunan_e4.yaml"
+            Path(__file__).resolve().parent / "configs" / "hunan_e4_v9.yaml"
         ),
     )
     parser.add_argument(

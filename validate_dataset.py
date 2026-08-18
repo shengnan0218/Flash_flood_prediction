@@ -15,7 +15,7 @@ from scripts.v8_training import (
     setup_v8_evaluation,
     setup_v8_training,
 )
-from scripts.v9_training import (
+from scripts.v9_active import (
     is_v9_requested,
     setup_v9_evaluation,
     setup_v9_training,
@@ -273,10 +273,10 @@ def validate_dataset(
 def main() -> None:
     project_root = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(
-        description="只读校验湖南正式model dataset，不启动训练"
+        description="只读校验湖南正式model dataset；默认正式入口为E4 v9，不启动训练"
     )
     parser.add_argument(
-        "--config", default=str(project_root / "configs" / "hunan_e4.yaml")
+        "--config", default=str(project_root / "configs" / "hunan_e4_v9.yaml")
     )
     parser.add_argument("--dataset-root", help="覆盖model dataset根目录")
     parser.add_argument("--graph-id", help="可选：只校验一个GRAPH_ID")

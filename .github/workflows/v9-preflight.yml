@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - agent/fix-v9-preflight
+      - agent/fix-v9-assimilation-entry
   pull_request:
 
 jobs:
@@ -23,8 +24,10 @@ jobs:
         run: >-
           python -m py_compile
           models/hydrologic_graph_v9.py
+          models/hydrologic_graph_v9_assimilated.py
           models/runoff/water_balance_v9.py
           scripts/v9_training.py
+          scripts/v9_active.py
           trainers/v9_trainer.py
           metrics/v9_station_evaluation.py
           train_hunan.py
@@ -34,6 +37,7 @@ jobs:
         run: >-
           pytest -q
           tests/test_hydrologic_graph_v9.py
+          tests/test_v9_active_assimilation.py
           tests/test_v9_runtime_contract.py
           tests/test_kinematic_wave_cfl.py
           tests/test_learned_channel_width.py
