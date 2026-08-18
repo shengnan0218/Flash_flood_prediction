@@ -1,0 +1,45 @@
+_base_: hunan_e4.yaml
+
+# v9: sequential 24 h runoff+routing warm-up + explicit-state Delta-Z head.
+# The same code path is used by E1--E4; YAML switches only runoff/routing physics.
+model_version: v9
+
+data:
+  # v8 tensors inherit the frozen v7 hydrologic-event domain.
+  dataset_type: event
+
+# Current Hunan tensors are hourly.  These are physical durations/cadences,
+# not assumptions hard-coded into the v9 model.  A Zhejiang minute loader can
+# later set forcing_step_seconds=60 and target_step_seconds independently.
+temporal:
+  history_duration_seconds: 86400
+  forecast_duration_seconds: 21600
+  forcing_step_seconds: 3600
+  target_step_seconds: 3600
+
+state_initialization:
+  enabled: true
+  mode: sequential_warmup
+
+warmup:
+  enabled: true
+  initial_state: static_prior
+
+z_head:
+  mode: explicit_state_mlp
+  incremental_output: true
+  detach_hydraulic_features: true
+  use_z0: true
+  use_recent_trend: true
+  trend_windows_seconds: [3600, 10800, 21600]
+  use_q_features: true
+  use_channel_state: true
+
+loss:
+  # Q and Z share hydrologic context but no province-wide monotonic Q-Z law.
+  qz_consistency_weight: 0.0
+
+training:
+  epochs: 100
+  patience: 100
+  early_stopping: false
