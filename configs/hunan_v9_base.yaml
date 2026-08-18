@@ -48,9 +48,13 @@ warmup:
 # incremental area and can add/remove runoff and channel storage, so water that
 # entered before the 24 h warm-up can be restored instead of merely multiplying
 # an almost-zero state.
+#
+# ``mode`` keeps the original v9 runtime compatibility token; the active formal
+# model implementation performs the stronger mass-aware analysis documented by
+# the explicit switches below.
 state_correction:
   enabled: true
-  mode: mass_aware_upstream_analysis_after_warmup
+  mode: v8_history_residual_after_warmup
   use_qz_history: true
   propagate_upstream: true
   correct_channel_storage: true
