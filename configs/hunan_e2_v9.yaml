@@ -1,0 +1,9 @@
+_base_: hunan_v9_base.yaml
+
+runoff_mode: water_balance_lstm
+routing_mode: pure_gnn
+
+training:
+  checkpoint: outputs/hunan_e2_v9_best.pt
+  final_checkpoint: outputs/hunan_e2_v9_final.pt
+  log_csv: outputs/hunan_e2_v9_train.csv
