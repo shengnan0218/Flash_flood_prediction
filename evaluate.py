@@ -12,8 +12,14 @@ from scripts.v8_training import (
     setup_v8_evaluation,
     validate_v8_checkpoint_config,
 )
+from scripts.v9_training import (
+    is_v9_requested,
+    setup_v9_evaluation,
+    validate_v9_checkpoint_config,
+)
 from trainers import Trainer
 from trainers.v8_trainer import V8Trainer
+from trainers.v9_trainer import V9Trainer
 from metrics.p2_event_evaluation import evaluate_p2_flood_events
 from metrics.v8_station_evaluation import evaluate_v8_station_aware
 
@@ -40,7 +46,7 @@ def _contains_none(value) -> bool:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="默认在独立TEST划分评估；自动识别legacy与v8数据契约"
+        description="默认在独立TEST划分评估；自动识别legacy、v8与v9数据契约"
     )
     parser.add_argument(
         "--config",
@@ -50,12 +56,12 @@ def main() -> None:
     )
     parser.add_argument(
         "--event-sample-index",
-        help="legacy P2 test_flood_event_samples.csv；v8不使用此参数",
+        help="legacy P2 test_flood_event_samples.csv；v8/v9不使用此参数",
     )
     parser.add_argument(
         "--output-dir",
         help=(
-            "评价明细输出目录。v8输出evaluation_summary.json、station_metrics.csv、"
+            "评价明细输出目录。v8/v9输出evaluation_summary.json、station_metrics.csv、"
             "graph_metrics.csv、event_station_metrics.csv和lead_time_metrics.csv"
         ),
     )
@@ -73,29 +79,40 @@ def main() -> None:
     parser.add_argument("--output", help="可选顶层JSON结果输出路径")
     parser.add_argument(
         "--diagnostics-dir",
-        help="legacy正式诊断输出目录；v8请使用--output-dir",
+        help="legacy正式诊断输出目录；v8/v9请使用--output-dir",
     )
     args = parser.parse_args()
 
-    use_v8 = is_v8_requested(args.config, args.dataset_root)
-    if use_v8:
+    use_v9 = is_v9_requested(args.config, args.dataset_root)
+    use_v8 = False if use_v9 else is_v8_requested(args.config, args.dataset_root)
+    if use_v9 or use_v8:
         if args.event_sample_index:
-            parser.error("v8已冻结event/sample domain，不接受--event-sample-index")
+            parser.error("v8/v9已冻结event/sample domain，不接受--event-sample-index")
         if args.diagnostics_dir:
-            parser.error("v8 station-aware评价请使用--output-dir，不使用--diagnostics-dir")
-        cfg, model, loader, device = setup_v8_evaluation(
+            parser.error("v8/v9 station-aware评价请使用--output-dir，不使用--diagnostics-dir")
+        if use_v9:
+            setup_fn = setup_v9_evaluation
+            trainer_cls = V9Trainer
+            validator = validate_v9_checkpoint_config
+            version = "v9"
+        else:
+            setup_fn = setup_v8_evaluation
+            trainer_cls = V8Trainer
+            validator = validate_v8_checkpoint_config
+            version = "v8"
+        cfg, model, loader, device = setup_fn(
             args.config,
             split=args.split,
             dataset_root=args.dataset_root,
             graph_id=args.graph_id,
         )
-        trainer = V8Trainer(model, cfg, device)
+        trainer = trainer_cls(model, cfg, device)
         checkpoint = trainer.load_weights(args.checkpoint)
-        validate_v8_checkpoint_config(checkpoint, cfg)
+        validator(checkpoint, cfg)
         checkpoint_path = Path(args.checkpoint).expanduser().resolve()
         output_dir = args.output_dir or (
             checkpoint_path.parent
-            / f"{checkpoint_path.stem}_{args.split.lower()}_v8_evaluation"
+            / f"{checkpoint_path.stem}_{args.split.lower()}_{version}_evaluation"
         )
         evaluation = evaluate_v8_station_aware(
             trainer,
@@ -106,6 +123,7 @@ def main() -> None:
         )
         result = {
             "split": args.split,
+            "model_version": cfg.get("model_version", version),
             "samples": len(loader.dataset),
             "graphs": list(getattr(loader.dataset, "graph_ids", ())),
             "target_variable": cfg["data"]["target_variable"],
