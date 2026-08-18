@@ -22,6 +22,7 @@ from trainers.v8_trainer import V8Trainer
 from trainers.v9_trainer import V9Trainer
 from metrics.p2_event_evaluation import evaluate_p2_flood_events
 from metrics.v8_station_evaluation import evaluate_v8_station_aware
+from metrics.v9_station_evaluation import evaluate_v9_station_aware
 
 
 def _json_safe(value):
@@ -94,11 +95,13 @@ def main() -> None:
             setup_fn = setup_v9_evaluation
             trainer_cls = V9Trainer
             validator = validate_v9_checkpoint_config
+            station_evaluator = evaluate_v9_station_aware
             version = "v9"
         else:
             setup_fn = setup_v8_evaluation
             trainer_cls = V8Trainer
             validator = validate_v8_checkpoint_config
+            station_evaluator = evaluate_v8_station_aware
             version = "v8"
         cfg, model, loader, device = setup_fn(
             args.config,
@@ -114,7 +117,7 @@ def main() -> None:
             checkpoint_path.parent
             / f"{checkpoint_path.stem}_{args.split.lower()}_{version}_evaluation"
         )
-        evaluation = evaluate_v8_station_aware(
+        evaluation = station_evaluator(
             trainer,
             loader,
             output_dir,
