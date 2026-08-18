@@ -42,10 +42,10 @@ class EdgeParameterNetwork(nn.Module):
 class KinematicWaveGNN(nn.Module):
     """Route lateral discharge through a converging DAG in physical units.
 
-    ``initial_edge_discharge`` is optional.  When supplied it represents the
-    forecast-origin discharge already present in each reach.  It is converted
-    to reach volume with this solver's own kinematic-wave relation, so P3 state
-    assimilation changes only the initial condition, not the routing equation.
+    ``initial_edge_discharge`` is retained for P3/backwards compatibility.
+    ``initial_edge_storage`` carries the solver's exact reach-volume state from
+    a sequential warm-up into the forecast and therefore avoids reinitialising
+    every forecast window as an empty river network.
     """
 
     def __init__(
@@ -103,6 +103,7 @@ class KinematicWaveGNN(nn.Module):
         edge_index: torch.Tensor,
         edge_static: torch.Tensor,
         initial_edge_discharge: torch.Tensor | None = None,
+        initial_edge_storage: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         with torch.autocast(device_type=q_lat.device.type, enabled=False):
             q_lat = q_lat.float()
@@ -123,6 +124,8 @@ class KinematicWaveGNN(nn.Module):
                 raise ValueError("q_lat必须为有限非负流量")
             if not torch.isfinite(edge_static).all():
                 raise ValueError("边属性含缺失/非有限值；运动波不允许隐式填补")
+            if initial_edge_discharge is not None and initial_edge_storage is not None:
+                raise ValueError("initial_edge_discharge与initial_edge_storage不能同时提供")
 
             length = edge_static[:, 0]
             slope = edge_static[:, 1]
@@ -167,17 +170,22 @@ class KinematicWaveGNN(nn.Module):
             if not torch.isfinite(alpha).all() or (alpha <= 0).any():
                 raise FloatingPointError("运动波参数alpha必须为有限正数")
 
-            if initial_edge_discharge is None:
-                volume = torch.zeros(batch, edges, device=q_lat.device)
-                initial_q = torch.zeros(batch, edges, device=q_lat.device)
-            else:
+            if initial_edge_storage is not None:
+                volume = initial_edge_storage.float()
+                if volume.shape != (batch, edges):
+                    raise ValueError("initial_edge_storage必须为[B,E]")
+                if not torch.isfinite(volume).all() or (volume < 0).any():
+                    raise ValueError("initial_edge_storage必须为有限非负m3")
+                if edges:
+                    initial_area = (volume / length.unsqueeze(0)).clamp_min(0.0)
+                    initial_q = alpha.unsqueeze(0) * initial_area.pow(exponent)
+                else:
+                    initial_q = volume.clone()
+            elif initial_edge_discharge is not None:
                 initial_q = initial_edge_discharge.float()
                 if initial_q.shape != (batch, edges):
                     raise ValueError("initial_edge_discharge必须为[B,E]")
-                if (
-                    not torch.isfinite(initial_q).all()
-                    or (initial_q < 0).any()
-                ):
+                if not torch.isfinite(initial_q).all() or (initial_q < 0).any():
                     raise ValueError("initial_edge_discharge必须为有限非负m3/s")
                 if edges:
                     initial_area = (
@@ -185,7 +193,10 @@ class KinematicWaveGNN(nn.Module):
                     ).clamp_min(0.0).pow(1.0 / exponent)
                     volume = initial_area * length.unsqueeze(0)
                 else:
-                    volume = initial_q
+                    volume = initial_q.clone()
+            else:
+                volume = torch.zeros(batch, edges, device=q_lat.device)
+                initial_q = torch.zeros(batch, edges, device=q_lat.device)
 
             initial_volume = volume.clone()
             node_outputs: list[torch.Tensor] = []
@@ -365,9 +376,10 @@ class PureDirectedGNN(nn.Module):
         edge_index: torch.Tensor,
         edge_static: torch.Tensor,
         initial_edge_discharge: torch.Tensor | None = None,
+        initial_edge_storage: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        if initial_edge_discharge is not None:
-            raise ValueError("pure_gnn routing不支持physical initial_edge_discharge")
+        if initial_edge_discharge is not None or initial_edge_storage is not None:
+            raise ValueError("pure_gnn routing不支持physical initial edge state")
         batch, steps, nodes = q_lat.shape
         key = (nodes, tuple(edge_index.detach().cpu().flatten().tolist()))
         if key != self._key:
