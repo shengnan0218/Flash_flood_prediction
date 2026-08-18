@@ -11,8 +11,14 @@ from scripts.v8_training import (
     setup_v8_training,
     validate_v8_checkpoint_config,
 )
+from scripts.v9_training import (
+    is_v9_requested,
+    setup_v9_training,
+    validate_v9_checkpoint_config,
+)
 from trainers import Trainer
 from trainers.v8_trainer import V8Trainer
+from trainers.v9_trainer import V9Trainer
 
 
 def _event_count(loader) -> int:
@@ -22,7 +28,7 @@ def _event_count(loader) -> int:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="湖南洪水模型训练；自动识别legacy与v8 hydrologic-graph契约"
+        description="湖南洪水模型训练；自动识别legacy、v8与v9 hydrologic-graph契约"
     )
     parser.add_argument(
         "--config",
@@ -51,8 +57,17 @@ def main() -> None:
     if args.resume and args.overwrite:
         parser.error("--resume与--overwrite不能同时使用")
 
-    use_v8 = is_v8_requested(args.config, args.dataset_root)
-    if use_v8:
+    use_v9 = is_v9_requested(args.config, args.dataset_root)
+    use_v8 = False if use_v9 else is_v8_requested(args.config, args.dataset_root)
+    if use_v9:
+        cfg, model, train_loader, validation_loader, device = setup_v9_training(
+            args.config,
+            dataset_root=args.dataset_root,
+            graph_id=args.graph_id,
+        )
+        trainer = V9Trainer(model, cfg, device)
+        checkpoint_validator = validate_v9_checkpoint_config
+    elif use_v8:
         cfg, model, train_loader, validation_loader, device = setup_v8_training(
             args.config,
             dataset_root=args.dataset_root,
@@ -73,6 +88,7 @@ def main() -> None:
         json.dumps(
             {
                 "mode": cfg["data"]["mode"],
+                "model_version": cfg.get("model_version", "legacy_or_v8"),
                 "dataset_root": cfg["data"]["dataset_root"],
                 "data_contract": (
                     cfg.get("_runtime", {})
@@ -84,6 +100,7 @@ def main() -> None:
                 "target_variable": cfg["data"]["target_variable"],
                 "dataset_type": cfg["data"].get("dataset_type", "event"),
                 "future_rainfall_mode": cfg["data"]["future_rainfall_mode"],
+                "temporal": cfg.get("temporal"),
                 "train_samples": len(train_loader.dataset),
                 "validation_samples": len(validation_loader.dataset),
                 "train_events": _event_count(train_loader),
