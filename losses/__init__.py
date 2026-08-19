@@ -1,4 +1,7 @@
-from .flood_multitask_loss import LossTerm, water_level_first_differences
-from .p3_consistency import FloodMultitaskLoss
+from .flood_multitask_loss import (
+    FloodMultitaskLoss,
+    LossTerm,
+    water_level_first_differences,
+)
 
 __all__ = ["FloodMultitaskLoss", "LossTerm", "water_level_first_differences"]
