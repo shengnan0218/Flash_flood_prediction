@@ -22,6 +22,7 @@ jobs:
       - name: Compile formal V10 V9 routing entry points
         run: >-
           python -m py_compile
+          datasets/hydrologic_graph_v10.py
           models/hydrologic_graph_v10.py
           models/hydrologic_graph_v9.py
           models/hydrologic_graph_v9_assimilated.py
@@ -44,6 +45,7 @@ jobs:
         run: >-
           pytest -q
           tests/test_v10_q_only_rating_stage.py
+          tests/test_v10_q_supervised_view.py
           tests/test_v10_rating_fit.py
           tests/test_hydrologic_graph_v9.py
           tests/test_v9_active_assimilation.py
