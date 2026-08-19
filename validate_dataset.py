@@ -1,4 +1,4 @@
-"""Read-only preflight validation for formal Hunan V10/V9/V8 datasets."""
+"""Read-only preflight validation for formal Hunan V11/V10/V9/V8 datasets."""
 from __future__ import annotations
 
 import argparse
@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any
 
 from datasets.hydrologic_graph_v10 import HydrologicGraphV10Dataset
+from scripts.v11_preflight import validate_v11_dataset
+from scripts.v11_training import is_v11_requested
 from scripts.v10_training import (
     is_v10_requested,
     setup_v10_evaluation,
@@ -287,7 +289,13 @@ def validate_dataset(
     qc_output_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     if qc_output_dir is not None:
-        raise ValueError("V10/V9/V8使用冻结hydrologic-graph QC，不写legacy qc_output_dir")
+        raise ValueError("V11/V10/V9/V8使用正式hydrologic-graph QC，不写legacy qc_output_dir")
+    if is_v11_requested(config_path, dataset_root):
+        return validate_v11_dataset(
+            str(config_path),
+            dataset_root=str(dataset_root) if dataset_root is not None else None,
+            graph_id=graph_id,
+        )
     if is_v10_requested(config_path, dataset_root):
         version = "v10"
     elif is_v9_requested(config_path, dataset_root):
@@ -295,7 +303,7 @@ def validate_dataset(
     elif is_v8_requested(config_path, dataset_root):
         version = "v8"
     else:
-        raise ValueError("正式preflight只保留V10/V9/V8；legacy/P2/P3已退役")
+        raise ValueError("正式preflight只保留V11/V10/V9/V8；legacy/P2/P3已退役")
     return _validate_hydrologic_graph_dataset(
         config_path, dataset_root=dataset_root, graph_id=graph_id, version=version
     )
@@ -304,12 +312,12 @@ def validate_dataset(
 def main() -> None:
     root = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(
-        description="只读校验湖南正式V10/V9/V8 model dataset；默认V10"
+        description="只读校验湖南正式V11/V10/V9/V8 model dataset；默认V11"
     )
     parser.add_argument(
-        "--config", default=str(root / "configs" / "hunan_e4_v10.yaml")
+        "--config", default=str(root / "configs" / "hunan_e4_v11.yaml")
     )
-    parser.add_argument("--dataset-root", help="覆盖冻结model dataset根目录")
+    parser.add_argument("--dataset-root", help="覆盖正式model dataset根目录")
     parser.add_argument("--graph-id", help="可选：只校验一个GRAPH_ID")
     parser.add_argument("--output", help="可选JSON报告路径")
     args = parser.parse_args()
