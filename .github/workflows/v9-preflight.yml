@@ -65,6 +65,7 @@ jobs:
           pytest -q
           tests/test_v11_model_and_loss.py
           tests/test_v11_event_balanced_sampling.py
+          tests/test_v11_builder_helpers.py
           tests/test_v10_q_only_rating_stage.py
           tests/test_v10_no_future_z_leakage.py
           tests/test_v10_q_supervised_view.py
