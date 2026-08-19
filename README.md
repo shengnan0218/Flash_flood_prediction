@@ -1,154 +1,195 @@
-# Flash Flood Prediction — Hunan Formal V10 / V9 / V8
+# Flash Flood Prediction — Hunan Formal V11 / V10 / V9 / V8
 
-本仓库当前正式数据事实层为冻结的 **V8 hydrologic computational graph dataset**：
+当前默认正式模型为 **V11**。V8、V9、V10 的模型、配置和运行路径继续保留，用于严格复现和对照；P2、P3 以及更早的专用实验路径已经退役。
+
+## 1. V11 为什么存在
+
+V10 的只读泛化审计显示：总体 Q 指标较好，但 TRAIN→VALIDATION 的动态响应泛化明显下降；尤其 `Delta-Q` 和相对 Q0 persistence 的增益明显弱于 TRAIN。同时，原 `q_peak_loss` 实际约束的是每个滑动 6 h window 的局部最大值，并不等同于真正洪水事件洪峰。
+
+V11 因此**不改 V10 的可训练模型架构**，只针对状态暴露、TRAIN sampling 和 loss 定义做三项有明确物理/统计含义的修改。
+
+## 2. V11 正式设计
+
+配置：
+
+```text
+configs/hunan_e4_v11.yaml
+```
+
+主流程：
+
+```text
+72 h antecedent rainfall
+        ↓
+water-balance LSTM runoff + optimized kinematic-wave routing warm-up
+        ↓
+last 24 h Q/Z observation context only
+        ↓
+forecast-origin mass-aware state assimilation
+        ↓
+1–6 h Q forecast                    ← 唯一学习/监督目标
+        ↓
+TRAIN-only station rating curve
+        ↓
+Q-derived stage + final-history-bin Z anchor
+```
+
+关键约束：
+
+- rainfall physical warm-up 从 24 h 扩为 **72 h**，用于恢复更长的前期湿润/蓄水状态；
+- Q/Z observation encoder **严格仍为 24 h**，不能因为扩展 rainfall history 而同时扩到 72 h，以免强化站点历史/persistence shortcut；
+- runoff、optimized kinematic-wave routing、V10 mass-aware forecast-origin assimilation、Q-only forecast 和 rating-derived Z 架构保持不变；
+- future Z 不进入 loss，不参与 checkpoint selection，也没有梯度回传到 Q；
+- `Q0_analysis` 与 `Z0_observed` 仍遵守最后一个 history hourly bin 的 V10 语义，不伪称为精确 bin-end 瞬时观测；
+- rating curve 仍只由 TRAIN 中唯一物理时刻 Q/Z 拟合；
+- TEST 最终评价仍保留完整冻结 split，不因为 Q-only 训练过滤掉可评价 derived stage 的样本。
+
+## 3. V11 数据层：从冻结 V8 派生，不改 V8
+
+冻结 V8 数据事实层继续保留：
 
 ```text
 _model_dataset_v8_hydrologic_graph/
 ```
 
-正式训练、评价和 preflight 入口只支持 **V10、V9、V8**。P2、P3 以及 V8 之前的实验配置和专用运行路径已经退役，不再作为正式工作流。
-
-## 1. 当前正式版本
-
-### V10 — 默认正式模型
-
-配置：
+V11 新建独立派生数据集：
 
 ```text
-configs/hunan_e4_v10.yaml
+_model_dataset_v11_72h_event_balanced/
 ```
 
-V10 的职责划分是：
+构建脚本：
 
 ```text
-24 h rainfall/history
-        ↓
-water-balance LSTM runoff
-        ↓
-optimized kinematic-wave routing
-        ↓
-1–6 h Q forecast                 ← 唯一学习/监督目标
-        ↓
-TRAIN-only station rating curve
-        ↓
-Q-derived stage
-        ↓
-final-history-bin Z residual anchoring
+scripts/20_build_hydrologic_graph_model_dataset_v11.py
 ```
 
-关键约束：
+V11 **严格继承 V8 的 33 graphs、2,807 events、279,574 SAMPLE_ID、EVENT_ID、SPLIT 和 FORECAST_TIME**。Q/Z、静态属性、拓扑和未来 6 h target 均继承冻结 V8；只重新从 authoritative computational-unit rainfall source 构造 72 h antecedent rainfall tensor。
 
-- 主模型只学习未来 **Q**；没有独立 neural Z head。
-- future Z 不进入 loss，不参与 checkpoint selection，也没有梯度回传到 Q 模型。
-- 保留 V9 的 24 h sequential warm-up、质量守恒的状态订正和优化后的 kinematic-wave routing。
-- 历史 Q/Z 仍可作为起报状态同化输入；“不用 Z 做未来监督”不等于“丢弃历史 Z 状态信息”。
-- station-specific rating curve 只由冻结数据 **TRAIN** 中唯一物理目标时刻的同时有效 Q/Z 拟合：`Z = aQ + b`。
-- 水位输出为：
+构建命令示例：
+
+```bash
+python scripts/20_build_hydrologic_graph_model_dataset_v11.py \
+  --v8-dataset _model_dataset_v8_hydrologic_graph \
+  --hydrologic-graph _hydrologic_graph_v1 \
+  --output-dir _model_dataset_v11_72h_event_balanced
+```
+
+如果 hydrologic-graph rainfall 源不在默认路径，必须显式给出 `--hydrologic-graph`。
+
+**不能对 V8 最早样本之前缺少的 48 h rainfall 静默补 0。** Builder 会逐 node 检查 authoritative rainfall valid period；如果无法覆盖某个 V8 origin 所需的完整 72 h antecedent period，直接失败。它还会重新计算未来 6 h rainfall，并与冻结 V8 future-rain tensor 做 `1e-6` 数值一致性校验，防止时间轴错位。
+
+## 4. Event-balanced TRAIN
+
+V11 不再 exhaustive 地把所有逐小时 sliding forecast origins 都送入每个 epoch。
+
+TRAIN 的基本平衡单位是 **EVENT_ID**：
 
 ```text
-Delta-Z_hat = f_station(Q_future_hat) - f_station(Q0_analysis)
-Z_hat       = Z0_observed + Delta-Z_hat
+每个 event / epoch：最多 8 个不重复 forecast origins
+
+优先：
+2 × LOW
+2 × RISING
+2 × PEAK
+2 × RECESSION
 ```
 
-- `Q0_analysis` 优先使用最后一个 history 小时 bin 内保留的 Q 观测；缺测时使用 V9 状态同化后的物理/model Q0。
-- `Z0_observed` 必须来自最后一个 history 小时 bin；不向前搜索更早 Z，不使用未来 Z。
-- 冻结 V8 的小时标签表示 hourly bin。最后一个 Q0/Z0 是该 bin 内保留下来的代表观测，**不保证是 bin 末端的精确瞬时整点值**。
-- rating curve 不对超出 TRAIN Q 范围的预测做静默截断；最终评价会显式报告 rating extrapolation 比例。
+若某一 phase 候选不足，从该 event 尚未选择的其他有效 origins 补齐；event 总候选不足 8 时全部使用，不制造重复样本。
 
-### V9 — 保留可复现
+phase 标签只用于 TRAIN sampling。其定义基于该 event 的 outlet Q：
 
-保留：
+- `PEAK`：该 6 h target window 的 outlet max ≥ event outlet peak 的 80%；
+- `LOW`：window max ≤ event outlet Q 中位数；
+- 其余若 window 内 Q 上升则 `RISING`；否则 `RECESSION`。
+
+VALIDATION 不使用 event-balanced subsampling：model selection 仍评价完整的 Q-supervised VALIDATION view。TEST 使用完整冻结 TEST view。
+
+## 5. V11 loss
+
+V10 的 sliding-window maximum peak term 被正式删除。V11 loss：
 
 ```text
-configs/hunan_v9_base.yaml
-configs/hunan_e1_v9.yaml
-configs/hunan_e2_v9.yaml
-configs/hunan_e3_v9.yaml
-configs/hunan_e4_v9.yaml
+q_point_weight     = 1.0
+q_high_flow_weight = 0.25
+q_volume_weight    = 0.25
 ```
 
-V9 的模型、loss、trainer、评价和测试均保留，用于完整复现实验和与 V10 对照。
+`q_point` 继续使用 TRAIN-only per-station Q scale 的 Huber error。
 
-### V8 — 保留可复现
-
-保留原 E1–E4 配置：
+`q_high_flow` 使用每站只从 TRAIN、按 `(STATION_ID, physical target hour)` 去重后计算的 P80/P99：
 
 ```text
-configs/hunan_e1_pure_ai.yaml
-configs/hunan_e2_physics_runoff.yaml
-configs/hunan_e3_physics_routing.yaml
-configs/hunan_e4.yaml
+Q < P80     : 不进入额外 high-flow term
+P80→P99     : multiplier 从 1 平滑增加到 3
+Q >= P99    : multiplier = 3
 ```
 
-V8 的冻结 dataset contract、loader、模型和评价逻辑不由 V10 重建或覆盖。
+它直接加强真正高流量物理时刻，而不是把任意 6 h window 的局部 maximum 当成一次洪峰。
 
-## 2. V10 数据边界
+`q_volume` 保留 V10 的 6 h duration-normalized mean-Q / volume bias 定义。
 
-V10 **不重建 V8 数据集**，只在 loader 层建立只读任务视图。
+所有 Q normalization、P80/P99 threshold 和 rating calibration 都严格 TRAIN-only。
 
-冻结 V8 sample 可因 Q 或 Z 任一任务有效而存在。因为 V10 是 Q-only：
+## 6. V11 evaluation
 
-- TRAIN：只保留冻结 `sample_index.csv` 中 `Q_TARGET_VALID_COUNT > 0` 的样本进入学习；
-- VALIDATION：同样只保留有 Q target 的样本用于 Q-only model selection；
-- TEST 最终评价：保留完整冻结 TEST split，Q 和 derived stage 各自使用自己的 truth mask。
+正式 V11 evaluation 保留 V10 的：
 
-这不是重新划分数据：EVENT_ID、SPLIT、FORECAST_TIME、tensor row、graph topology 和观测值全部沿用冻结 V8；preflight 会同时报告 frozen sample count、active Q-supervised count 和被任务视图排除的数量。
+- pooled / station / outlet / graph Q metrics；
+- derived `Delta-Z` 和 anchored absolute Z；
+- rating extrapolation；
+- event × station 和 lead-time metrics。
 
-## 3. TRAIN-only rating curve
-
-V10 在启动时从冻结 dataset root 读取 TRAIN，并按：
+此外增加两类真正用于泛化判断的指标：
 
 ```text
-(STATION_ID, physical target unix hour)
+1–6 h Q0 persistence baseline
+skill over persistence
+Delta-Q NSE/RMSE
 ```
 
-去重重叠 forecast windows。若同一物理时刻的重复 Q/Z 值冲突，直接失败，不静默选取。
-
-rating curve 拟合本身不要求 Q0，因为它估计的是站点 Q–Z 关系，而不是 forecast-origin availability。正式配置要求所有 outlet station 都有足够的 TRAIN-only Q/Z 配对；否则 preflight 失败。
-
-rating 参数是 model buffer，不是 trainable parameter。checkpoint 绑定 rating artifact SHA；评价时如果 dataset/rating artifact 已变化会拒绝加载为同一实验。
-
-## 4. 时间和 forcing 语义
-
-当前湖南冻结数据：
+以及按固定提前量重建事件过程的：
 
 ```text
-history duration: 24 h
-forecast duration: 6 h
-forcing step:      1 h
-target step:       1 h
-future rainfall:   observed_hindcast
+fixed-lead event peak magnitude
+peak ratio / relative error
+peak timing error
+fixed-lead event NSE
 ```
 
-降雨时间戳表示 `[start, end)` 小时区间起点。hydro 小时标签是 hourly bin 标签；当前冻结处理保留 bin 内代表观测。forecast origin 是最后一个 history bin 的结束边界；没有对整个 Q/Z tensor 做额外 1 h shift。
+因此 V11 不再用训练中的 window-max loss 代替真正 event-peak forecast skill。
 
-`observed_hindcast` 是当前湖南实验的既定 forcing 条件，不应解释为业务上已知未来降雨。未来业务预测需另行接入降雨预报 forcing，并作为新的实验条件报告。
+## 7. V11 preflight
 
-## 5. V10 loss 与训练
+数据构建完成后，训练前必须先运行：
 
-V10 只包含：
-
-```text
-q_point_weight  = 1.0
-q_peak_weight   = 0.25
-q_volume_weight = 0.25
+```bash
+python validate_dataset.py --output outputs/hunan_e4_v11_preflight.json
 ```
 
-Q 误差使用 TRAIN-only per-station Q scale。没有 Z level、Z slope、Q–Z consistency 或其他 future-Z loss。
+preflight 会同时验证：
 
-正式配置：
+- 72 h rainfall tensor / 24 h Q-Z history / 6 h forecast；
+- antecedent rainfall 无 valid-period 外 zero padding；
+- TRAIN/VALIDATION/TEST event 无泄漏；
+- Q-only TRAIN/VALIDATION view 与完整 frozen split 的关系；
+- 实际 epoch-0 event-balanced sampling 无重复、每 event ≤8、batch 不跨 graph；
+- phase contract；
+- P80/P99 threshold 的 TRAIN-only unique-physical-hour provenance 与 outlet coverage；
+- rating 的 TRAIN-only provenance；
+- 没有独立 neural Z head，rating 不是 trainable parameter；
+- 没有残留 window `q_peak_loss`；
+- 最终 TEST view 不被 Q-supervision filter 缩减。
 
-```text
-batch_size: 16
-epochs: 100
-early_stopping: false
-optimizer: AdamW
-lr: 0.001
+只有最终：
+
+```json
+"status": "VALID"
 ```
 
-checkpoint selection 固定为 **Q-only validation loss**。
+才启动正式训练。
 
-## 6. 运行顺序
+## 8. 正式训练与评价
 
 服务器同步：
 
@@ -158,92 +199,58 @@ git fetch origin
 git reset --hard origin/main
 ```
 
-训练前必须先做只读 preflight：
+启动 V11：
 
 ```bash
-python validate_dataset.py --output outputs/hunan_e4_v10_preflight.json
-```
-
-只有报告最后为：
-
-```json
-"status": "VALID"
-```
-
-才进入正式训练。
-
-启动 V10：
-
-```bash
-nohup python train_hunan.py > hunan_e4_v10_train.log 2>&1 &
-```
-
-查看训练：
-
-```bash
-ps -eo pid,etime,%cpu,%mem,cmd | grep "python train_hunan.py" | grep -v grep
-tail -f hunan_e4_v10_train.log
+nohup python -u train_hunan.py \
+  --config configs/hunan_e4_v11.yaml \
+  > hunan_e4_v11_train.log 2>&1 &
 ```
 
 默认输出：
 
 ```text
-outputs/hunan_e4_v10_best.pt
-outputs/hunan_e4_v10_final.pt
-outputs/hunan_e4_v10_train.csv
+outputs/hunan_e4_v11_best.pt
+outputs/hunan_e4_v11_final.pt
+outputs/hunan_e4_v11_train.csv
 ```
 
-最终 TEST：
+正式 VALIDATION/TEST：
 
 ```bash
-python evaluate.py --checkpoint outputs/hunan_e4_v10_best.pt --split TEST
+python evaluate.py \
+  --config configs/hunan_e4_v11.yaml \
+  --checkpoint outputs/hunan_e4_v11_best.pt \
+  --split VALIDATION
 ```
 
-V10 final evaluation 输出至少包括：
+模型方案确定前优先使用 VALIDATION；TEST 保留为最终报告。
 
-- global Q metrics；
-- station Q / derived-stage metrics；
-- graph metrics；
-- event × station metrics；
-- 1–6 h lead-time metrics；
-- corrected-stage coverage；
-- TRAIN rating range extrapolation audit；
-- rating artifact / evaluation-view audit。
+## 9. V10 / V9 / V8 保留复现
 
-## 7. V8 / V9 复现
+V10：
 
-V8/V9 不再是默认入口，但可以通过显式 `--config` 复现：
-
-```bash
-python train_hunan.py --config configs/hunan_e4_v9.yaml
-python train_hunan.py --config configs/hunan_e4.yaml
+```text
+configs/hunan_e4_v10.yaml
 ```
 
-对应评价也显式提供相同 config：
+V9：
 
-```bash
-python evaluate.py --config configs/hunan_e4_v9.yaml --checkpoint <checkpoint> --split TEST
+```text
+configs/hunan_v9_base.yaml
+configs/hunan_e1_v9.yaml
+configs/hunan_e2_v9.yaml
+configs/hunan_e3_v9.yaml
+configs/hunan_e4_v9.yaml
 ```
 
-V10 的新增代码不得反向修改 V8/V9 模型架构、loss 或配置语义。
+V8：
 
-## 8. 代码审计门禁
+```text
+configs/hunan_e1_pure_ai.yaml
+configs/hunan_e2_physics_runoff.yaml
+configs/hunan_e3_physics_routing.yaml
+configs/hunan_e4.yaml
+```
 
-正式合并前 CI 同时检查：
-
-- V10 config contract；
-- TRAIN-only rating calibration 与 overlap dedup；
-- Q-supervised read-only dataset view；
-- V10 state_dict 中不存在 independent Z head；
-- rating curve 不可训练；
-- derived stage 已从 autograd detach；
-- rating intercept 对 corrected Delta-Z 不产生影响；
-- 缺 Z0 时不向前搜索；
-- 缺 observed Q0 时使用 model/assimilated Q0；
-- negative Q fail-fast；
-- Q-only loss 不受任何 Z 输出影响；
-- V9 state assimilation tests；
-- optimized kinematic-wave 与原 solver 的输出/梯度等价性；
-- V8/V9 相关正式测试继续通过。
-
-如果 real-data preflight、checkpoint compatibility 或任何物理/时间契约不一致，程序应失败，而不是回退、填补或静默修正。
+显式 `--config` 仍可复现这些版本；V11 不修改其模型、loss、trainer、dataset contract 或配置本体。
