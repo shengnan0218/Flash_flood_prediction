@@ -1,4 +1,4 @@
-"""Formal training/evaluation setup for v10 Q-only hydrologic forecasting."""
+"""Formal training/evaluation setup for V10 Q-only hydrologic forecasting."""
 from __future__ import annotations
 
 import math
@@ -6,7 +6,8 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from data.device import resolve_device, seed_everything
-from datasets.hydrologic_graph_v8 import HydrologicGraphV8Dataset, build_hydrologic_graph_v8_loader
+from datasets.hydrologic_graph_v8 import build_hydrologic_graph_v8_loader
+from datasets.hydrologic_graph_v10 import HydrologicGraphV10Dataset
 from models.hydrologic_graph_v10 import HydrologicGraphV10Model
 from scripts.v10_rating import fit_train_only_linear_ratings
 from scripts.v8_training import (
@@ -67,9 +68,12 @@ def _runtime_config(
         value = cfg["training"].get(key)
         if value is not None:
             cfg["training"][key] = str(_resolve_root(value))
-    forcing_step = float(cfg.get("temporal", {}).get("forcing_step_seconds", float("nan")))
+    forcing_step = float(
+        cfg.get("temporal", {}).get("forcing_step_seconds", float("nan"))
+    )
     if not math.isfinite(forcing_step) or forcing_step <= 0:
         raise ValueError("v10 temporal.forcing_step_seconds必须>0")
+    # One source of truth: the physical routing solver step follows temporal forcing.
     cfg.setdefault("solver", {})["seconds_per_step"] = forcing_step
     _validate_v10_config(cfg)
     return cfg
@@ -87,7 +91,7 @@ def _validate_v10_config(cfg: dict[str, Any]) -> None:
         "use_observation_masks": True,
         "future_rainfall_mode": "observed_hindcast",
     }
-    wrong_data = {k: data.get(k) for k, v in expected_data.items() if data.get(k) != v}
+    wrong_data = {key: data.get(key) for key, value in expected_data.items() if data.get(key) != value}
     if wrong_data:
         raise ValueError(f"v10 data contract不一致: {wrong_data}")
 
@@ -107,8 +111,10 @@ def _validate_v10_config(cfg: dict[str, Any]) -> None:
     target_steps = forecast_duration // target_step
     if (history_steps, internal_steps, target_steps) != (24, 6, 6):
         raise ValueError("当前冻结Hunan v8 tensor只支持24 h warm-up和6 h forecast")
-    if int(cfg.get("history_length", -1)) != history_steps or int(cfg.get("forecast_horizon", -1)) != target_steps:
-        raise ValueError("v10 history_length/forecast_horizon与physical temporal contract不一致")
+    if int(cfg.get("history_length", -1)) != history_steps:
+        raise ValueError("v10 history_length与physical temporal contract不一致")
+    if int(cfg.get("forecast_horizon", -1)) != target_steps:
+        raise ValueError("v10 forecast_horizon与physical temporal contract不一致")
     for key, expected in V10_TIME_SEMANTICS.items():
         if temporal.get(key) != expected:
             raise ValueError(f"v10 temporal.{key}必须为{expected!r}")
@@ -119,6 +125,7 @@ def _validate_v10_config(cfg: dict[str, Any]) -> None:
         raise ValueError("正式E4 v10固定water_balance_lstm runoff")
     if cfg.get("routing_mode") != "kinematic_wave_gnn":
         raise ValueError("正式E4 v10固定kinematic_wave_gnn routing")
+
     state = cfg.get("state_initialization", {})
     if state.get("enabled") is not True or state.get("mode") != "sequential_warmup":
         raise ValueError("v10必须sequential_warmup")
@@ -135,7 +142,9 @@ def _validate_v10_config(cfg: dict[str, Any]) -> None:
         "additive_storage_from_q_residual": True,
     }
     wrong_correction = {
-        k: correction.get(k) for k, v in expected_correction.items() if correction.get(k) != v
+        key: correction.get(key)
+        for key, value in expected_correction.items()
+        if correction.get(key) != value
     }
     if wrong_correction:
         raise ValueError(f"v10 state assimilation不一致: {wrong_correction}")
@@ -156,17 +165,25 @@ def _validate_v10_config(cfg: dict[str, Any]) -> None:
         "z0_source": "exact_forecast_origin_observation_only",
         "allow_backward_z_search": False,
     }
-    wrong_stage = {k: stage.get(k) for k, v in expected_stage.items() if stage.get(k) != v}
+    wrong_stage = {
+        key: stage.get(key)
+        for key, value in expected_stage.items()
+        if stage.get(key) != value
+    }
     if wrong_stage:
         raise ValueError(f"v10 stage_output不一致: {wrong_stage}")
     if int(stage.get("min_unique_train_pairs", 0)) < 2:
         raise ValueError("v10 stage_output.min_unique_train_pairs必须>=2")
     if "z_head" in cfg:
-        raise ValueError("v10配置不得包含独立z_head")
+        raise ValueError("v10正式配置不得包含独立z_head")
 
     loss = cfg.get("loss", {})
     expected_loss = {"mode": "q_only", "q_scale_mode": "per_station"}
-    wrong_loss = {k: loss.get(k) for k, v in expected_loss.items() if loss.get(k) != v}
+    wrong_loss = {
+        key: loss.get(key)
+        for key, value in expected_loss.items()
+        if loss.get(key) != value
+    }
     if wrong_loss:
         raise ValueError(f"v10 loss contract不一致: {wrong_loss}")
     for key, expected in {
@@ -176,12 +193,16 @@ def _validate_v10_config(cfg: dict[str, Any]) -> None:
     }.items():
         if not math.isclose(float(loss.get(key, float("nan"))), expected):
             raise ValueError(f"v10 loss.{key}必须为{expected}")
-    floor = float(loss.get("q_scale_floor_m3s", float("nan")))
-    if not math.isfinite(floor) or floor <= 0:
+    q_floor = float(loss.get("q_scale_floor_m3s", float("nan")))
+    if not math.isfinite(q_floor) or q_floor <= 0:
         raise ValueError("v10 q_scale_floor_m3s必须>0")
     forbidden_z_loss = {
-        "water_level_weight", "z_level_weight", "z_slope_weight",
-        "z_target_mode", "delta_z_scale_mode", "delta_z_scale_floor_m",
+        "water_level_weight",
+        "z_level_weight",
+        "z_slope_weight",
+        "z_target_mode",
+        "delta_z_scale_mode",
+        "delta_z_scale_floor_m",
         "qz_consistency_weight",
     }
     present = sorted(forbidden_z_loss & set(loss))
@@ -191,7 +212,7 @@ def _validate_v10_config(cfg: dict[str, Any]) -> None:
     if cfg.get("validation_selection", {}).get("mode") != "val_loss":
         raise ValueError("v10 checkpoint selection固定Q-only val_loss")
     if bool(cfg.get("train_sampling", {}).get("enabled", False)):
-        raise ValueError("v10固定full-pass TRAIN")
+        raise ValueError("v10固定full-pass Q-supervised TRAIN")
     if bool(cfg.get("hyperparameter_optimization", {}).get("enabled", False)):
         raise ValueError("v10正式训练禁止同时HPO")
     training = cfg.get("training", {})
@@ -203,7 +224,9 @@ def _validate_v10_config(cfg: dict[str, Any]) -> None:
         raise ValueError("v10 batch_size/hidden_dim必须>0")
 
 
-def _validate_dataset_time_contract(cfg: dict[str, Any], dataset: HydrologicGraphV8Dataset) -> None:
+def _validate_dataset_time_contract(
+    cfg: dict[str, Any], dataset: HydrologicGraphV10Dataset
+) -> None:
     declared = dataset.contract.get("timestamp_semantics")
     if isinstance(declared, Mapping):
         wrong = {
@@ -218,19 +241,24 @@ def _validate_dataset_time_contract(cfg: dict[str, Any], dataset: HydrologicGrap
         "dataset_declared": isinstance(declared, Mapping),
         "whole_hour_tensor_shift": False,
         "interpretation": (
-            "rain/hydro labels are hourly bins; forecast origin is end of final history bin; "
-            "targets advance by target_step_seconds"
+            "rain/hydro labels are hourly bins; forecast origin is end of final "
+            "history bin; targets advance by target_step_seconds"
         ),
     }
 
 
-def _finalize_v10_runtime(cfg: dict[str, Any], dataset: HydrologicGraphV8Dataset) -> None:
+def _finalize_v10_runtime(
+    cfg: dict[str, Any], dataset: HydrologicGraphV10Dataset
+) -> None:
+    # _attach_runtime reads only the frozen dataset contract/normalization and
+    # global station catalogue.  Filtering the sample-frame view therefore does
+    # not recompute or contaminate any TRAIN-only statistics.
     _attach_runtime(cfg, dataset)
     _validate_dataset_time_contract(cfg, dataset)
     runtime = cfg["_runtime"]
     q_floor = float(cfg["loss"]["q_scale_floor_m3s"])
-    raw_q = [float(v) for v in runtime["v8_normalization"]["q_target_scale"]]
-    applied_q = [max(v, q_floor) for v in raw_q]
+    raw_q = [float(value) for value in runtime["v8_normalization"]["q_target_scale"]]
+    applied_q = [max(value, q_floor) for value in raw_q]
     runtime["v8_normalization"]["q_target_scale"] = applied_q
     runtime["target_scale_audit"] = {
         "computed_from_split": "TRAIN",
@@ -238,27 +266,44 @@ def _finalize_v10_runtime(cfg: dict[str, Any], dataset: HydrologicGraphV8Dataset
         "q_scale_floor_m3s": q_floor,
         "stations": {
             station: {
-                "raw_scale_m3s": raw_q[i],
-                "applied_scale_m3s": applied_q[i],
-                "floor_applied": raw_q[i] < q_floor,
+                "raw_scale_m3s": raw_q[index],
+                "applied_scale_m3s": applied_q[index],
+                "floor_applied": raw_q[index] < q_floor,
             }
-            for i, station in enumerate(runtime["v8_station_ids"])
+            for index, station in enumerate(runtime["v8_station_ids"])
         },
     }
+    # Rating calibration deliberately scans the authoritative frozen root and
+    # TRAIN split, not the Q-supervised learning view.  Q0 is not a fit criterion.
     runtime["v10_rating_curves"] = fit_train_only_linear_ratings(
         cfg["data"]["dataset_root"],
         tuple(runtime["v8_station_ids"]),
         min_unique_pairs=int(cfg["stage_output"]["min_unique_train_pairs"]),
-        require_all_outlet_stations=bool(cfg["stage_output"]["require_all_outlet_stations"]),
+        require_all_outlet_stations=bool(
+            cfg["stage_output"]["require_all_outlet_stations"]
+        ),
     )
     runtime["model_version"] = "v10"
     runtime["supervised_target"] = "Q_ONLY"
     runtime["stage_prediction"] = {
         "learned_head": False,
-        "method": "station TRAIN-only linear rating + forecast-origin Z residual correction",
+        "method": (
+            "station TRAIN-only linear rating + forecast-origin Z residual correction"
+        ),
         "future_z_used": False,
     }
     runtime["temporal"] = dict(cfg["temporal"])
+
+
+def _view_audit(dataset: HydrologicGraphV10Dataset) -> dict[str, Any]:
+    return {
+        "split": dataset.split,
+        "require_q_supervision": dataset.require_q_supervision,
+        "frozen_sample_count": dataset.frozen_sample_count_before_q_filter,
+        "active_sample_count": len(dataset),
+        "q_supervised_sample_count": dataset.q_supervised_sample_count,
+        "q_filter_removed_count": dataset.q_filter_removed_count,
+    }
 
 
 def setup_v10_training(
@@ -271,26 +316,44 @@ def setup_v10_training(
     seed_everything(int(cfg["seed"]))
     root = cfg["data"]["dataset_root"]
     tensor_cache: dict[str, dict[str, Any]] = {}
-    train_dataset = HydrologicGraphV8Dataset(
-        root, cfg["data"]["train_split"], graph_id=cfg["data"].get("graph_id"),
+    train_dataset = HydrologicGraphV10Dataset(
+        root,
+        cfg["data"]["train_split"],
+        graph_id=cfg["data"].get("graph_id"),
         future_rainfall_mode=cfg["data"]["future_rainfall_mode"],
-        strict=cfg["data"]["strict_validation"], tensor_cache=tensor_cache,
+        strict=cfg["data"]["strict_validation"],
+        tensor_cache=tensor_cache,
+        require_q_supervision=True,
     )
-    validation_dataset = HydrologicGraphV8Dataset(
-        root, cfg["data"]["validation_split"], graph_id=cfg["data"].get("graph_id"),
+    validation_dataset = HydrologicGraphV10Dataset(
+        root,
+        cfg["data"]["validation_split"],
+        graph_id=cfg["data"].get("graph_id"),
         future_rainfall_mode=cfg["data"]["future_rainfall_mode"],
-        strict=cfg["data"]["strict_validation"], tensor_cache=tensor_cache,
+        strict=cfg["data"]["strict_validation"],
+        tensor_cache=tensor_cache,
+        require_q_supervision=True,
     )
     _ensure_split_compatibility(train_dataset, validation_dataset)
     _finalize_v10_runtime(cfg, train_dataset)
+    cfg["_runtime"]["q_supervision_views"] = {
+        "train": _view_audit(train_dataset),
+        "validation": _view_audit(validation_dataset),
+    }
     train_loader = build_hydrologic_graph_v8_loader(
-        train_dataset, batch_size=int(cfg["batch_size"]), shuffle=True,
-        num_workers=int(cfg["num_workers"]), pin_memory=bool(cfg["pin_memory"]),
+        train_dataset,
+        batch_size=int(cfg["batch_size"]),
+        shuffle=True,
+        num_workers=int(cfg["num_workers"]),
+        pin_memory=bool(cfg["pin_memory"]),
         seed=int(cfg["seed"]) + _SPLIT_SEED_OFFSET["TRAIN"],
     )
     validation_loader = build_hydrologic_graph_v8_loader(
-        validation_dataset, batch_size=int(cfg["batch_size"]), shuffle=False,
-        num_workers=int(cfg["num_workers"]), pin_memory=bool(cfg["pin_memory"]),
+        validation_dataset,
+        batch_size=int(cfg["batch_size"]),
+        shuffle=False,
+        num_workers=int(cfg["num_workers"]),
+        pin_memory=bool(cfg["pin_memory"]),
         seed=int(cfg["seed"]) + _SPLIT_SEED_OFFSET["VALIDATION"],
     )
     model = HydrologicGraphV10Model(cfg)
@@ -310,15 +373,25 @@ def setup_v10_evaluation(
         raise ValueError("v10 evaluation split必须为VALIDATION/TEST")
     cfg = _runtime_config(config_path, dataset_root=dataset_root, graph_id=graph_id)
     seed_everything(int(cfg["seed"]))
-    dataset = HydrologicGraphV8Dataset(
-        cfg["data"]["dataset_root"], split, graph_id=cfg["data"].get("graph_id"),
+    # Final evaluation deliberately keeps the complete frozen split.  This
+    # permits derived-stage evaluation on Z-valid windows even when Q truth is
+    # absent; Q metrics still use their own independent target mask.
+    dataset = HydrologicGraphV10Dataset(
+        cfg["data"]["dataset_root"],
+        split,
+        graph_id=cfg["data"].get("graph_id"),
         future_rainfall_mode=cfg["data"]["future_rainfall_mode"],
         strict=cfg["data"]["strict_validation"],
+        require_q_supervision=False,
     )
     _finalize_v10_runtime(cfg, dataset)
+    cfg["_runtime"]["evaluation_view"] = _view_audit(dataset)
     loader = build_hydrologic_graph_v8_loader(
-        dataset, batch_size=int(cfg["batch_size"]), shuffle=False,
-        num_workers=int(cfg["num_workers"]), pin_memory=bool(cfg["pin_memory"]),
+        dataset,
+        batch_size=int(cfg["batch_size"]),
+        shuffle=False,
+        num_workers=int(cfg["num_workers"]),
+        pin_memory=bool(cfg["pin_memory"]),
         seed=int(cfg["seed"]) + _SPLIT_SEED_OFFSET[split],
     )
     model = HydrologicGraphV10Model(cfg)
@@ -333,19 +406,28 @@ def validate_v10_checkpoint_config(
     if not isinstance(saved, Mapping):
         raise ValueError("v10 checkpoint缺少训练config")
     for key in (
-        "model_version", "runoff_mode", "routing_mode", "history_length",
-        "forecast_horizon", "node_static_dim", "edge_static_dim", "hidden_dim",
-        "temporal", "warmup", "state_initialization", "state_correction",
-        "stage_output", "solver", "physical_bounds", "loss",
+        "model_version",
+        "runoff_mode",
+        "routing_mode",
+        "history_length",
+        "forecast_horizon",
+        "node_static_dim",
+        "edge_static_dim",
+        "hidden_dim",
+        "temporal",
+        "warmup",
+        "state_initialization",
+        "state_correction",
+        "stage_output",
+        "solver",
+        "physical_bounds",
+        "loss",
     ):
         if saved.get(key) != cfg.get(key):
             raise ValueError(f"checkpoint与当前v10配置不兼容: {key}")
     saved_runtime = saved.get("_runtime", {})
     current_runtime = cfg.get("_runtime", {})
-    for label, key in (
-        ("dataset", "data_contract"),
-        ("rating", "v10_rating_curves"),
-    ):
+    for label, key in (("dataset", "data_contract"), ("rating", "v10_rating_curves")):
         old = saved_runtime.get(key, {})
         new = current_runtime.get(key, {})
         if old.get("artifact_sha256") != new.get("artifact_sha256"):
@@ -356,7 +438,9 @@ def validate_v10_checkpoint_config(
         raise ValueError("resume要求v10 data.graph_id完全一致")
 
 
-def extract_v10_transferable_state_dict(checkpoint: Mapping[str, Any]) -> dict[str, Any]:
+def extract_v10_transferable_state_dict(
+    checkpoint: Mapping[str, Any],
+) -> dict[str, Any]:
     """Exclude all Hunan station-specific normalization/rating/embedding state."""
     state = checkpoint.get("model") if isinstance(checkpoint, Mapping) else None
     if not isinstance(state, Mapping):
