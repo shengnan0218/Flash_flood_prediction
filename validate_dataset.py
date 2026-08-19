@@ -55,8 +55,8 @@ def _validate_hydrologic_graph_dataset(
     train_dataset = train_loader.dataset
     validation_dataset = validation_loader.dataset
 
-    # Materialise Q-supervised probes now, before releasing the shared TRAIN NPZ
-    # cache.  This avoids a second full setup/rating scan later in preflight.
+    # Materialise probes now, before releasing the shared TRAIN NPZ cache.  For
+    # V10 they come from the Q-supervised learning view; V8/V9 remain unchanged.
     train_probe = next(iter(train_loader))
     validation_probe = next(iter(validation_loader))
 
@@ -261,7 +261,10 @@ def _validate_hydrologic_graph_dataset(
             raise ValueError(f"{label}: Q target mask shape错误")
         if probe.z_target_mask.shape != probe.z_target.shape:
             raise ValueError(f"{label}: Z evaluation target mask shape错误")
-    if not train_probe.q_target_mask.any() or not validation_probe.q_target_mask.any():
+    if version == "v10" and (
+        not train_probe.q_target_mask.any()
+        or not validation_probe.q_target_mask.any()
+    ):
         raise ValueError("v10 TRAIN/VALIDATION probe不应出现无Q监督batch")
 
     result["test"] = _dataset_summary(test_dataset)
