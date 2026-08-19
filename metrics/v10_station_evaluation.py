@@ -19,6 +19,8 @@ from metrics.v8_station_evaluation import (
     _hydrograph_fields,
     _json_safe,
     _load_station_metadata,
+    _macro_hydrograph,
+    _macro_regression,
     _merge,
     _normalise_id,
     _regression_fields,
@@ -79,6 +81,10 @@ def evaluate_v10_station_aware(
     graph_q = defaultdict(_empty_regression)
     graph_dz = defaultdict(_empty_regression)
     graph_z_abs = defaultdict(_empty_regression)
+    graph_outlet_q = defaultdict(_empty_regression)
+    graph_outlet_dz = defaultdict(_empty_regression)
+    graph_outlet_z_abs = defaultdict(_empty_regression)
+    graph_outlet_q_hydro = defaultdict(_empty_hydrograph)
 
     event_q = defaultdict(_empty_regression)
     event_dz = defaultdict(_empty_regression)
@@ -91,11 +97,18 @@ def evaluate_v10_station_aware(
     z_abs_global = _empty_regression()
     z_raw_global = _empty_regression()
     q_hydro_global = _empty_hydrograph()
+    outlet_q_global = _empty_regression()
+    outlet_dz_global = _empty_regression()
+    outlet_z_abs_global = _empty_regression()
+    outlet_q_hydro_global = _empty_hydrograph()
     extrapolation_global = _empty_extrapolation()
 
     lead_q = [_empty_regression() for _ in range(horizon)]
     lead_dz = [_empty_regression() for _ in range(horizon)]
     lead_z_abs = [_empty_regression() for _ in range(horizon)]
+    lead_outlet_q = [_empty_regression() for _ in range(horizon)]
+    lead_outlet_dz = [_empty_regression() for _ in range(horizon)]
+    lead_outlet_z_abs = [_empty_regression() for _ in range(horizon)]
 
     sample_total = 0
     stage_target_valid = 0
@@ -137,9 +150,21 @@ def evaluate_v10_station_aware(
         if any(_normalise_id(value) != graph_id for value in graph_ids):
             raise ValueError("v10 evaluation batch混入多个graph")
 
+        local_station_ids = tuple(_normalise_id(value) for value in batch.obs_station_ids)
+        outlet_station = outlet_by_graph[graph_id]
+        outlet_matches = [
+            index for index, station in enumerate(local_station_ids)
+            if station == outlet_station
+        ]
+        if len(outlet_matches) != 1:
+            raise ValueError(
+                f"{graph_id}: v10 evaluation必须唯一定位outlet={outlet_station}，"
+                f"实际matches={outlet_matches}"
+            )
+        outlet_index = outlet_matches[0]
+
         # Rating-domain diagnostics use predicted Q/Q0 rather than truth.  They
-        # do not clamp predictions or change stage outputs; they only expose
-        # when the TRAIN-only station curve is being extrapolated.
+        # never clamp or modify outputs; they only expose TRAIN-range extrapolation.
         local_station_index = batch.obs_station_index.detach().long().cpu()
         q_min = model.rating.q_min_m3s.detach().cpu()[local_station_index].numpy()
         q_max = model.rating.q_max_m3s.detach().cpu()[local_station_index].numpy()
@@ -159,21 +184,23 @@ def evaluate_v10_station_aware(
         origin_domain_mask = np.broadcast_to(
             rating_available_station[None, :], q0_analysis.shape
         )
-        batch_extrap = {
-            "raw_future_count": int(raw_domain_mask.sum()),
-            "raw_future_outside_train_q_range": int(
-                (raw_domain_mask & future_outside).sum()
-            ),
-            "corrected_future_count": int(corrected_domain_mask.sum()),
-            "corrected_future_outside_train_q_range": int(
-                (corrected_domain_mask & future_outside).sum()
-            ),
-            "origin_count": int(origin_domain_mask.sum()),
-            "origin_outside_train_q_range": int(
-                (origin_domain_mask & origin_outside).sum()
-            ),
-        }
-        _merge_extrapolation(extrapolation_global, batch_extrap)
+        _merge_extrapolation(
+            extrapolation_global,
+            {
+                "raw_future_count": int(raw_domain_mask.sum()),
+                "raw_future_outside_train_q_range": int(
+                    (raw_domain_mask & future_outside).sum()
+                ),
+                "corrected_future_count": int(corrected_domain_mask.sum()),
+                "corrected_future_outside_train_q_range": int(
+                    (corrected_domain_mask & future_outside).sum()
+                ),
+                "origin_count": int(origin_domain_mask.sum()),
+                "origin_outside_train_q_range": int(
+                    (origin_domain_mask & origin_outside).sum()
+                ),
+            },
+        )
 
         _merge(q_global, _array_sums(q_pred, q_true, q_mask))
         _merge(dz_global, _array_sums(dz_pred, dz_true, corrected_mask))
@@ -185,6 +212,29 @@ def evaluate_v10_station_aware(
         _merge(
             graph_z_abs[graph_id],
             _array_sums(z_abs_pred, z_abs_true, corrected_mask),
+        )
+
+        oq_pred = q_pred[:, :, outlet_index : outlet_index + 1]
+        oq_true = q_true[:, :, outlet_index : outlet_index + 1]
+        oq_mask = q_mask[:, :, outlet_index : outlet_index + 1]
+        odz_pred = dz_pred[:, :, outlet_index : outlet_index + 1]
+        odz_true = dz_true[:, :, outlet_index : outlet_index + 1]
+        oz_pred = z_abs_pred[:, :, outlet_index : outlet_index + 1]
+        oz_true = z_abs_true[:, :, outlet_index : outlet_index + 1]
+        ostage_mask = corrected_mask[:, :, outlet_index : outlet_index + 1]
+        _merge(outlet_q_global, _array_sums(oq_pred, oq_true, oq_mask))
+        _merge(outlet_dz_global, _array_sums(odz_pred, odz_true, ostage_mask))
+        _merge(outlet_z_abs_global, _array_sums(oz_pred, oz_true, ostage_mask))
+        _merge(outlet_q_hydro_global, _array_hydrograph(oq_pred, oq_true, oq_mask))
+        _merge(graph_outlet_q[graph_id], _array_sums(oq_pred, oq_true, oq_mask))
+        _merge(graph_outlet_dz[graph_id], _array_sums(odz_pred, odz_true, ostage_mask))
+        _merge(
+            graph_outlet_z_abs[graph_id],
+            _array_sums(oz_pred, oz_true, ostage_mask),
+        )
+        _merge(
+            graph_outlet_q_hydro[graph_id],
+            _array_hydrograph(oq_pred, oq_true, oq_mask),
         )
 
         for lead in range(horizon):
@@ -204,9 +254,32 @@ def evaluate_v10_station_aware(
                     z_abs_pred[:, lead], z_abs_true[:, lead], corrected_mask[:, lead]
                 ),
             )
+            _merge(
+                lead_outlet_q[lead],
+                _array_sums(
+                    q_pred[:, lead, outlet_index],
+                    q_true[:, lead, outlet_index],
+                    q_mask[:, lead, outlet_index],
+                ),
+            )
+            _merge(
+                lead_outlet_dz[lead],
+                _array_sums(
+                    dz_pred[:, lead, outlet_index],
+                    dz_true[:, lead, outlet_index],
+                    corrected_mask[:, lead, outlet_index],
+                ),
+            )
+            _merge(
+                lead_outlet_z_abs[lead],
+                _array_sums(
+                    z_abs_pred[:, lead, outlet_index],
+                    z_abs_true[:, lead, outlet_index],
+                    corrected_mask[:, lead, outlet_index],
+                ),
+            )
 
-        for obs, station in enumerate(batch.obs_station_ids):
-            station_id = _normalise_id(station)
+        for obs, station_id in enumerate(local_station_ids):
             _merge(
                 station_q[station_id],
                 _array_sums(q_pred[:, :, obs], q_true[:, :, obs], q_mask[:, :, obs]),
@@ -241,26 +314,28 @@ def evaluate_v10_station_aware(
                     z_raw_pred[:, :, obs], z_abs_true[:, :, obs], raw_mask[:, :, obs]
                 ),
             )
-            station_extra = {
-                "raw_future_count": int(raw_domain_mask[:, :, obs].sum()),
-                "raw_future_outside_train_q_range": int(
-                    (raw_domain_mask[:, :, obs] & future_outside[:, :, obs]).sum()
-                ),
-                "corrected_future_count": int(
-                    corrected_domain_mask[:, :, obs].sum()
-                ),
-                "corrected_future_outside_train_q_range": int(
-                    (
-                        corrected_domain_mask[:, :, obs]
-                        & future_outside[:, :, obs]
-                    ).sum()
-                ),
-                "origin_count": int(origin_domain_mask[:, obs].sum()),
-                "origin_outside_train_q_range": int(
-                    (origin_domain_mask[:, obs] & origin_outside[:, obs]).sum()
-                ),
-            }
-            _merge_extrapolation(station_extrapolation[station_id], station_extra)
+            _merge_extrapolation(
+                station_extrapolation[station_id],
+                {
+                    "raw_future_count": int(raw_domain_mask[:, :, obs].sum()),
+                    "raw_future_outside_train_q_range": int(
+                        (raw_domain_mask[:, :, obs] & future_outside[:, :, obs]).sum()
+                    ),
+                    "corrected_future_count": int(
+                        corrected_domain_mask[:, :, obs].sum()
+                    ),
+                    "corrected_future_outside_train_q_range": int(
+                        (
+                            corrected_domain_mask[:, :, obs]
+                            & future_outside[:, :, obs]
+                        ).sum()
+                    ),
+                    "origin_count": int(origin_domain_mask[:, obs].sum()),
+                    "origin_outside_train_q_range": int(
+                        (origin_domain_mask[:, obs] & origin_outside[:, obs]).sum()
+                    ),
+                },
+            )
 
             for sample_index in range(batch_size):
                 event_id = str(event_ids[sample_index])
@@ -341,9 +416,13 @@ def evaluate_v10_station_aware(
             {
                 "GRAPH_ID": graph_id,
                 "OUTLET_STATION_ID": outlet_by_graph.get(graph_id, ""),
-                **_regression_fields("q", graph_q[graph_id]),
-                **_regression_fields("delta_z_rating_corrected", graph_dz[graph_id]),
-                **_regression_fields("z_abs_rating_corrected", graph_z_abs[graph_id]),
+                **_regression_fields("all_station_q", graph_q[graph_id]),
+                **_regression_fields("all_station_delta_z", graph_dz[graph_id]),
+                **_regression_fields("all_station_z_abs", graph_z_abs[graph_id]),
+                **_regression_fields("outlet_q", graph_outlet_q[graph_id]),
+                **_hydrograph_fields("outlet_q", graph_outlet_q_hydro[graph_id]),
+                **_regression_fields("outlet_delta_z", graph_outlet_dz[graph_id]),
+                **_regression_fields("outlet_z_abs", graph_outlet_z_abs[graph_id]),
             }
         )
 
@@ -351,7 +430,9 @@ def evaluate_v10_station_aware(
     for graph_id, event_id, station_id in sorted(event_q):
         meta = station_meta.get((graph_id, station_id))
         if meta is None:
-            raise ValueError(f"v10 event evaluation缺station metadata: {graph_id}/{station_id}")
+            raise ValueError(
+                f"v10 event evaluation缺station metadata: {graph_id}/{station_id}"
+            )
         key = (graph_id, event_id, station_id)
         event_rows.append(
             {
@@ -379,9 +460,12 @@ def evaluate_v10_station_aware(
                 "LEAD_SECONDS": (lead + 1) * step_seconds,
                 "LEAD_MINUTES": (lead + 1) * step_seconds / 60.0,
                 "LEAD_HOURS": (lead + 1) * step_seconds / 3600.0,
-                **_regression_fields("q", lead_q[lead]),
-                **_regression_fields("delta_z_rating_corrected", lead_dz[lead]),
-                **_regression_fields("z_abs_rating_corrected", lead_z_abs[lead]),
+                **_regression_fields("all_station_q", lead_q[lead]),
+                **_regression_fields("all_station_delta_z", lead_dz[lead]),
+                **_regression_fields("all_station_z_abs", lead_z_abs[lead]),
+                **_regression_fields("outlet_q", lead_outlet_q[lead]),
+                **_regression_fields("outlet_delta_z", lead_outlet_dz[lead]),
+                **_regression_fields("outlet_z_abs", lead_outlet_z_abs[lead]),
             }
         )
 
@@ -395,6 +479,9 @@ def evaluate_v10_station_aware(
     pd.DataFrame(event_rows).to_csv(event_path, index=False, encoding="utf-8-sig")
     pd.DataFrame(lead_rows).to_csv(lead_path, index=False, encoding="utf-8-sig")
 
+    outlet_station_rows = [
+        row for row in station_rows if int(row["IS_OUTLET_STATION"]) == 1
+    ]
     summary = {
         "model_version": "v10",
         "supervised_forecast_target": "Q_ONLY",
@@ -409,14 +496,44 @@ def evaluate_v10_station_aware(
         "checkpoint": str(Path(checkpoint).expanduser().resolve()),
         "split": str(split).upper(),
         "sample_count": sample_total,
-        "q": {
+        "q_all_stations_pooled": {
             **_regression_fields("q", q_global),
             **_hydrograph_fields("q", q_hydro_global),
         },
-        "derived_stage": {
+        "q_outlets_pooled": {
+            **_regression_fields("q", outlet_q_global),
+            **_hydrograph_fields("q", outlet_q_hydro_global),
+        },
+        "derived_stage_all_stations_pooled": {
             **_regression_fields("delta_z_rating_corrected", dz_global),
             **_regression_fields("z_abs_rating_corrected", z_abs_global),
             **_regression_fields("z_abs_rating_unanchored", z_raw_global),
+        },
+        "derived_stage_outlets_pooled": {
+            **_regression_fields("delta_z_rating_corrected", outlet_dz_global),
+            **_regression_fields("z_abs_rating_corrected", outlet_z_abs_global),
+        },
+        "station_macro": {
+            "q": _macro_regression(station_rows, "q"),
+            "q_hydrograph": _macro_hydrograph(station_rows, "q"),
+            "delta_z_rating_corrected": _macro_regression(
+                station_rows, "delta_z_rating_corrected"
+            ),
+            "z_abs_rating_corrected": _macro_regression(
+                station_rows, "z_abs_rating_corrected"
+            ),
+        },
+        "outlet_station_macro": {
+            "q": _macro_regression(outlet_station_rows, "q"),
+            "q_hydrograph": _macro_hydrograph(outlet_station_rows, "q"),
+            "delta_z_rating_corrected": _macro_regression(
+                outlet_station_rows, "delta_z_rating_corrected"
+            ),
+            "z_abs_rating_corrected": _macro_regression(
+                outlet_station_rows, "z_abs_rating_corrected"
+            ),
+        },
+        "derived_stage_coverage": {
             "z_target_valid_count": stage_target_valid,
             "corrected_stage_valid_count": stage_corrected_valid,
             "corrected_stage_coverage_of_z_target": (
@@ -425,8 +542,8 @@ def evaluate_v10_station_aware(
             "raw_rating_stage_valid_count": raw_stage_valid,
             "final_history_bin_q_observed_count": q0_observed_total,
             "final_history_bin_z_observed_count": z0_observed_total,
-            "rating_extrapolation": _extrapolation_fields(extrapolation_global),
         },
+        "rating_extrapolation": _extrapolation_fields(extrapolation_global),
         "event_station_group_count": len(event_rows),
         "rating_curve_audit": trainer.cfg.get("_runtime", {}).get(
             "v10_rating_curves", {}
