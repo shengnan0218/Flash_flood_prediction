@@ -1,13 +1,19 @@
-"""Evaluate formal Hunan V10/V9/V8 models on VALIDATION or TEST."""
+"""Evaluate formal Hunan V11/V10/V9/V8 models on VALIDATION or TEST."""
 from __future__ import annotations
 
 import argparse
 import json
 from pathlib import Path
 
+from metrics.v11_station_evaluation import evaluate_v11_station_aware
 from metrics.v10_station_evaluation import evaluate_v10_station_aware
 from metrics.v8_station_evaluation import evaluate_v8_station_aware
 from metrics.v9_station_evaluation import evaluate_v9_station_aware
+from scripts.v11_training import (
+    is_v11_requested,
+    setup_v11_evaluation,
+    validate_v11_checkpoint_config,
+)
 from scripts.v10_training import (
     is_v10_requested,
     setup_v10_evaluation,
@@ -15,6 +21,7 @@ from scripts.v10_training import (
 )
 from scripts.v8_training import is_v8_requested, setup_v8_evaluation, validate_v8_checkpoint_config
 from scripts.v9_active import is_v9_requested, setup_v9_evaluation, validate_v9_checkpoint_config
+from trainers.v11_trainer import V11Trainer
 from trainers.v10_trainer import V10Trainer
 from trainers.v8_trainer import V8Trainer
 from trainers.v9_trainer import V9Trainer
@@ -23,18 +30,24 @@ from trainers.v9_trainer import V9Trainer
 def main() -> None:
     root = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(
-        description="湖南正式评价入口；默认E4 V10，显式配置仍可复现V9/V8"
+        description="湖南正式评价入口；默认E4 V11，显式配置仍可复现V10/V9/V8"
     )
-    parser.add_argument("--config", default=str(root / "configs" / "hunan_e4_v10.yaml"))
+    parser.add_argument("--config", default=str(root / "configs" / "hunan_e4_v11.yaml"))
     parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--dataset-root", help="覆盖冻结model dataset根目录")
+    parser.add_argument("--dataset-root", help="覆盖正式model dataset根目录")
     parser.add_argument("--graph-id", help="可选：只评价指定GRAPH_ID")
     parser.add_argument("--split", choices=["VALIDATION", "TEST"], default="TEST")
     parser.add_argument("--output-dir", help="station-aware评价明细输出目录")
     parser.add_argument("--output", help="可选顶层JSON结果路径")
     args = parser.parse_args()
 
-    if is_v10_requested(args.config, args.dataset_root):
+    if is_v11_requested(args.config, args.dataset_root):
+        setup_fn = setup_v11_evaluation
+        trainer_cls = V11Trainer
+        validator = validate_v11_checkpoint_config
+        evaluator = evaluate_v11_station_aware
+        version = "v11"
+    elif is_v10_requested(args.config, args.dataset_root):
         setup_fn = setup_v10_evaluation
         trainer_cls = V10Trainer
         validator = validate_v10_checkpoint_config
@@ -54,7 +67,7 @@ def main() -> None:
         version = "v8"
     else:
         raise ValueError(
-            "正式evaluate入口只保留V10/V9/V8；P3/P2及更早legacy评价路径已退役"
+            "正式evaluate入口只保留V11/V10/V9/V8；P3/P2及更早legacy评价路径已退役"
         )
 
     cfg, model, loader, device = setup_fn(
@@ -87,6 +100,7 @@ def main() -> None:
             "supervised_target", cfg["data"]["target_variable"]
         ),
         "stage_prediction": cfg.get("_runtime", {}).get("stage_prediction"),
+        "history_design": cfg.get("_runtime", {}).get("history_design"),
         "data_contract": cfg.get("_runtime", {}).get("data_contract", {}).get("contract"),
         "checkpoint": str(checkpoint_path),
         "evaluation_dir": evaluation.get(

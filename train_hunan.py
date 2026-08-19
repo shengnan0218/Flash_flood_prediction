@@ -1,10 +1,15 @@
-"""Train formal Hunan hydrologic-graph models; V10 is the default entry."""
+"""Train formal Hunan hydrologic-graph models; V11 is the default entry."""
 from __future__ import annotations
 
 import argparse
 import json
 from pathlib import Path
 
+from scripts.v11_training import (
+    is_v11_requested,
+    setup_v11_training,
+    validate_v11_checkpoint_config,
+)
 from scripts.v10_training import (
     is_v10_requested,
     setup_v10_training,
@@ -12,6 +17,7 @@ from scripts.v10_training import (
 )
 from scripts.v8_training import is_v8_requested, setup_v8_training, validate_v8_checkpoint_config
 from scripts.v9_active import is_v9_requested, setup_v9_training, validate_v9_checkpoint_config
+from trainers.v11_trainer import V11Trainer
 from trainers.v10_trainer import V10Trainer
 from trainers.v8_trainer import V8Trainer
 from trainers.v9_trainer import V9Trainer
@@ -25,10 +31,10 @@ def _event_count(loader) -> int:
 def main() -> None:
     root = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(
-        description="湖南正式训练入口；默认E4 V10，显式配置仍可复现V9/V8"
+        description="湖南正式训练入口；默认E4 V11，显式配置仍可复现V10/V9/V8"
     )
-    parser.add_argument("--config", default=str(root / "configs" / "hunan_e4_v10.yaml"))
-    parser.add_argument("--dataset-root", help="覆盖配置中的冻结model dataset根目录")
+    parser.add_argument("--config", default=str(root / "configs" / "hunan_e4_v11.yaml"))
+    parser.add_argument("--dataset-root", help="覆盖配置中的正式model dataset根目录")
     parser.add_argument("--graph-id", help="可选：只训练指定GRAPH_ID")
     parser.add_argument("--resume", help="恢复完整训练状态（含optimizer）")
     parser.add_argument(
@@ -38,7 +44,13 @@ def main() -> None:
     if args.resume and args.overwrite:
         parser.error("--resume与--overwrite不能同时使用")
 
-    if is_v10_requested(args.config, args.dataset_root):
+    if is_v11_requested(args.config, args.dataset_root):
+        cfg, model, train_loader, validation_loader, device = setup_v11_training(
+            args.config, dataset_root=args.dataset_root, graph_id=args.graph_id
+        )
+        trainer = V11Trainer(model, cfg, device)
+        checkpoint_validator = validate_v11_checkpoint_config
+    elif is_v10_requested(args.config, args.dataset_root):
         cfg, model, train_loader, validation_loader, device = setup_v10_training(
             args.config, dataset_root=args.dataset_root, graph_id=args.graph_id
         )
@@ -58,7 +70,7 @@ def main() -> None:
         checkpoint_validator = validate_v8_checkpoint_config
     else:
         raise ValueError(
-            "正式train_hunan入口只保留V10/V9/V8；P3/P2及更早legacy配置已退役"
+            "正式train_hunan入口只保留V11/V10/V9/V8；P3/P2及更早legacy配置已退役"
         )
 
     print(
@@ -74,10 +86,15 @@ def main() -> None:
                     "supervised_target", cfg["data"]["target_variable"]
                 ),
                 "stage_prediction": cfg.get("_runtime", {}).get("stage_prediction"),
+                "history_design": cfg.get("_runtime", {}).get("history_design"),
+                "event_balanced_sampling": cfg.get("_runtime", {}).get(
+                    "event_balanced_sampling"
+                ),
                 "dataset_type": cfg["data"].get("dataset_type"),
                 "future_rainfall_mode": cfg["data"]["future_rainfall_mode"],
                 "temporal": cfg.get("temporal"),
-                "train_samples": len(train_loader.dataset),
+                "train_candidate_samples": len(train_loader.dataset),
+                "train_batches_per_epoch": len(train_loader),
                 "validation_samples": len(validation_loader.dataset),
                 "train_events": _event_count(train_loader),
                 "validation_events": _event_count(validation_loader),
