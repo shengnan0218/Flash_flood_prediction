@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from datasets.hydrologic_graph_v10 import HydrologicGraphV10Dataset
 from scripts.v10_training import (
     is_v10_requested,
     setup_v10_evaluation,
@@ -53,16 +54,60 @@ def _validate_hydrologic_graph_dataset(
     )
     train_dataset = train_loader.dataset
     validation_dataset = validation_loader.dataset
-    train_events = set(train_dataset.event_ids)
-    validation_events = set(validation_dataset.event_ids)
-    overlap_tv = sorted(train_events & validation_events)
-    if overlap_tv:
-        raise ValueError(f"TRAIN/VALIDATION EVENT_ID泄漏: {overlap_tv[:20]}")
+
+    # Materialise Q-supervised probes now, before releasing the shared TRAIN NPZ
+    # cache.  This avoids a second full setup/rating scan later in preflight.
+    train_probe = next(iter(train_loader))
+    validation_probe = next(iter(validation_loader))
+
     if train_dataset.station_ids != validation_dataset.station_ids:
         raise ValueError("TRAIN/VALIDATION station catalogue不一致")
-    unseen_validation = set(validation_dataset.graph_ids) - set(train_dataset.graph_ids)
-    if unseen_validation:
-        raise ValueError(f"VALIDATION包含TRAIN未出现graph: {sorted(unseen_validation)}")
+    unseen_validation_learning = set(validation_dataset.graph_ids) - set(
+        train_dataset.graph_ids
+    )
+    if unseen_validation_learning:
+        raise ValueError(
+            "V10/V9/V8 VALIDATION包含TRAIN学习域未出现graph: "
+            f"{sorted(unseen_validation_learning)}"
+        )
+
+    # V10 learning views are Q-filtered, so frozen split leakage must be checked
+    # on separate unfiltered read-only views.  V8/V9 datasets are already full.
+    if version == "v10":
+        frozen_train = HydrologicGraphV10Dataset(
+            cfg["data"]["dataset_root"],
+            cfg["data"]["train_split"],
+            graph_id=cfg["data"].get("graph_id"),
+            future_rainfall_mode=cfg["data"]["future_rainfall_mode"],
+            strict=cfg["data"]["strict_validation"],
+            require_q_supervision=False,
+        )
+        frozen_validation = HydrologicGraphV10Dataset(
+            cfg["data"]["dataset_root"],
+            cfg["data"]["validation_split"],
+            graph_id=cfg["data"].get("graph_id"),
+            future_rainfall_mode=cfg["data"]["future_rainfall_mode"],
+            strict=cfg["data"]["strict_validation"],
+            require_q_supervision=False,
+        )
+    else:
+        frozen_train = train_dataset
+        frozen_validation = validation_dataset
+
+    frozen_train_events = set(frozen_train.event_ids)
+    frozen_validation_events = set(frozen_validation.event_ids)
+    overlap_tv = sorted(frozen_train_events & frozen_validation_events)
+    if overlap_tv:
+        raise ValueError(f"冻结TRAIN/VALIDATION EVENT_ID泄漏: {overlap_tv[:20]}")
+    if frozen_train.station_ids != frozen_validation.station_ids:
+        raise ValueError("冻结TRAIN/VALIDATION station catalogue不一致")
+    unseen_validation_frozen = set(frozen_validation.graph_ids) - set(
+        frozen_train.graph_ids
+    )
+    if unseen_validation_frozen:
+        raise ValueError(
+            f"冻结VALIDATION包含TRAIN未出现graph: {sorted(unseen_validation_frozen)}"
+        )
 
     runtime = cfg.get("_runtime", {})
     result: dict[str, Any] = {
@@ -79,6 +124,8 @@ def _validate_hydrologic_graph_dataset(
         "future_rainfall_mode": cfg["data"]["future_rainfall_mode"],
         "train": _dataset_summary(train_dataset),
         "validation": _dataset_summary(validation_dataset),
+        "frozen_train": _dataset_summary(frozen_train),
+        "frozen_validation": _dataset_summary(frozen_validation),
         "target_scale_audit": runtime.get("target_scale_audit"),
         "timestamp_semantics": runtime.get("timestamp_semantics"),
     }
@@ -98,6 +145,10 @@ def _validate_hydrologic_graph_dataset(
                 raise ValueError(f"v10 {label} Q-only样本视图计数不守恒: {view}")
             if active != int(view.get("q_supervised_sample_count", -1)):
                 raise ValueError(f"v10 {label} active样本并非全部Q-supervised")
+        if int(views["train"]["frozen_sample_count"]) != len(frozen_train):
+            raise ValueError("v10 TRAIN Q-view frozen计数与完整冻结视图不一致")
+        if int(views["validation"]["frozen_sample_count"]) != len(frozen_validation):
+            raise ValueError("v10 VALIDATION Q-view frozen计数与完整冻结视图不一致")
 
         ratings = runtime.get("v10_rating_curves", {})
         result["rating_curve_audit"] = {
@@ -148,9 +199,8 @@ def _validate_hydrologic_graph_dataset(
             ),
         }
 
-    # Keep split sets before releasing the potentially large TRAIN cache.
-    train_station_ids = train_dataset.station_ids
-    train_graphs = set(train_dataset.graph_ids)
+    train_station_ids = frozen_train.station_ids
+    frozen_train_graphs = set(frozen_train.graph_ids)
     del model, train_loader, validation_loader
     gc.collect()
 
@@ -158,19 +208,20 @@ def _validate_hydrologic_graph_dataset(
         config_path, split="TEST", dataset_root=dataset_root, graph_id=graph_id
     )
     test_dataset = test_loader.dataset
-    test_events = set(test_dataset.event_ids)
+    test_probe = next(iter(test_loader))
+    frozen_test_events = set(test_dataset.event_ids)
     overlaps = {
         "train_validation": overlap_tv,
-        "train_test": sorted(train_events & test_events),
-        "validation_test": sorted(validation_events & test_events),
+        "train_test": sorted(frozen_train_events & frozen_test_events),
+        "validation_test": sorted(frozen_validation_events & frozen_test_events),
     }
     if any(overlaps.values()):
-        raise ValueError(f"事件级split泄漏: {overlaps}")
+        raise ValueError(f"冻结事件级split泄漏: {overlaps}")
     if test_dataset.station_ids != train_station_ids:
-        raise ValueError("TEST与TRAIN station catalogue不一致")
-    unseen_test = set(test_dataset.graph_ids) - train_graphs
+        raise ValueError("冻结TEST与TRAIN station catalogue不一致")
+    unseen_test = set(test_dataset.graph_ids) - frozen_train_graphs
     if unseen_test:
-        raise ValueError(f"TEST包含TRAIN未出现graph: {sorted(unseen_test)}")
+        raise ValueError(f"冻结TEST包含TRAIN未出现graph: {sorted(unseen_test)}")
     if (
         test_cfg.get("_runtime", {})
         .get("data_contract", {})
@@ -197,13 +248,6 @@ def _validate_hydrologic_graph_dataset(
             raise ValueError("v10 final TEST评价错误过滤了冻结样本")
         result["evaluation_view"] = evaluation_view
 
-    # Materialise one same-graph batch per split to exercise tensor keys/masks.
-    probe_setup = setup_train(
-        config_path, dataset_root=dataset_root, graph_id=graph_id
-    )
-    train_probe = next(iter(probe_setup[2]))
-    validation_probe = next(iter(probe_setup[3]))
-    test_probe = next(iter(test_loader))
     for label, probe in (
         ("TRAIN", train_probe),
         ("VALIDATION", validation_probe),
@@ -228,7 +272,7 @@ def _validate_hydrologic_graph_dataset(
         "train_q_target": list(train_probe.q_target.shape),
     }
     result["status"] = "VALID"
-    del test_model, test_loader, probe_setup
+    del test_model, test_loader
     return result
 
 
