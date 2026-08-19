@@ -70,7 +70,9 @@ def _validate_hydrologic_graph_dataset(
         "model_version": version,
         "data_contract": dict(runtime.get("data_contract", {})),
         "dataset_type": cfg["data"].get("dataset_type"),
-        "supervised_target": runtime.get("supervised_target", cfg["data"].get("target_variable")),
+        "supervised_target": runtime.get(
+            "supervised_target", cfg["data"].get("target_variable")
+        ),
         "stage_prediction": runtime.get("stage_prediction"),
         "history_length": int(cfg["history_length"]),
         "forecast_horizon": int(cfg["forecast_horizon"]),
@@ -81,32 +83,65 @@ def _validate_hydrologic_graph_dataset(
         "timestamp_semantics": runtime.get("timestamp_semantics"),
     }
     if version == "v10":
+        # Make the distinction between the frozen V8 split and the Q-only
+        # learning/selection view explicit.  No sample is physically deleted.
+        result["q_supervision_views"] = runtime.get("q_supervision_views")
+        views = result["q_supervision_views"] or {}
+        for label in ("train", "validation"):
+            view = views.get(label, {})
+            if view.get("require_q_supervision") is not True:
+                raise ValueError(f"v10 {label}学习视图没有强制Q监督")
+            frozen = int(view.get("frozen_sample_count", -1))
+            active = int(view.get("active_sample_count", -1))
+            removed = int(view.get("q_filter_removed_count", -1))
+            if min(frozen, active, removed) < 0 or active + removed != frozen:
+                raise ValueError(f"v10 {label} Q-only样本视图计数不守恒: {view}")
+            if active != int(view.get("q_supervised_sample_count", -1)):
+                raise ValueError(f"v10 {label} active样本并非全部Q-supervised")
+
         ratings = runtime.get("v10_rating_curves", {})
         result["rating_curve_audit"] = {
             key: ratings.get(key)
             for key in (
-                "method", "fit_split", "deduplication_key", "q0_required_for_curve_fit",
-                "min_unique_train_pairs", "candidate_pair_occurrences", "unique_pair_count",
-                "duplicate_value_conflict_count", "station_count", "available_station_count",
-                "outlet_station_count", "outlet_missing_curve", "artifact_sha256",
+                "method",
+                "fit_split",
+                "deduplication_key",
+                "q0_required_for_curve_fit",
+                "min_unique_train_pairs",
+                "candidate_pair_occurrences",
+                "unique_pair_count",
+                "duplicate_value_conflict_count",
+                "station_count",
+                "available_station_count",
+                "outlet_station_count",
+                "outlet_missing_curve",
+                "artifact_sha256",
             )
         }
         if ratings.get("fit_split") != "TRAIN":
             raise ValueError("v10 rating curve不是TRAIN-only")
+        if ratings.get("q0_required_for_curve_fit") is not False:
+            raise ValueError("v10 rating curve拟合不应错误依赖Q0")
         if ratings.get("duplicate_value_conflict_count") != 0:
             raise ValueError("v10 rating TRAIN重叠窗口有冲突")
         if ratings.get("outlet_missing_curve"):
             raise ValueError("v10存在无rating curve的outlet")
         state_keys = tuple(model.state_dict().keys())
         forbidden = [
-            key for key in state_keys
-            if key.startswith("z_head.") or key.startswith("node_context_projection.")
+            key
+            for key in state_keys
+            if key.startswith("z_head.")
+            or key.startswith("node_context_projection.")
             or key == "dz_target_scale"
         ]
         if forbidden:
             raise ValueError(f"v10仍包含独立Z-head状态: {forbidden[:10]}")
+        parameter_names = tuple(name for name, _ in model.named_parameters())
+        if any(name.startswith("rating.") for name in parameter_names):
+            raise ValueError("v10 rating curve被错误注册为可训练参数")
         result["model_contract_audit"] = {
             "independent_z_head_present": False,
+            "rating_trainable_parameter_present": False,
             "rating_buffers_present": all(
                 key in state_keys
                 for key in ("rating.slope", "rating.intercept", "rating.available")
@@ -137,15 +172,30 @@ def _validate_hydrologic_graph_dataset(
     if unseen_test:
         raise ValueError(f"TEST包含TRAIN未出现graph: {sorted(unseen_test)}")
     if (
-        test_cfg.get("_runtime", {}).get("data_contract", {}).get("artifact_sha256")
+        test_cfg.get("_runtime", {})
+        .get("data_contract", {})
+        .get("artifact_sha256")
         != result["data_contract"].get("artifact_sha256")
     ):
         raise ValueError("preflight期间dataset_contract.json发生变化")
-    if version == "v10" and (
-        test_cfg.get("_runtime", {}).get("v10_rating_curves", {}).get("artifact_sha256")
-        != cfg.get("_runtime", {}).get("v10_rating_curves", {}).get("artifact_sha256")
-    ):
-        raise ValueError("TRAIN/TEST setup得到不同rating curve artifact")
+    if version == "v10":
+        if (
+            test_cfg.get("_runtime", {})
+            .get("v10_rating_curves", {})
+            .get("artifact_sha256")
+            != cfg.get("_runtime", {})
+            .get("v10_rating_curves", {})
+            .get("artifact_sha256")
+        ):
+            raise ValueError("TRAIN/TEST setup得到不同rating curve artifact")
+        evaluation_view = test_cfg.get("_runtime", {}).get("evaluation_view", {})
+        if evaluation_view.get("require_q_supervision") is not False:
+            raise ValueError("v10 final TEST评价必须保留完整冻结split")
+        if int(evaluation_view.get("active_sample_count", -1)) != int(
+            evaluation_view.get("frozen_sample_count", -2)
+        ):
+            raise ValueError("v10 final TEST评价错误过滤了冻结样本")
+        result["evaluation_view"] = evaluation_view
 
     # Materialise one same-graph batch per split to exercise tensor keys/masks.
     probe_setup = setup_train(
@@ -154,7 +204,11 @@ def _validate_hydrologic_graph_dataset(
     train_probe = next(iter(probe_setup[2]))
     validation_probe = next(iter(probe_setup[3]))
     test_probe = next(iter(test_loader))
-    for label, probe in (("TRAIN", train_probe), ("VALIDATION", validation_probe), ("TEST", test_probe)):
+    for label, probe in (
+        ("TRAIN", train_probe),
+        ("VALIDATION", validation_probe),
+        ("TEST", test_probe),
+    ):
         if probe.history_rain.ndim != 4 or probe.future_rain.ndim != 4:
             raise ValueError(f"{label}: rain tensor维度错误")
         if probe.q_target.shape != probe.z_target.shape:
@@ -163,6 +217,8 @@ def _validate_hydrologic_graph_dataset(
             raise ValueError(f"{label}: Q target mask shape错误")
         if probe.z_target_mask.shape != probe.z_target.shape:
             raise ValueError(f"{label}: Z evaluation target mask shape错误")
+    if not train_probe.q_target_mask.any() or not validation_probe.q_target_mask.any():
+        raise ValueError("v10 TRAIN/VALIDATION probe不应出现无Q监督batch")
 
     result["test"] = _dataset_summary(test_dataset)
     result["event_overlap"] = overlaps
@@ -203,7 +259,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="只读校验湖南正式V10/V9/V8 model dataset；默认V10"
     )
-    parser.add_argument("--config", default=str(root / "configs" / "hunan_e4_v10.yaml"))
+    parser.add_argument(
+        "--config", default=str(root / "configs" / "hunan_e4_v10.yaml")
+    )
     parser.add_argument("--dataset-root", help="覆盖冻结model dataset根目录")
     parser.add_argument("--graph-id", help="可选：只校验一个GRAPH_ID")
     parser.add_argument("--output", help="可选JSON报告路径")
