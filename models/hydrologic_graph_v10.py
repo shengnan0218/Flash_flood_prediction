@@ -1,17 +1,19 @@
 """Formal v10: Q-only hydrologic forecast with fixed rating-derived stage.
 
 V10 preserves the active v9 runoff, optimized routing, 24 h warm-up and
-mass-aware forecast-origin Q/Z state assimilation.  The independent neural Z
-head is removed completely.  Stage is a non-trainable station transformation:
+mass-aware Q/Z history state assimilation.  The independent neural Z head is
+removed completely.  Stage is a non-trainable station transformation:
 
     raw Z(t+h) = f_s(Q_hat(t+h))
     corrected Delta-Z(t+h) = f_s(Q_hat(t+h)) - f_s(Q0_analysis)
     corrected Z(t+h) = Z0_obs + corrected Delta-Z(t+h)
 
-Q0_analysis honours observed Q0 exactly when available and otherwise uses the
-v9 corrected physical/model origin discharge.  Corrected stage is available
-only when the station has a TRAIN-only rating curve and exact forecast-origin
-Z0 is observed.  No future Z observation is used.
+Under the frozen V8 timestamp contract, Q0/Z0 observations are the retained
+representative observations in the final history hourly bin; they are not
+claimed to be exact end-of-bin instantaneous values.  Q0_analysis uses that
+observed Q0 when available and otherwise uses the v9 corrected physical/model
+origin discharge.  Corrected stage requires a TRAIN-only rating curve and a
+valid final-history-bin Z observation.  No future Z observation is used.
 """
 from __future__ import annotations
 
@@ -116,12 +118,15 @@ class HydrologicGraphV10Model(HydrologicGraphV9Model):
         stage = cfg.get("stage_output", {})
         if stage.get("method") != "train_only_station_linear_rating":
             raise ValueError("v10正式stage method必须为train_only_station_linear_rating")
-        if stage.get("q0_source") != "observed_if_available_else_assimilated_model":
-            raise ValueError("v10 q0_source与正式设计不一致")
-        if stage.get("z0_source") != "exact_forecast_origin_observation_only":
-            raise ValueError("v10 z0_source与正式设计不一致")
+        if (
+            stage.get("q0_source")
+            != "final_history_bin_observed_if_available_else_assimilated_model"
+        ):
+            raise ValueError("v10 q0_source与冻结小时bin语义不一致")
+        if stage.get("z0_source") != "final_history_bin_observation_only":
+            raise ValueError("v10 z0_source与冻结小时bin语义不一致")
         if bool(stage.get("allow_backward_z_search", False)):
-            raise ValueError("v10禁止向前搜索历史Z替代forecast-origin Z0")
+            raise ValueError("v10禁止向前搜索更早历史Z替代最后history-bin Z0")
 
     @staticmethod
     def _require_physical_q(q: torch.Tensor, label: str) -> None:
@@ -298,32 +303,29 @@ class HydrologicGraphV10Model(HydrologicGraphV9Model):
             q0_model_corrected,
         )
         self._require_physical_q(q_obs, "forecast Q")
-        # Missing observed Q0 has already selected the nonnegative physical/model
-        # origin.  A present but negative observed Q0 is a data-contract error.
-        self._require_physical_q(q0_analysis, "forecast-origin Q0_analysis")
+        self._require_physical_q(q0_analysis, "final-history-bin Q0_analysis")
 
-        # Non-trainable station rating and exact Z0 residual anchoring.
+        # Stage is a diagnostic/output transformation, never a training branch.
+        # Detach Q/Q0 explicitly so derived stage cannot retain an autograd graph
+        # or ever become an accidental supervision path through future changes.
+        q_stage = q_obs.detach()
+        q0_stage = q0_analysis.detach()
         slope, intercept, rating_available_station = self.rating.station_parameters(
-            station_index, q_obs
+            station_index, q_stage
         )
         slope_3d = slope.view(1, 1, -1)
         intercept_3d = intercept.view(1, 1, -1)
-        z_rating_raw_abs = slope_3d * q_obs + intercept_3d
-        z_rating_origin_abs = (
-            slope.view(1, -1) * q0_analysis + intercept.view(1, -1)
-        )
+        z_rating_raw_abs = slope_3d * q_stage + intercept_3d
+        z_rating_origin_abs = slope.view(1, -1) * q0_stage + intercept.view(1, -1)
         z0_observed_available = batch.z_mask[:, -1].bool()
         stage_origin_available = (
-            z0_observed_available
-            & rating_available_station.view(1, -1)
+            z0_observed_available & rating_available_station.view(1, -1)
         )
         stage_available_mask = stage_origin_available.unsqueeze(1).expand(
             -1, self.horizon, -1
         )
-        # For linear f_s(Q)=aQ+b the intercept cancels exactly.  Keep the
-        # difference form explicit in semantics/diagnostics, but calculate the
-        # algebraically identical slope*(Q-Q0) for numerical economy.
-        z_delta_candidate = slope_3d * (q_obs - q0_analysis.unsqueeze(1))
+        # For linear f_s(Q)=aQ+b the intercept cancels exactly.
+        z_delta_candidate = slope_3d * (q_stage - q0_stage.unsqueeze(1))
         z_abs_candidate = batch.z_history[:, -1].unsqueeze(1) + z_delta_candidate
         z_delta = torch.where(
             stage_available_mask, z_delta_candidate, torch.zeros_like(z_delta_candidate)
@@ -394,8 +396,8 @@ class HydrologicGraphV10Model(HydrologicGraphV9Model):
 
         return {
             "q": q_obs,
-            # ``z`` is retained only as a compatibility alias for derived Delta-Z;
-            # it has no neural head and never enters the v10 training objective.
+            # Compatibility alias only: derived, detached Delta-Z with no neural
+            # head and no participation in the V10 training objective.
             "z": z_delta,
             "z_delta": z_delta,
             "z_abs": z_abs,
