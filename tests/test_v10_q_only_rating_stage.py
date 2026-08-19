@@ -6,6 +6,7 @@ from data.v8_schema import HydrologicGraphBatch
 from losses.hydrologic_graph_v10_loss import HydrologicGraphV10Loss
 from models.hydrologic_graph_v10 import HydrologicGraphV10Model
 from scripts.v8_training import _load_yaml
+from trainers.v10_trainer import V10Trainer
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -178,6 +179,23 @@ def test_v10_loss_is_q_only_and_rating_buffers_receive_no_gradient() -> None:
         parameter.grad is not None and torch.isfinite(parameter.grad).all()
         for parameter in model.parameters()
     )
+
+
+def test_v10_trainer_executes_real_q_only_train_and_validation_paths() -> None:
+    torch.manual_seed(15)
+    cfg = _cfg()
+    model = HydrologicGraphV10Model(cfg)
+    trainer = V10Trainer(model, cfg, torch.device("cpu"))
+    batch = _batch()
+    train = trainer.train_epoch([batch], epoch=0)
+    validation = trainer.evaluate([batch])
+    for result in (train, validation):
+        assert result["q_valid_count"] == 6
+        assert torch.isfinite(torch.tensor(float(result["loss"])))
+        assert "z_loss" not in result
+        assert "z_total_loss" not in result
+    assert "q_nse" in validation
+    assert "q_kge" in validation
 
 
 def test_v10_rejects_negative_observed_q0_instead_of_clamping() -> None:
