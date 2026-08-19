@@ -1,4 +1,3 @@
-from copy import deepcopy
 from pathlib import Path
 
 import torch
@@ -92,18 +91,22 @@ def test_v10_has_no_trainable_future_z_path() -> None:
     assert "rating.intercept" in state_keys
 
 
-def test_v10_observed_q0_and_z0_give_exact_rating_aligned_stage() -> None:
+def test_v10_final_history_bin_q0_z0_give_rating_aligned_stage() -> None:
     torch.manual_seed(11)
     model = HydrologicGraphV10Model(_cfg())
     batch = _batch()
     output = model(batch)
     expected_q0 = batch.q_history[:, -1]
     assert torch.equal(output["q0_analysis"], expected_q0)
-    expected_dz = 0.5 * (output["q"] - expected_q0.unsqueeze(1))
+    expected_dz = 0.5 * (output["q"].detach() - expected_q0.unsqueeze(1))
     expected_abs = batch.z_history[:, -1].unsqueeze(1) + expected_dz
     torch.testing.assert_close(output["z_delta"], expected_dz)
     torch.testing.assert_close(output["z_abs"], expected_abs)
     assert output["z_available_mask"].all()
+    assert output["q"].requires_grad
+    assert not output["z_delta"].requires_grad
+    assert not output["z_abs"].requires_grad
+    assert not output["z_rating_raw_abs"].requires_grad
 
 
 def test_v10_stage_correction_is_invariant_to_rating_intercept() -> None:
@@ -122,7 +125,7 @@ def test_v10_stage_correction_is_invariant_to_rating_intercept() -> None:
     )
 
 
-def test_v10_missing_exact_z0_masks_stage_without_backward_search() -> None:
+def test_v10_missing_final_history_bin_z_masks_stage_without_backward_search() -> None:
     model = HydrologicGraphV10Model(_cfg())
     batch = _batch()
     batch.z_mask[:, -1] = False
@@ -144,7 +147,9 @@ def test_v10_missing_observed_q0_uses_model_origin_but_can_still_output_stage() 
         output["q0_analysis"],
         output["diagnostics"]["q_origin_model_corrected_m3s"],
     )
-    expected = 0.5 * (output["q"] - output["q0_analysis"].unsqueeze(1))
+    expected = 0.5 * (
+        output["q"].detach() - output["q0_analysis"].detach().unsqueeze(1)
+    )
     torch.testing.assert_close(output["z_delta"], expected)
     assert output["z_available_mask"].all()
 
