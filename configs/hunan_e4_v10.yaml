@@ -67,8 +67,10 @@ stage_output:
   min_unique_train_pairs: 20
   require_all_outlet_stations: true
   origin_residual_correction: true
-  q0_source: observed_if_available_else_assimilated_model
-  z0_source: exact_forecast_origin_observation_only
+  # Under the frozen V8 timestamp contract these are the retained observations
+  # in the final history hourly bin, not guaranteed exact end-of-bin instants.
+  q0_source: final_history_bin_observed_if_available_else_assimilated_model
+  z0_source: final_history_bin_observation_only
   allow_backward_z_search: false
 
 physical_bounds:
