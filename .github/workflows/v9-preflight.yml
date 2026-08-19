@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - agent/v10-q-only-rating-stage
+      - agent/v11-event-balanced-72h
   pull_request:
 
 jobs:
@@ -29,31 +30,41 @@ jobs:
           fi
       - name: Import formal Python packages
         run: python -c "import datasets, losses, metrics, models, trainers"
-      - name: Compile formal V10 V9 routing entry points
+      - name: Compile formal V11 V10 V9 routing entry points
         run: >-
           python -m py_compile
+          datasets/hydrologic_graph_v11.py
           datasets/hydrologic_graph_v10.py
+          models/hydrologic_graph_v11.py
           models/hydrologic_graph_v10.py
           models/hydrologic_graph_v9.py
           models/hydrologic_graph_v9_assimilated.py
           models/runoff/water_balance_v9.py
           models/routing/kinematic_wave.py
           models/routing/kinematic_wave_optimized.py
+          losses/hydrologic_graph_v11_loss.py
           losses/hydrologic_graph_v10_loss.py
+          scripts/20_build_hydrologic_graph_model_dataset_v11.py
+          scripts/v11_training.py
+          scripts/v11_preflight.py
           scripts/v10_rating.py
           scripts/v10_training.py
           scripts/v9_training.py
           scripts/v9_active.py
+          trainers/v11_trainer.py
           trainers/v10_trainer.py
           trainers/v9_trainer.py
+          metrics/v11_station_evaluation.py
           metrics/v10_station_evaluation.py
           metrics/v9_station_evaluation.py
           train_hunan.py
           evaluate.py
           validate_dataset.py
-      - name: Run V10 V9 and routing tests
+      - name: Run V11 V10 V9 and routing tests
         run: >-
           pytest -q
+          tests/test_v11_model_and_loss.py
+          tests/test_v11_event_balanced_sampling.py
           tests/test_v10_q_only_rating_stage.py
           tests/test_v10_no_future_z_leakage.py
           tests/test_v10_q_supervised_view.py
