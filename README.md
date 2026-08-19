@@ -1,385 +1,249 @@
-# 湖南省多站河网短时洪水训练与测试
+# Flash Flood Prediction — Hunan Formal V10 / V9 / V8
 
-冻结 Step16 连续双目标数据上的 P2 流程见
-[`docs/p2_continuous_multitask.md`](docs/p2_continuous_multitask.md)。其训练不依赖
-事件；重新计算的洪水事件只用于 TEST 专项评价。
-
-本项目已经按湖南正式 `_model_dataset` 接口接通，不再把真实训练伪装成 synthetic 流程。它支持多张不同节点数的河网、按事件划分 TRAIN/VALIDATION/TEST、按河网自动选择流量或水位目标，以及 E1–E4 四组神经/物理消融实验。
-
-默认任务是用前 24 小时预测未来 1–6 小时。正式训练只读取湖南数据；浙江微调尚未启用。
-
-## 1. 环境
-
-建议使用 Python 3.11 及独立虚拟环境。在 `project` 目录执行：
-
-```powershell
-python -m pip install -r requirements.txt
-python -m unittest discover -s tests -v
-```
-
-当前正式 CSV 数据层在 Windows 上要求 `num_workers: 0`，以免多个 worker 复制整省动态张量。TRAIN 与 VALIDATION 会在同一进程共享只读动态张量。
-
-GPU 服务器上 `device: auto` 会自动选择 CUDA。正式配置默认仍保持 `amp: false`；确认服务器 GPU/PyTorch 支持后，可在所用的 `hunan_*.yaml` 中覆盖为 `amp: true`。AMP 的动态 loss-scale 溢出会由 `GradScaler` 跳过该步并降低 scale；FP32 训练遇到非有限梯度仍立即报错。
-
-## 2. 唯一认可的正式目录
-
-默认位置是 `project/_model_dataset`，也可通过 `--dataset-root` 指定绝对路径。
+本仓库当前正式数据事实层为冻结的 **V8 hydrologic computational graph dataset**：
 
 ```text
-_model_dataset/
-├─ graph/
-│  ├─ node_catalog.csv
-│  ├─ edge_topology.csv
-│  ├─ node_static_attributes.csv
-│  └─ edge_static_attributes.csv
-├─ dynamic/
-│  ├─ graph_<BASIN_ID>_hourly.csv
-│  └─ ...
-├─ events/
-│  ├─ flood_events_all.csv
-│  ├─ flood_events_final.csv
-│  ├─ data_split.csv
-│  ├─ sample_index.csv
-│  └─ target_variable_by_graph.csv
-├─ metadata/
-│  ├─ feature_schema.json
-│  ├─ normalization_stats.json
-│  ├─ dataset_summary.csv
-│  ├─ source_manifest.json
-│  └─ build_log.txt
-└─ qc/
-   ├─ dynamic_coverage.csv
-   ├─ event_exclusion.csv
-   ├─ hydro_file_selection.csv
-   ├─ hydro_load_audit.csv
-   ├─ rain_source_coverage.csv
-   └─ sample_rejection.csv
+_model_dataset_v8_hydrologic_graph/
 ```
 
-任何正式文件缺失、主外键不一致、时间不连续、单位不合法、QC 拒绝记录仍进入样本、或 split 存在冲突时，程序都会终止，不会回退到 synthetic 或静默填补。
+正式训练、评价和 preflight 入口只支持 **V10、V9、V8**。P2、P3 以及 V8 之前的实验配置和专用运行路径已经退役，不再作为正式工作流。
 
-## 3. 表字段契约
+## 1. 当前正式版本
 
-### 图与静态属性
+### V10 — 默认正式模型
 
-`graph/node_catalog.csv`：
+配置：
 
 ```text
-GRAPH_ID,BASIN_ID,NODE_INDEX,STATION_ID,OUTLET_ID,ROLE,IS_OUTLET
+configs/hunan_e4_v10.yaml
 ```
 
-同一图的 `NODE_INDEX` 必须从 0 连续递增，只能有一个 `IS_OUTLET=1`，且该站必须等于 `OUTLET_ID`。
-
-`graph/edge_topology.csv`：
+V10 的职责划分是：
 
 ```text
-GRAPH_ID,FROM_NODE,TO_NODE,FROM_STATION,TO_STATION
+24 h rainfall/history
+        ↓
+water-balance LSTM runoff
+        ↓
+optimized kinematic-wave routing
+        ↓
+1–6 h Q forecast                 ← 唯一学习/监督目标
+        ↓
+TRAIN-only station rating curve
+        ↓
+Q-derived stage
+        ↓
+final-history-bin Z residual anchoring
 ```
 
-方向必须为直接上游 `FROM` → 直接下游 `TO`。图必须是能汇入唯一出口的 DAG。当前正式物理路由没有分流比例，因此出度大于 1 的分汊节点会被拒绝；多个上游汇入一个下游是支持的。
+关键约束：
 
-`graph/node_static_attributes.csv` 必须含下列 10 项且每个节点恰好一行：
+- 主模型只学习未来 **Q**；没有独立 neural Z head。
+- future Z 不进入 loss，不参与 checkpoint selection，也没有梯度回传到 Q 模型。
+- 保留 V9 的 24 h sequential warm-up、质量守恒的状态订正和优化后的 kinematic-wave routing。
+- 历史 Q/Z 仍可作为起报状态同化输入；“不用 Z 做未来监督”不等于“丢弃历史 Z 状态信息”。
+- station-specific rating curve 只由冻结数据 **TRAIN** 中唯一物理目标时刻的同时有效 Q/Z 拟合：`Z = aQ + b`。
+- 水位输出为：
 
 ```text
-GRAPH_ID,STATION_ID,
-log_incremental_area,log_upstream_area,
-mean_hillslope_flow_distance_m,mean_slope_deg,elevation_std_m,
-drainage_density_km_per_km2,soil_log_ksat_0_30cm,
-soil_profile_depth_cm,forest_fraction,impervious_fraction
+Delta-Z_hat = f_station(Q_future_hat) - f_station(Q0_analysis)
+Z_hat       = Z0_observed + Delta-Z_hat
 ```
 
-`graph/edge_static_attributes.csv`：
+- `Q0_analysis` 优先使用最后一个 history 小时 bin 内保留的 Q 观测；缺测时使用 V9 状态同化后的物理/model Q0。
+- `Z0_observed` 必须来自最后一个 history 小时 bin；不向前搜索更早 Z，不使用未来 Z。
+- 冻结 V8 的小时标签表示 hourly bin。最后一个 Q0/Z0 是该 bin 内保留下来的代表观测，**不保证是 bin 末端的精确瞬时整点值**。
+- rating curve 不对超出 TRAIN Q 范围的预测做静默截断；最终评价会显式报告 rating extrapolation 比例。
+
+### V9 — 保留可复现
+
+保留：
 
 ```text
-GRAPH_ID,FROM_STATION,TO_STATION,
-reach_length_km,reach_slope_m_per_m
+configs/hunan_v9_base.yaml
+configs/hunan_e1_v9.yaml
+configs/hunan_e2_v9.yaml
+configs/hunan_e3_v9.yaml
+configs/hunan_e4_v9.yaml
 ```
 
-加载器会把 `reach_length_km` 明确转换为 m。`feature_schema.json` 也必须声明上述两个源字段；`reach_length_m` 仅是模型内部名称，不能作为正式 CSV/schema 输入。河长必须大于 0，坡降必须大于等于 0。正式输入不要求、也不会读取 `channel_width_m`。
+V9 的模型、loss、trainer、评价和测试均保留，用于完整复现实验和与 V10 对照。
 
-### 逐时动态数据
+### V8 — 保留可复现
 
-每个河网严格读取：
+保留原 E1–E4 配置：
 
 ```text
-dynamic/graph_<BASIN_ID>_hourly.csv
+configs/hunan_e1_pure_ai.yaml
+configs/hunan_e2_physics_runoff.yaml
+configs/hunan_e3_physics_routing.yaml
+configs/hunan_e4.yaml
 ```
 
-文件内只能包含与该 `BASIN_ID` 对应的一个 `GRAPH_ID`，字段为：
+V8 的冻结 dataset contract、loader、模型和评价逻辑不由 V10 重建或覆盖。
+
+## 2. V10 数据边界
+
+V10 **不重建 V8 数据集**，只在 loader 层建立只读任务视图。
+
+冻结 V8 sample 可因 Q 或 Z 任一任务有效而存在。因为 V10 是 Q-only：
+
+- TRAIN：只保留冻结 `sample_index.csv` 中 `Q_TARGET_VALID_COUNT > 0` 的样本进入学习；
+- VALIDATION：同样只保留有 Q target 的样本用于 Q-only model selection；
+- TEST 最终评价：保留完整冻结 TEST split，Q 和 derived stage 各自使用自己的 truth mask。
+
+这不是重新划分数据：EVENT_ID、SPLIT、FORECAST_TIME、tensor row、graph topology 和观测值全部沿用冻结 V8；preflight 会同时报告 frozen sample count、active Q-supervised count 和被任务视图排除的数量。
+
+## 3. TRAIN-only rating curve
+
+V10 在启动时从冻结 dataset root 读取 TRAIN，并按：
 
 ```text
-GRAPH_ID,TIMESTAMP,STATION_ID,
-RAIN_MM,FLOW,WATER_LEVEL,
-RAIN_MASK,FLOW_MASK,WATER_LEVEL_MASK
+(STATION_ID, physical target unix hour)
 ```
 
-每个出现的整点必须为该图全部节点各提供一行。缺测值可留空，但对应 mask 必须为 0；mask 为 1 的值必须有限。`RAIN_MM` 单位为 mm/h，`FLOW` 为 m³/s，`WATER_LEVEL` 为 m。
+去重重叠 forecast windows。若同一物理时刻的重复 Q/Z 值冲突，直接失败，不静默选取。
 
-### 事件、目标和划分
+rating curve 拟合本身不要求 Q0，因为它估计的是站点 Q–Z 关系，而不是 forecast-origin availability。正式配置要求所有 outlet station 都有足够的 TRAIN-only Q/Z 配对；否则 preflight 失败。
 
-`events/flood_events_final.csv`：
+rating 参数是 model buffer，不是 trainable parameter。checkpoint 绑定 rating artifact SHA；评价时如果 dataset/rating artifact 已变化会拒绝加载为同一实验。
+
+## 4. 时间和 forcing 语义
+
+当前湖南冻结数据：
 
 ```text
-EVENT_ID,GRAPH_ID,BASIN_ID,OUTLET_ID,
-RAIN_START,RAIN_END,HYDRO_START,PEAK_TIME,HYDRO_END,
-SAMPLE_START,SAMPLE_END,EVENT_TYPE,EVENT_GRADE,
-COMPOUND_EVENT,PEAK_COUNT,
-SOURCE_RAIN_EVENT_IDS,SOURCE_RAIN_EVENT_COUNT
+history duration: 24 h
+forecast duration: 6 h
+forcing step:      1 h
+target step:       1 h
+future rainfall:   observed_hindcast
 ```
 
-主实验只加载 `EVENT_TYPE=HYDRO_FLOOD` 且 `EVENT_GRADE=A/B`。`flood_events_all.csv` 至少应含 `EVENT_ID,GRAPH_ID`，并覆盖 final 表中的全部事件。
+降雨时间戳表示 `[start, end)` 小时区间起点。hydro 小时标签是 hourly bin 标签；当前冻结处理保留 bin 内代表观测。forecast origin 是最后一个 history bin 的结束边界；没有对整个 Q/Z tensor 做额外 1 h shift。
 
-`events/data_split.csv`：
+`observed_hindcast` 是当前湖南实验的既定 forcing 条件，不应解释为业务上已知未来降雨。未来业务预测需另行接入降雨预报 forcing，并作为新的实验条件报告。
+
+## 5. V10 loss 与训练
+
+V10 只包含：
 
 ```text
-EVENT_ID,GRAPH_ID,EVENT_YEAR,EVENT_GRADE,SPLIT,SPLIT_REASON
+q_point_weight  = 1.0
+q_peak_weight   = 0.25
+q_volume_weight = 0.25
 ```
 
-`SPLIT` 只能是 `TRAIN`、`VALIDATION`、`TEST`。同一事件不能跨集合；每个河网还会检查 TRAIN → VALIDATION → TEST 的时间顺序。
+Q 误差使用 TRAIN-only per-station Q scale。没有 Z level、Z slope、Q–Z consistency 或其他 future-Z loss。
 
-`events/sample_index.csv`：
+正式配置：
 
 ```text
-SAMPLE_ID,EVENT_ID,GRAPH_ID,OUTLET_ID,
-INPUT_START,FORECAST_TIME,TARGET_END,
-HISTORY_HOURS,FORECAST_HOURS,TARGET_VARIABLE,SPLIT
+batch_size: 16
+epochs: 100
+early_stopping: false
+optimizer: AdamW
+lr: 0.001
 ```
 
-时间定义为：
+checkpoint selection 固定为 **Q-only validation loss**。
 
-```text
-历史输入 = [INPUT_START, FORECAST_TIME]，共 HISTORY_HOURS 个整点
-预测目标 = FORECAST_TIME 后第 1...FORECAST_HOURS 小时
-TARGET_END - FORECAST_TIME = FORECAST_HOURS
+## 6. 运行顺序
+
+服务器同步：
+
+```bash
+cd ~/Flash_flood_prediction
+git fetch origin
+git reset --hard origin/main
 ```
 
-模型内部把出口标签展开为 `[F,N]`，但只有出口节点的目标 mask 为真。
+训练前必须先做只读 preflight：
 
-`events/target_variable_by_graph.csv` 至少必须含：
-
-```text
-GRAPH_ID,TARGET_VARIABLE
+```bash
+python validate_dataset.py --output outputs/hunan_e4_v10_preflight.json
 ```
 
-可附加 `BASIN_ID,OUTLET_ID`。目标只能是 `FLOW`、`WATER_LEVEL` 或 `BOTH`，并必须与该图所有 `sample_index` 行一致。正式配置默认 `target_variable: AUTO`，以此表为权威来源。
-
-## 4. 两个必需 JSON 契约
-
-`metadata/feature_schema.json` 必须明确 10/2/2 维特征顺序（节点静态/边静态/动态），以及如何从对数面积恢复物理 km²。程序绝不会猜测 `log_incremental_area` 的对数底数。
+只有报告最后为：
 
 ```json
-{
-  "dynamic_features": ["FLOW", "WATER_LEVEL"],
-  "node_static_features": [
-    "log_incremental_area",
-    "log_upstream_area",
-    "mean_hillslope_flow_distance_m",
-    "mean_slope_deg",
-    "elevation_std_m",
-    "drainage_density_km_per_km2",
-    "soil_log_ksat_0_30cm",
-    "soil_profile_depth_cm",
-    "forest_fraction",
-    "impervious_fraction"
-  ],
-  "edge_static_features": [
-    "reach_length_km",
-    "reach_slope_m_per_m"
-  ],
-  "physical_features": {
-    "incremental_area_km2": {
-      "source": "log_incremental_area",
-      "transform": "log1p",
-      "unit": "km2"
-    }
-  }
-}
+"status": "VALID"
 ```
 
-`transform` 支持 `ln`、`log1p`、`log10`。如果静态表另含未变换的 `incremental_area_km2`，可将 `source` 写为该列并使用 `unit: km2`。
+才进入正式训练。
 
-`metadata/normalization_stats.json` 必须显式声明只由 TRAIN 计算：
+启动 V10：
 
-```json
-{
-  "computed_from_split": "TRAIN",
-  "features": {
-    "RAIN_MM": {"mean": 0.0, "std": 1.0, "min": 0.0, "max": 100.0},
-    "FLOW": {"mean": 20.0, "std": 15.0, "min": 0.0, "max": 500.0},
-    "WATER_LEVEL": {"mean": 2.0, "std": 0.8, "min": -1.0, "max": 10.0}
-  }
-}
+```bash
+nohup python train_hunan.py > hunan_e4_v10_train.log 2>&1 &
 ```
 
-默认/既有实验使用 FLOW/WATER_LEVEL 的 TRAIN 全局标准差把联合 Q/Z Huber
-损失无量纲化，避免把 m³/s 与 m 直接相加。严格对照配置
-`hunan_e4_multitask_qnorm_v1.yaml` 仅把 Q point/peak/volume 的监督误差改为
-各 FLOW 目标河网自己的 TRAIN 出口 Q 标准差；Z 与动态输入 normalization
-不变。下列评估指标始终在物理空间计算：
+查看训练：
 
-- 全部有效标签的逐时 MAE，以及 MAE、RMSE、带符号 bias、NSE、KGE；
-- `q_sample_peak_mae` 与 `q_sample_peak_bias`，其中 bias 为预测峰值减观测峰值；
-- `q_sample_relative_peak_bias`，即 `(预测峰值-观测峰值)/观测峰值` 的比率，不乘 100，观测峰值为 0 时不计；
-- `q_sample_peak_timing_mae_hours` 与 `q_sample_peak_timing_bias_hours`，带符号值为正表示预测滞后、为负表示预测提前；
-- `q_sample_relative_volume_bias`，保留洪量高估/低估方向。
-
-正式 `evaluate.py` 还输出基于现有滑动窗口的 `EVENT_ID`/`GRAPH_ID` 等权宏平均，并在 `window_group_metrics` 中保留逐事件、逐河网明细。字段名刻意包含 `window`：同一目标时刻若出现在多个预测窗口中仍会重复计入，不能把这些值解释为去重后的完整洪水过程指标。NSE/KGE 等无定义的组不会进入对应宏平均，实际参与组数写在 `*_defined_count`。
-
-训练验证和独立评估还会生成去重后的真实事件/河网/水位站诊断。真实事件按正式 `EVENT_ID` 聚合；同一事件、站点和目标时刻只保留最短预见期（最新起报）的预测。逐站 ΔZ 使用该 sample 历史窗内、截至 `FORECAST_TIME` 最后一个有效实测水位为基准，不读取未来真实水位做校正。完整口径、字段与输出目录见 [docs/validation_diagnostics.md](docs/validation_diagnostics.md)。
-
-当前数据契约没有权威预警阈值、连续业务发报记录或平水负事件，因此暂不计算高流量分层 NSE/KGE、POD/CSI/HSS/F1/FAR 和有效预见期；在补齐业务定义前不会用任意分位数冒充业务阈值。
-
-`source_manifest.json` 应记录数据构建版本、源文件及动态文件校验和。checkpoint 会绑定站点顺序、目标映射和核心契约文件 SHA-256；数据重建后不匹配会拒绝评估，防止站点参数错配。
-
-## 5. QC 门禁
-
-所有列出的 QC 文件必须存在且是带表头的 UTF-8 CSV。
-
-- `event_exclusion.csv` 至少含 `EVENT_ID`；表中事件不得出现在已加载样本。
-- `sample_rejection.csv` 必须包含 `REJECTION_ID,SAMPLE_ID,EVENT_ID,GRAPH_ID,OUTLET_ID,FORECAST_TIME,TARGET_START,TARGET_END,TARGET_VARIABLE,TARGET_COVERAGE,MIN_TARGET_COVERAGE,REASON,SPLIT`。每个 final 事件必须至少拥有一个有效 sample，或在该表中有明确拒绝记录；低于未来目标覆盖率阈值的候选窗口逐窗记录。
-- 其余 coverage/audit 表会检查可读性并在预检报告中给出行数。
-
-`dataset_summary.csv` 必须是带表头 CSV，`source_manifest.json` 必须是有效 JSON，`build_log.txt` 必须是 UTF-8 文本。
-
-训练前还必须运行确定性事件/水位审计：
-
-```powershell
-python audit_dataset_quality.py --dataset-root "D:\path\to\_model_dataset"
+```bash
+ps -eo pid,etime,%cpu,%mem,cmd | grep "python train_hunan.py" | grep -v grep
+tail -f hunan_e4_v10_train.log
 ```
 
-它只生成证据，不重写事件、split 或样本：
+默认输出：
 
-- `qc/event_hydrograph_overlap.csv`：同一图/出口的相邻或时间重叠事件对。只有“共享有效目标时刻且共享同一实测峰时”，或正式 hydro window 确实重叠时，才标记 `MUST_MERGE`；仅样本时段重叠但峰不同标记 `REVIEW`。同一连续过程跨 split 标记 `CROSS_SPLIT_LEAKAGE`。
-- `qc/water_level_station_audit.csv`：按目标站和 split 输出物理水位范围、TRAIN 站级范围、TRAIN 全局 normalization 范围、逐时跳变和站内基准一致性。TRAIN 事件中若整场水位范围落在站级事件中位数 Tukey outer fence 之外，判为基准断裂并标记 `FAIL`，不自动删除站点或事件。
-- `qc/dataset_quality_audit_summary.json`：合并连通组、预计事件数变化、不重新划分时的暂定 split 数量和严格失败计数；正式数量必须在合并后的真实事件层重新执行原 deterministic split 得到。
-
-`validate_dataset.py` 会重新计算这些审计，不会只信任已有 QC 文件。`strict_validation=true` 时，只要存在 `MUST_MERGE`、`CROSS_SPLIT_LEAKAGE`、TRAIN 水位基准断裂，或 normalization 与 TRAIN 输入窗口重算不一致，就会终止。可用 `--qc-output-dir` 在失败前保留本次审计证据。
-
-仓库现已纳入权威上游构建器 `scripts/16_build_model_dataset_v3.py` 及其运行说明 `docs/README_16_build_model_dataset.md`。该构建器在正式 split 前使用同一出口的有效目标小时、实测峰时和正式 hydro window 形成确定性合并连通组；随后重新生成 final/all events、split、sample index、normalization、summary、QC 和 manifest。TRAIN 内不可恢复的水位基准断裂按事件级排除并留痕，不自动平移水位，也不删除整站。旧 `_model_dataset_v4_candidate` 仍保留为审计证据，不能继续训练。
-
-## 6. 未来降雨策略
-
-物理预测的目标期需要一个明确的降雨假设，项目不会悄悄读取未来实测值。
-
-- `persistence`：默认。各节点使用最后一个历史有效雨量持平外推，未来 `RAIN_MASK=0`，表示它不是实测或预报产品。
-- `zero`：未来雨量置 0，mask 为 0。
-- `observed_hindcast`：读取目标期实测雨量，只适合作为“完美降雨已知”的回算上限实验，不能当作业务预报成绩。
-
-若以后接入数值天气预报，可在相同位置扩展独立 forecast forcing 字段和模式。
-
-## 7. 预检、训练和独立测试
-
-先做只读预检：
-
-```powershell
-python validate_dataset.py --config configs/hunan_e4.yaml --dataset-root "D:\path\to\_model_dataset" --qc-output-dir "D:\path\to\_model_dataset\qc" --output outputs/dataset_validation.json
+```text
+outputs/hunan_e4_v10_best.pt
+outputs/hunan_e4_v10_final.pt
+outputs/hunan_e4_v10_train.csv
 ```
 
-报告必须显示 `"status": "VALID"` 才进入训练。
+最终 TEST：
 
-训练 E4：
-
-```powershell
-python train_hunan.py --config configs/hunan_e4.yaml --dataset-root "D:\path\to\_model_dataset"
+```bash
+python evaluate.py --checkpoint outputs/hunan_e4_v10_best.pt --split TEST
 ```
 
-事件与水位修复后的下一次全新 E4 使用
-`configs/hunan_e4_event_zqc_v1.yaml`。它只继承现有正式 E4 并改用新的
-checkpoint/log 名，不会覆盖 `hunan_e4_diagnostics_*`：
+V10 final evaluation 输出至少包括：
 
-```powershell
-python train_hunan.py --config configs/hunan_e4_event_zqc_v1.yaml --dataset-root "D:\path\to\_model_dataset_v5_event_zqc"
+- global Q metrics；
+- station Q / derived-stage metrics；
+- graph metrics；
+- event × station metrics；
+- 1–6 h lead-time metrics；
+- corrected-stage coverage；
+- TRAIN rating range extrapolation audit；
+- rating artifact / evaluation-view audit。
+
+## 7. V8 / V9 复现
+
+V8/V9 不再是默认入口，但可以通过显式 `--config` 复现：
+
+```bash
+python train_hunan.py --config configs/hunan_e4_v9.yaml
+python train_hunan.py --config configs/hunan_e4.yaml
 ```
 
-必须先确认同一新数据目录的 validator 输出 `status=VALID`；不要用旧 best
-checkpoint 评估重建后的事件定义。
+对应评价也显式提供相同 config：
 
-若同名 log/checkpoint 已存在，全新训练会拒绝覆盖。确认要从头重跑时显式增加 `--overwrite`；续训不要使用该参数。
-
-best/last checkpoint 均先写入同目录临时文件，完成 flush/fsync 后通过原子替换发布；保存或替换失败不会覆盖上一份完整 checkpoint。
-
-从最后一次完整状态续训：
-
-```powershell
-python train_hunan.py --config configs/hunan_e4.yaml --dataset-root "D:\path\to\_model_dataset" --resume outputs/hunan_e4_best.last.pt
+```bash
+python evaluate.py --config configs/hunan_e4_v9.yaml --checkpoint <checkpoint> --split TEST
 ```
 
-独立 TEST：
+V10 的新增代码不得反向修改 V8/V9 模型架构、loss 或配置语义。
 
-```powershell
-python evaluate.py --config configs/hunan_e4.yaml --dataset-root "D:\path\to\_model_dataset" --checkpoint outputs/hunan_e4_best.pt --output outputs/hunan_e4_test.json
-```
+## 8. 代码审计门禁
 
-需要对 best checkpoint 重跑验证集详细诊断时：
+正式合并前 CI 同时检查：
 
-```powershell
-python evaluate.py --config configs/hunan_e4.yaml --dataset-root "D:\path\to\_model_dataset" --checkpoint outputs/hunan_e4_best.pt --split VALIDATION --output outputs/hunan_e4_validation.json
-```
+- V10 config contract；
+- TRAIN-only rating calibration 与 overlap dedup；
+- Q-supervised read-only dataset view；
+- V10 state_dict 中不存在 independent Z head；
+- rating curve 不可训练；
+- derived stage 已从 autograd detach；
+- rating intercept 对 corrected Delta-Z 不产生影响；
+- 缺 Z0 时不向前搜索；
+- 缺 observed Q0 时使用 model/assimilated Q0；
+- negative Q fail-fast；
+- Q-only loss 不受任何 Z 输出影响；
+- V9 state assimilation tests；
+- optimized kinematic-wave 与原 solver 的输出/梯度等价性；
+- V8/V9 相关正式测试继续通过。
 
-训练只用 TRAIN 拟合、VALIDATION 选最佳 checkpoint；TEST 不参与拟合和早停。评估只加载模型权重，不恢复 optimizer。未训练河网、站点映射、核心数据契约、求解器积分契约或物理参数边界发生变化都会被拒绝。
-
-默认配置也指向 `project/_model_dataset`，若数据放在该处可省略 `--dataset-root`。
-
-新版多目标 E4 单次训练使用独立配置和输出，不覆盖旧实验：
-
-```powershell
-python train_hunan.py --config configs/hunan_e4_multitask.yaml --dataset-root "D:\path\to\_model_dataset"
-```
-
-它采用事件—流域平衡 Q point loss、6 h 峰值/洪量 loss、绝对 Z 与真正逐小时
-first-difference Z loss，并以越大越好的综合 VALIDATION score 选择 best/早停。
-准确公式、去重口径和默认权重见
-[docs/multitask_training_and_hpo.md](docs/multitask_training_and_hpo.md)。
-
-逐图 Q loss normalization 的 100-epoch 严格对照实验使用：
-
-```powershell
-python train_hunan.py --config configs/hunan_e4_multitask_qnorm_v1.yaml --dataset-root "D:\path\to\_model_dataset_v5_event_zqc"
-```
-
-它只用 TRAIN supervision 中去重后的出口 Q 目标时刻计算逐图 population std，
-并应用 `q_scale_floor_m3s: 1.0`。训练执行 epoch 0--99，仍逐轮验证并保留
-best/last checkpoint；逐图统计写入同一输出目录的
-`hunan_e4_multitask_qnorm_v1_q_scales.json`。
-
-Optuna 是独立、显式启用的后续入口；`hyperparameter_optimization.enabled`
-默认是 `false`，普通训练不会启动搜索。本轮不应把 HPO 当作新版单次训练的
-默认下一步。
-
-## 8. E1–E4 实验
-
-正式配置采用分层继承：`base.yaml` 只保存共享默认值，`hunan_e4.yaml` 在其上覆盖湖南数据契约和 E4 运行参数，E1–E3 再继承 `hunan_e4.yaml` 并仅切换产流/汇流模块。不需要另外的旧 `e1_pure_ai.yaml`–`e4_full_physics.yaml` 文件。
-
-| 配置 | 产流 | 汇流 |
-|---|---|---|
-| `configs/hunan_e1_pure_ai.yaml` | Pure LSTM | Directed GNN |
-| `configs/hunan_e2_physics_runoff.yaml` | Water-balance LSTM | Directed GNN |
-| `configs/hunan_e3_physics_routing.yaml` | Pure LSTM | Kinematic wave |
-| `configs/hunan_e4.yaml` | Water-balance LSTM | Kinematic wave |
-
-旧基线四组共享完全相同的数据、split、目标、损失、评价和 checkpoint 规则。
-未来多目标 HPO 只允许在 E4 搜索一次共享参数；得到真实最优结果后，E1–E4
-冻结同一套 loss/权重、hidden dim、lr、weight decay、seed、epoch、早停和
-checkpoint 规则，只切换上表两个 physics mode，禁止分别调参。TEST 不参与
-任何选择或剪枝。
-
-## 9. 模型与安全约束
-
-- `GraphEventBatch` 使用 `[B,H,N,D]` / `[B,T,N]`，不同河网不 padding；同一个 batch 只含一张图。
-- 全省站点使用稳定的全局 `station_index`，Q–Z 观测参数不会因河网节点数不同而错位。
-- 对数静态面积只用于神经特征，水量换算单独使用反变换后的 `node_area_km2`。
-- 历史 Q/Z/降雨 mask 会作为模型输入；缺测 0 与真实 0 可区分。
-- 运动波使用可微后向 Euler 单调非线性求解、守恒蓄量和直接上游汇入；CFL 仅报告显式方法所需的等价子步数，不再控制积分或中止短河段高流量样本。非有限值或隐式方程残差超限仍会明确报错。
-- 数据没有实测河宽时，运动波根据河长、坡降及边两端节点属性学习有界的 `effective width`；Manning n 同样是有界可学习参数。二者是由路由目标校准的等效水力参数，不应表述为实测河宽或实测糙率。
-- 水位观测头对非负 Q 和河道蓄量结构单调，并按全局站点索引取参数。
-- 物理库容从每个样本窗口开始 warm-up；默认 24 小时。慢响应流域应通过实验加长 HISTORY_HOURS。
-
-当前模型没有闸坝调度、分洪比例、回水、潮汐边界或连续跨事件状态缓存。含这些过程的河网不能在未建模的情况下解释为纯自然河道结果。
-
-当前 JSON 同时报告全部有效出口标签的微平均和按 `EVENT_ID`/`GRAPH_ID` 等权的窗口宏平均。由于滑动窗口可能重叠，论文定稿前仍应在业务时序定义完成后另做目标时刻去重和完整洪水过程复核。
-
-## 10. 调试模式与浙江数据
-
-`profile_model.py` 和单元测试复用上表四份湖南配置，但只生成内存中的 synthetic fixture 检查结构和吞吐；它们不产生正式科研结果。`base.yaml` 是继承基底，不是湖南正式训练入口。
-
-浙江正式适配器尚未实现。当前版本不会把 synthetic 数据当作浙江微调，也不会让同一个 loader 同时充当训练和验证。待浙江整理为相同目录契约后，再增加独立预训练权重加载、浙江事件级微调 split 和独立 TEST。
+如果 real-data preflight、checkpoint compatibility 或任何物理/时间契约不一致，程序应失败，而不是回退、填补或静默修正。

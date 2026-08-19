@@ -1,0 +1,116 @@
+# Formal E4 v10: Q-only hydrologic forecast + TRAIN-only rating-derived stage.
+# Standalone on purpose: no P2/P3/legacy experiment inheritance.
+model_version: v10
+seed: 42
+runoff_mode: water_balance_lstm
+routing_mode: kinematic_wave_gnn
+history_length: 24
+forecast_horizon: 6
+node_static_dim: 10
+edge_static_dim: 2
+hidden_dim: 32
+device: auto
+gpu_id: 0
+batch_size: 16
+gradient_accumulation_steps: 1
+amp: false
+gradient_checkpointing: false
+num_workers: 0
+pin_memory: false
+debug_mode: false
+debug_max_batches: 4
+
+data:
+  mode: hunan
+  dataset_type: event
+  dataset_root: _model_dataset_v8_hydrologic_graph
+  graph_id: null
+  # Q is the only learned/supervised forecast task. Z tensors remain available
+  # as history assimilation input and read-only final stage evaluation truth.
+  target_variable: Q
+  strict_validation: true
+  use_observation_masks: true
+  future_rainfall_mode: observed_hindcast
+  train_split: TRAIN
+  validation_split: VALIDATION
+  test_split: TEST
+
+temporal:
+  history_duration_seconds: 86400
+  forecast_duration_seconds: 21600
+  forcing_step_seconds: 3600
+  target_step_seconds: 3600
+  rain_interval_anchor: interval_start
+  hydro_hour_bin_anchor: start_label_last_observation_within_bin
+  forecast_origin_anchor: end_of_last_history_bin
+
+state_initialization:
+  enabled: true
+  mode: sequential_warmup
+warmup:
+  enabled: true
+  initial_state: static_prior
+state_correction:
+  enabled: true
+  mode: v8_history_residual_after_warmup
+  use_qz_history: true
+  propagate_upstream: true
+  correct_channel_storage: true
+  additive_storage_from_q_residual: true
+  hidden_residual_scale: 0.25
+  storage_log_scale: 0.35
+  max_additive_storage_hours: 6.0
+
+stage_output:
+  enabled: true
+  method: train_only_station_linear_rating
+  min_unique_train_pairs: 20
+  require_all_outlet_stations: true
+  origin_residual_correction: true
+  # Under the frozen V8 timestamp contract these are the retained observations
+  # in the final history hourly bin, not guaranteed exact end-of-bin instants.
+  q0_source: final_history_bin_observed_if_available_else_assimilated_model
+  z0_source: final_history_bin_observation_only
+  allow_backward_z_search: false
+
+physical_bounds:
+  width: [2.0, 80.0]
+  manning_n: [0.015, 0.12]
+solver:
+  dx: 1000.0
+  cfl: 0.8
+  integration_scheme: backward_euler
+  implicit_iterations: 8
+  implicit_residual_tolerance: 1.0e-5
+  minimum_slope: 1.0e-6
+  minimum_length: 10.0
+  # Runtime replaces this from temporal.forcing_step_seconds as single truth.
+  seconds_per_step: 3600.0
+
+loss:
+  mode: q_only
+  q_scale_mode: per_station
+  q_scale_floor_m3s: 1.0
+  q_point_weight: 1.0
+  q_peak_weight: 0.25
+  q_volume_weight: 0.25
+
+validation_selection:
+  mode: val_loss
+
+optimizer:
+  name: adamw
+  lr: 0.001
+  weight_decay: 1.0e-5
+train_sampling:
+  enabled: false
+hyperparameter_optimization:
+  enabled: false
+training:
+  epochs: 100
+  patience: 100
+  early_stopping: false
+  gradient_clip: 1.0
+  checkpoint: outputs/hunan_e4_v10_best.pt
+  final_checkpoint: outputs/hunan_e4_v10_final.pt
+  log_csv: outputs/hunan_e4_v10_train.csv
