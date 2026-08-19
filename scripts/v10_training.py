@@ -161,8 +161,8 @@ def _validate_v10_config(cfg: dict[str, Any]) -> None:
         "method": "train_only_station_linear_rating",
         "require_all_outlet_stations": True,
         "origin_residual_correction": True,
-        "q0_source": "observed_if_available_else_assimilated_model",
-        "z0_source": "exact_forecast_origin_observation_only",
+        "q0_source": "final_history_bin_observed_if_available_else_assimilated_model",
+        "z0_source": "final_history_bin_observation_only",
         "allow_backward_z_search": False,
     }
     wrong_stage = {
@@ -240,6 +240,10 @@ def _validate_dataset_time_contract(
         **V10_TIME_SEMANTICS,
         "dataset_declared": isinstance(declared, Mapping),
         "whole_hour_tensor_shift": False,
+        "history_qz_anchor_semantics": (
+            "final history tensor value is the retained representative observation "
+            "inside the final hourly bin, not guaranteed an exact end-of-bin instant"
+        ),
         "interpretation": (
             "rain/hydro labels are hourly bins; forecast origin is end of final "
             "history bin; targets advance by target_step_seconds"
@@ -288,9 +292,11 @@ def _finalize_v10_runtime(
     runtime["stage_prediction"] = {
         "learned_head": False,
         "method": (
-            "station TRAIN-only linear rating + forecast-origin Z residual correction"
+            "station TRAIN-only linear rating + final-history-bin Z residual correction"
         ),
         "future_z_used": False,
+        "q0_source": cfg["stage_output"]["q0_source"],
+        "z0_source": cfg["stage_output"]["z0_source"],
     }
     runtime["temporal"] = dict(cfg["temporal"])
 
@@ -362,7 +368,7 @@ def setup_v10_training(
 
 
 def setup_v10_evaluation(
-    config_path: str | Path,
+    config_path: str |Path,
     *,
     split: str = "TEST",
     dataset_root: str | Path | None = None,
