@@ -47,6 +47,7 @@ jobs:
           tests/test_v10_q_only_rating_stage.py
           tests/test_v10_q_supervised_view.py
           tests/test_v10_rating_fit.py
+          tests/test_v10_runtime_contract.py
           tests/test_hydrologic_graph_v9.py
           tests/test_v9_active_assimilation.py
           tests/test_v9_runtime_contract.py
