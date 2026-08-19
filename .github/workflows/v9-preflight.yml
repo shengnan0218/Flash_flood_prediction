@@ -19,6 +19,16 @@ jobs:
           cache: pip
       - name: Install dependencies
         run: pip install -r requirements.txt
+      - name: Reject stale imports of retired P2 P3 modules
+        shell: bash
+        run: |
+          if grep -R -n -E '(p3_consistency|p3_rating_calibrated|p2_event_evaluation|p3_rating_aligned_runtime|p3_rating_calibrated_runtime|p3_rating_calibration)' \
+            --include='*.py' --include='*.md' --include='*.yaml' .; then
+            echo 'Retired P2/P3 module reference remains in the active tree.' >&2
+            exit 1
+          fi
+      - name: Import formal Python packages
+        run: python -c "import datasets, losses, metrics, models, trainers"
       - name: Compile formal V10 V9 routing entry points
         run: >-
           python -m py_compile
@@ -45,6 +55,7 @@ jobs:
         run: >-
           pytest -q
           tests/test_v10_q_only_rating_stage.py
+          tests/test_v10_no_future_z_leakage.py
           tests/test_v10_q_supervised_view.py
           tests/test_v10_rating_fit.py
           tests/test_v10_runtime_contract.py
