@@ -1,7 +1,0 @@
-_base_: hunan_e4.yaml
-
-# 数据事件与水位基准完成上游修复后的下一次全新 E4 实验。
-# 仅隔离输出路径；模型、Q:Z=2:1、优化器、solver 和其他实验设置均继承不变。
-training:
-  checkpoint: outputs/hunan_e4_event_zqc_v1_best.pt
-  log_csv: outputs/hunan_e4_event_zqc_v1_train.csv
