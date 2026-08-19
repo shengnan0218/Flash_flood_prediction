@@ -53,7 +53,8 @@ class FixedStationLinearRatingV10(nn.Module):
             b = float(values["intercept_m"])
             lower = float(values["q_min_m3s"])
             upper = float(values["q_max_m3s"])
-            if not all(torch.isfinite(torch.tensor(v)) for v in (a, b, lower, upper)):
+            values_tensor = torch.tensor((a, b, lower, upper), dtype=torch.float64)
+            if not torch.isfinite(values_tensor).all():
                 raise ValueError(f"v10 rating station={station}参数含NaN/Inf")
             if a <= 0 or upper < lower:
                 raise ValueError(f"v10 rating station={station}参数不满足物理/范围约束")
@@ -91,19 +92,20 @@ class HydrologicGraphV10Model(HydrologicGraphV9Model):
     def __init__(self, cfg: dict[str, Any]) -> None:
         if str(cfg.get("model_version", "")).lower() != "v10":
             raise ValueError("HydrologicGraphV10Model只接受model_version=v10")
-        super().__init__(cfg)
 
-        # Remove every trainable or normalization component that exists only for
-        # the v9 independent Z head.  Historical Z normalization/encoder stays:
-        # Z history remains an explicit forecast-origin assimilation input for Q.
-        if hasattr(self, "z_head"):
-            del self.z_head
-        if hasattr(self, "node_context_projection"):
-            del self.node_context_projection
-        if hasattr(self, "dz_target_scale"):
-            del self.dz_target_scale
-        if hasattr(self, "trend_windows_seconds"):
-            delattr(self, "trend_windows_seconds")
+        # The preserved v9 base constructor historically creates its neural Z
+        # head unconditionally.  Feed it a private constructor-only compatibility
+        # view, never mutate/persist the formal v10 config, then remove every
+        # Z-only module/buffer immediately.  This keeps v9 byte-for-byte intact
+        # while ensuring the v10 state_dict/optimizer contain no neural Z path.
+        base_cfg = dict(cfg)
+        base_cfg["z_head"] = {"trend_windows_seconds": [3600, 10800, 21600]}
+        super().__init__(base_cfg)
+        self.cfg = cfg
+        del self.z_head
+        del self.node_context_projection
+        del self.dz_target_scale
+        delattr(self, "trend_windows_seconds")
 
         runtime = cfg.get("_runtime", {})
         station_ids = tuple(str(value) for value in runtime.get("v8_station_ids", ()))
@@ -120,6 +122,13 @@ class HydrologicGraphV10Model(HydrologicGraphV9Model):
             raise ValueError("v10 z0_source与正式设计不一致")
         if bool(stage.get("allow_backward_z_search", False)):
             raise ValueError("v10禁止向前搜索历史Z替代forecast-origin Z0")
+
+    @staticmethod
+    def _require_physical_q(q: torch.Tensor, label: str) -> None:
+        if not torch.isfinite(q).all():
+            raise FloatingPointError(f"v10 {label}含NaN/Inf")
+        if (q < 0).any():
+            raise ValueError(f"v10 {label}含负流量；不得在rating转换时静默截断")
 
     def forward(self, batch: HydrologicGraphBatch) -> dict[str, Any]:
         _validate_v9_batch(
@@ -288,6 +297,10 @@ class HydrologicGraphV10Model(HydrologicGraphV9Model):
             batch.q_history[:, -1],
             q0_model_corrected,
         )
+        self._require_physical_q(q_obs, "forecast Q")
+        # Missing observed Q0 has already selected the nonnegative physical/model
+        # origin.  A present but negative observed Q0 is a data-contract error.
+        self._require_physical_q(q0_analysis, "forecast-origin Q0_analysis")
 
         # Non-trainable station rating and exact Z0 residual anchoring.
         slope, intercept, rating_available_station = self.rating.station_parameters(
@@ -295,10 +308,9 @@ class HydrologicGraphV10Model(HydrologicGraphV9Model):
         )
         slope_3d = slope.view(1, 1, -1)
         intercept_3d = intercept.view(1, 1, -1)
-        z_rating_raw_abs = slope_3d * q_obs.clamp_min(0.0) + intercept_3d
+        z_rating_raw_abs = slope_3d * q_obs + intercept_3d
         z_rating_origin_abs = (
-            slope.view(1, -1) * q0_analysis.clamp_min(0.0)
-            + intercept.view(1, -1)
+            slope.view(1, -1) * q0_analysis + intercept.view(1, -1)
         )
         z0_observed_available = batch.z_mask[:, -1].bool()
         stage_origin_available = (
@@ -308,9 +320,10 @@ class HydrologicGraphV10Model(HydrologicGraphV9Model):
         stage_available_mask = stage_origin_available.unsqueeze(1).expand(
             -1, self.horizon, -1
         )
-        z_delta_candidate = slope_3d * (
-            q_obs.clamp_min(0.0) - q0_analysis.clamp_min(0.0).unsqueeze(1)
-        )
+        # For linear f_s(Q)=aQ+b the intercept cancels exactly.  Keep the
+        # difference form explicit in semantics/diagnostics, but calculate the
+        # algebraically identical slope*(Q-Q0) for numerical economy.
+        z_delta_candidate = slope_3d * (q_obs - q0_analysis.unsqueeze(1))
         z_abs_candidate = batch.z_history[:, -1].unsqueeze(1) + z_delta_candidate
         z_delta = torch.where(
             stage_available_mask, z_delta_candidate, torch.zeros_like(z_delta_candidate)
@@ -344,6 +357,9 @@ class HydrologicGraphV10Model(HydrologicGraphV9Model):
             "q_origin_observed_available": q0_observed_available,
             "stage_z0_observed_available": z0_observed_available,
             "stage_rating_available": rating_available_station,
+            "stage_rating_slope_m_per_m3s": slope,
+            "stage_rating_intercept_m": intercept,
+            "stage_rating_origin_abs_m": z_rating_origin_abs,
             "stage_origin_residual_m": origin_residual,
             "state_correction_node_available": node_obs_available,
             "state_correction_q0_residual_norm": node_q0_residual_norm,
@@ -378,8 +394,8 @@ class HydrologicGraphV10Model(HydrologicGraphV9Model):
 
         return {
             "q": q_obs,
-            # ``z`` is retained as a compatibility alias, but is derived stage
-            # only; it has no neural head and never enters the v10 training loss.
+            # ``z`` is retained only as a compatibility alias for derived Delta-Z;
+            # it has no neural head and never enters the v10 training objective.
             "z": z_delta,
             "z_delta": z_delta,
             "z_abs": z_abs,
