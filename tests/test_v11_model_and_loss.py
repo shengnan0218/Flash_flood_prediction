@@ -42,8 +42,6 @@ def _cfg() -> dict:
                 }
             }
         },
-        # Private constructor compatibility alias and official V11 artifact are
-        # deliberately the same station relationship.
         "v10_rating_curves": {
             "stations": {
                 "S1": {
@@ -148,8 +146,6 @@ def test_v11_loss_has_high_flow_term_and_no_window_peak_term() -> None:
     stats = engine.batch_statistics({"q": prediction}, batch)
     assert set(stats) == {"q_point", "q_high_flow", "q_volume"}
     assert "q_peak" not in engine.coefficients()
-    # P80=2 means every point is high-flow here; the P99 ramp increases the
-    # physical influence of the highest targets without a window maximum.
     assert stats["q_high_flow"].denominator == 6
     assert stats["q_high_flow"].numerator > 0
     loss = engine.combine(stats)
@@ -158,7 +154,7 @@ def test_v11_loss_has_high_flow_term_and_no_window_peak_term() -> None:
     assert prediction.grad is not None
 
 
-def test_v11_trainer_runs_q_only_high_flow_objective() -> None:
+def test_v11_trainer_runs_q_only_high_flow_objective_and_generalization_metrics() -> None:
     torch.manual_seed(23)
     cfg = _cfg()
     trainer = V11Trainer(HydrologicGraphV11Model(cfg), cfg, torch.device("cpu"))
@@ -171,3 +167,13 @@ def test_v11_trainer_runs_q_only_high_flow_objective() -> None:
         assert "q_peak_loss" not in result
         assert "z_loss" not in result
         assert torch.isfinite(torch.tensor(float(result["loss"])))
+    for key in (
+        "q0_observed_valid_count",
+        "q0_subset_model_nse",
+        "q0_persistence_nse",
+        "q_skill_over_persistence",
+        "delta_q_rmse",
+        "delta_q_nse",
+    ):
+        assert key in validation
+        assert key not in train
