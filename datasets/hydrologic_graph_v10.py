@@ -6,6 +6,21 @@ import pandas as pd
 from datasets.hydrologic_graph_v8 import HydrologicGraphV8Dataset
 
 
+def filter_q_supervised_samples(frame: pd.DataFrame, *, split: str) -> pd.DataFrame:
+    """Return an order-preserving read-only sample-frame view with Q supervision."""
+    if "Q_TARGET_VALID_COUNT" not in frame.columns:
+        raise ValueError(
+            "v10 Q-only TRAIN/VALIDATION要求冻结sample_index含Q_TARGET_VALID_COUNT"
+        )
+    count = pd.to_numeric(frame["Q_TARGET_VALID_COUNT"], errors="raise").astype("int64")
+    if (count < 0).any():
+        raise ValueError("Q_TARGET_VALID_COUNT不能为负")
+    result = frame.loc[count.gt(0)].copy().reset_index(drop=True)
+    if result.empty:
+        raise ValueError(f"{split}没有任何Q监督窗口，不能用于v10 Q-only学习/选择")
+    return result
+
+
 class HydrologicGraphV10Dataset(HydrologicGraphV8Dataset):
     """Reuse frozen V8 tensors, optionally retaining only Q-supervised windows.
 
@@ -21,26 +36,14 @@ class HydrologicGraphV10Dataset(HydrologicGraphV8Dataset):
         self.require_q_supervision = bool(require_q_supervision)
         self.frozen_sample_count_before_q_filter = len(self.samples)
         if not self.require_q_supervision:
-            self.q_supervised_sample_count = int(
-                pd.to_numeric(
-                    self.samples.get("Q_TARGET_VALID_COUNT", pd.Series(index=self.samples.index, data=0)),
-                    errors="coerce",
-                ).fillna(0).gt(0).sum()
+            raw = self.samples.get("Q_TARGET_VALID_COUNT")
+            self.q_supervised_sample_count = (
+                int(pd.to_numeric(raw, errors="coerce").fillna(0).gt(0).sum())
+                if raw is not None
+                else 0
             )
             return
-        if "Q_TARGET_VALID_COUNT" not in self.samples.columns:
-            raise ValueError(
-                "v10 Q-only TRAIN/VALIDATION要求冻结sample_index含Q_TARGET_VALID_COUNT"
-            )
-        count = pd.to_numeric(
-            self.samples["Q_TARGET_VALID_COUNT"], errors="raise"
-        ).astype("int64")
-        if (count < 0).any():
-            raise ValueError("Q_TARGET_VALID_COUNT不能为负")
-        keep = count.gt(0)
-        self.samples = self.samples.loc[keep].reset_index(drop=True)
-        if self.samples.empty:
-            raise ValueError(f"{self.split}没有任何Q监督窗口，不能用于v10 Q-only学习/选择")
+        self.samples = filter_q_supervised_samples(self.samples, split=self.split)
         self.q_supervised_sample_count = len(self.samples)
         self.graph_ids = tuple(sorted(self.samples["GRAPH_ID"].unique().tolist()))
         self.event_ids = tuple(sorted(self.samples["EVENT_ID"].unique().tolist()))
