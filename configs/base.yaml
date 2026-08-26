@@ -8,6 +8,10 @@ forecast_horizon: 6
 node_static_dim: 10
 edge_static_dim: 2
 hidden_dim: 32
+input_preprocessing:
+  rain_transform: log1p_train_standardized
+  static_z_clip: 5.0
+  q_history_lags_hours: [1, 3]
 device: auto
 gpu_id: 0
 batch_size: 16

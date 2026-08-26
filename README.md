@@ -57,7 +57,7 @@ python train_hunan.py \
 
 ### 3.1 产流模块
 
-- `pure_lstm`：普通 LSTM，根据标准化降雨和节点静态属性直接预测各节点侧向产流；
+- `pure_lstm`：普通 LSTM 根据标准化降雨和节点静态属性预测单位面积径流深，再按节点增量面积换算为 m³/s；
 - `water_balance_lstm`：水量平衡 LSTM，将降雨划分到快、慢两个蓄水库，并通过连续时间退水率产生侧向流量。
 
 72 h 历史降雨和未来 6 h 降雨连续输入产流模块，历史时段用于暖启动产流状态。
@@ -67,7 +67,7 @@ python train_hunan.py \
 - `pure_gnn`：按有向河网拓扑进行非物理消息传递；
 - `kinematic_wave_gnn`：采用可学习河宽和曼宁系数的隐式运动波求解器进行河道汇流。
 
-运动波模块使用河段长度、坡降以及上下游节点静态属性，并逐时维持河道蓄量和质量平衡诊断。
+运动波模块使用原始河段长度和坡降求解物理方程，并使用标准化节点/边属性估计有效河宽和曼宁系数。普通 GNN 同样使用标准化静态属性，并根据 `log1p(Q)` 学习相对于上游流量的传递量。运动波模块逐时维持河道蓄量和质量平衡诊断。
 
 ### 3.3 全连接输出层
 
@@ -77,7 +77,7 @@ python train_hunan.py \
 Qbase(t) = Q0 + Qroute(t) - Qroute(0)
 ```
 
-小型 MLP 根据路由结果、Q0、站点流量尺度、预报时效和出口静态属性给出有界修正，最终输出非负 Q。Q0 不用于修改 LSTM 隐状态或河道蓄量。
+小型 MLP 根据路由结果、最近有效 Q、观测时距、1 h/3 h 流量变化、站点流量尺度、预报时效和出口静态属性给出有界修正，最终输出非负 Q。预报起点 Q 缺失时使用 24 h 窗口内最近有效观测，并显式输入距预报起点的小时数。Q 观测不用于修改 LSTM 隐状态或河道蓄量。
 
 水位 Z 不作为训练目标，由 TRAIN 数据拟合的固定站点线性 rating curve 从预测 Q 推导，用于评价与结果输出。
 
@@ -249,6 +249,7 @@ outputs/                         checkpoint、日志和评价结果
 | `runoff_mode` | `pure_lstm` 或 `water_balance_lstm` |
 | `routing_mode` | `pure_gnn` 或 `kinematic_wave_gnn` |
 | `hidden_dim` | LSTM/GNN 隐藏维度 |
+| `input_preprocessing` | 降雨变换、静态属性裁剪和 Q 历史时距 |
 | `batch_size` | 同一 graph mini-batch 大小 |
 | `data.dataset_root` | 模型数据集目录 |
 | `data.future_rainfall_mode` | `observed_hindcast`、`zero` 或 `persistence` |
@@ -258,3 +259,12 @@ outputs/                         checkpoint、日志和评价结果
 | `training` | epoch、输出路径和梯度裁剪 |
 
 修改实验参数时，应同时修改 `training.checkpoint`、`training.final_checkpoint` 和 `training.log_csv`，保证不同实验输出互不覆盖。
+
+### 输入标准化
+
+- 降雨：先执行 `log1p`，再使用 TRAIN 样本计算的均值和标准差进行标准化；
+- 节点静态属性：使用 TRAIN-only 均值和标准差标准化，并裁剪到 `[-5, 5]`；
+- GNN 神经网络边特征：使用 TRAIN-only 均值和标准差标准化，并裁剪到 `[-5, 5]`；
+- 运动波方程中的河段长度和坡降：保留原始物理量，不使用标准化值；
+- Q loss 与输出层：使用 TRAIN-only、per-station Q 均值和尺度；
+- 所有 normalization、洪水阈值和 rating curve 均只从 TRAIN 生成，评价阶段重新读取 TRAIN 作为统计参考，不使用 VALIDATION/TEST 拟合。

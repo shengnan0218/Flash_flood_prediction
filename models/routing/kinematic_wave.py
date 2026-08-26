@@ -104,6 +104,7 @@ class KinematicWaveGNN(nn.Module):
         edge_static: torch.Tensor,
         initial_edge_discharge: torch.Tensor | None = None,
         initial_edge_storage: torch.Tensor | None = None,
+        neural_edge_static: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         with torch.autocast(device_type=q_lat.device.type, enabled=False):
             q_lat = q_lat.float()
@@ -140,8 +141,14 @@ class KinematicWaveGNN(nn.Module):
             slope = slope.clamp_min(minimum_slope)
             source, destination = edge_index
 
-            edge_ml = torch.sign(edge_static) * torch.log1p(edge_static.abs())
-            node_ml = torch.sign(node_static) * torch.log1p(node_static.abs())
+            edge_ml = (
+                torch.sign(edge_static) * torch.log1p(edge_static.abs())
+                if neural_edge_static is None
+                else neural_edge_static.float()
+            )
+            if edge_ml.shape != edge_static.shape or not torch.isfinite(edge_ml).all():
+                raise ValueError("neural_edge_static必须与edge_static同形且有限")
+            node_ml = node_static
             parameters = torch.cat(
                 [edge_ml, node_ml[source], node_ml[destination]], dim=-1
             )
@@ -364,8 +371,9 @@ class PureDirectedGNN(nn.Module):
             nn.Linear(1 + edge_static_dim + 2 * node_static_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, 1),
-            nn.Softplus(),
         )
+        nn.init.zeros_(self.msg[-1].weight)
+        nn.init.zeros_(self.msg[-1].bias)
         self._order: list[int] = []
         self._key: tuple[int, tuple[int, ...]] | None = None
 
@@ -377,6 +385,7 @@ class PureDirectedGNN(nn.Module):
         edge_static: torch.Tensor,
         initial_edge_discharge: torch.Tensor | None = None,
         initial_edge_storage: torch.Tensor | None = None,
+        neural_edge_static: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         if initial_edge_discharge is not None or initial_edge_storage is not None:
             raise ValueError("pure_gnn routing不支持physical initial edge state")
@@ -386,8 +395,14 @@ class PureDirectedGNN(nn.Module):
             _, self._order = topological_levels(edge_index, nodes)
             self._key = key
         source, destination = edge_index
-        edge_features = torch.sign(edge_static) * torch.log1p(edge_static.abs())
-        node_features = torch.sign(node_static) * torch.log1p(node_static.abs())
+        edge_features = (
+            torch.sign(edge_static) * torch.log1p(edge_static.abs())
+            if neural_edge_static is None
+            else neural_edge_static
+        )
+        if edge_features.shape != edge_static.shape or not torch.isfinite(edge_features).all():
+            raise ValueError("neural_edge_static必须与edge_static同形且有限")
+        node_features = node_static
         outputs: list[torch.Tensor] = []
         for time_index in range(steps):
             q = q_lat[:, time_index].clone()
@@ -396,7 +411,7 @@ class PureDirectedGNN(nn.Module):
                 if edge_ids.numel():
                     message_input = torch.cat(
                         [
-                            q[:, node, None]
+                            torch.log1p(q[:, node, None].clamp_min(0.0))
                             .expand(-1, edge_ids.numel())
                             .unsqueeze(-1),
                             edge_features[edge_ids][None].expand(batch, -1, -1),
@@ -409,9 +424,11 @@ class PureDirectedGNN(nn.Module):
                         ],
                         dim=-1,
                     )
-                    q.index_add_(
-                        1, destination[edge_ids], self.msg(message_input).squeeze(-1)
+                    transfer_factor = torch.nn.functional.softplus(
+                        self.msg(message_input).squeeze(-1)
                     )
+                    messages = transfer_factor * q[:, node, None]
+                    q.index_add_(1, destination[edge_ids], messages)
             outputs.append(q)
         routed = torch.stack(outputs, dim=1)
         return routed, {

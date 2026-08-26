@@ -5,7 +5,7 @@ import torch
 
 from data.hydrologic_schema import HydrologicGraphBatch
 from losses.hydrologic_loss import HydrologicLoss
-from models.hydrologic_model import HydrologicModel
+from models.hydrologic_model import HydrologicModel, PureRunoffLSTM
 from scripts.training import load_yaml
 
 
@@ -21,10 +21,12 @@ def config(runoff: str, routing: str) -> dict:
     cfg["_runtime"] = {
         "station_ids": ["S1"],
         "normalization": {
-            "rain_mean": 0.0,
-            "rain_scale": 1.0,
+            "log_rain_mean": 0.0,
+            "log_rain_scale": 1.0,
             "node_static_mean": [0.0] * 10,
             "node_static_scale": [1.0] * 10,
+            "edge_static_mean": [1000.0, 0.01],
+            "edge_static_scale": [500.0, 0.005],
             "q_target_mean": [0.0],
             "q_target_scale": [2.0],
         },
@@ -109,3 +111,31 @@ def test_future_stage_truth_is_never_read() -> None:
     after = model(sample)
     torch.testing.assert_close(after["q"], before["q"], rtol=0, atol=0)
     torch.testing.assert_close(after["z_delta"], before["z_delta"], rtol=0, atol=0)
+
+
+def test_pure_runoff_uses_incremental_area_conversion() -> None:
+    torch.manual_seed(31)
+    runoff = PureRunoffLSTM(input_dim=3, hidden_dim=4)
+    features = torch.zeros(1, 2, 2, 3)
+    q, diagnostics = runoff(
+        features, torch.tensor([1.0, 2.0]), seconds=3600.0
+    )
+    torch.testing.assert_close(q[:, :, 1], 2.0 * q[:, :, 0])
+    assert diagnostics["unit_runoff_mm"].shape == (1, 2, 2)
+
+
+def test_latest_available_q_and_trends_feed_output_head() -> None:
+    model = HydrologicModel(config("pure_lstm", "pure_gnn")).eval()
+    sample = batch()
+    sample.q_mask[:, -1] = False
+    sample.q_history[:, -1] = 0.0
+    output = model(sample)
+    torch.testing.assert_close(
+        output["diagnostics"]["q_origin_observation_age_hours"],
+        torch.ones(1, 1),
+    )
+    torch.testing.assert_close(
+        output["q0_analysis"], sample.q_history[:, -2]
+    )
+    assert output["diagnostics"]["q_delta_1h_available"].all()
+    assert output["diagnostics"]["q_delta_3h_available"].all()

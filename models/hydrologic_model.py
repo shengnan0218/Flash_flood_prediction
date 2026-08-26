@@ -29,19 +29,29 @@ def _buffer(values: Any) -> torch.Tensor:
 
 
 class PureRunoffLSTM(nn.Module):
-    """Unconstrained runoff ablation with the same inputs and hidden width."""
+    """Unconstrained unit-runoff LSTM with physically consistent area scaling."""
 
     def __init__(self, input_dim: int, hidden_dim: int) -> None:
         super().__init__()
         self.lstm = nn.LSTM(input_dim, hidden_dim, batch_first=True)
         self.head = nn.Sequential(nn.Linear(hidden_dim, 1), nn.Softplus())
 
-    def forward(self, features: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    def forward(
+        self,
+        features: torch.Tensor,
+        area_km2: torch.Tensor,
+        *,
+        seconds: float,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         batch, steps, nodes, width = features.shape
         sequence = features.permute(0, 2, 1, 3).reshape(batch * nodes, steps, width)
         encoded, _ = self.lstm(sequence)
-        q = self.head(encoded).reshape(batch, nodes, steps).permute(0, 2, 1)
-        return q, {"runoff_water_balance_residual": torch.full_like(q, float("nan"))}
+        runoff_mm = self.head(encoded).reshape(batch, nodes, steps).permute(0, 2, 1)
+        q = runoff_mm * area_km2.view(1, 1, nodes) * 1000.0 / float(seconds)
+        return q, {
+            "unit_runoff_mm": runoff_mm,
+            "runoff_water_balance_residual": torch.full_like(q, float("nan")),
+        }
 
 
 class FixedStationRating(nn.Module):
@@ -77,7 +87,7 @@ class ResidualOutputMLP(nn.Module):
         super().__init__()
         self.max_scale_fraction = float(max_scale_fraction)
         self.network = nn.Sequential(
-            nn.Linear(static_dim + 5, hidden_dim),
+            nn.Linear(static_dim + 10, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, 1),
         )
@@ -90,6 +100,11 @@ class ResidualOutputMLP(nn.Module):
         routed_q0: torch.Tensor,
         observed_q0: torch.Tensor,
         q0_available: torch.Tensor,
+        q0_age_hours: torch.Tensor,
+        q_delta_1h: torch.Tensor,
+        q_delta_1h_available: torch.Tensor,
+        q_delta_3h: torch.Tensor,
+        q_delta_3h_available: torch.Tensor,
         q_mean: torch.Tensor,
         q_scale: torch.Tensor,
         outlet_static: torch.Tensor,
@@ -111,6 +126,11 @@ class ResidualOutputMLP(nn.Module):
                 (route_delta / scale).unsqueeze(-1),
                 ((q0 - mean) / scale).expand(-1, horizon, -1).unsqueeze(-1),
                 available.expand(-1, horizon, -1).to(routed_q.dtype).unsqueeze(-1),
+                (q0_age_hours.unsqueeze(1) / 23.0).expand(-1, horizon, -1).unsqueeze(-1),
+                (q_delta_1h.unsqueeze(1) / scale).expand(-1, horizon, -1).unsqueeze(-1),
+                q_delta_1h_available.unsqueeze(1).expand(-1, horizon, -1).to(routed_q.dtype).unsqueeze(-1),
+                (q_delta_3h.unsqueeze(1) / scale).expand(-1, horizon, -1).unsqueeze(-1),
+                q_delta_3h_available.unsqueeze(1).expand(-1, horizon, -1).to(routed_q.dtype).unsqueeze(-1),
                 lead.unsqueeze(-1),
                 static,
             ],
@@ -137,16 +157,26 @@ class HydrologicModel(nn.Module):
         self.node_static_dim = int(cfg["node_static_dim"])
         self.edge_static_dim = int(cfg["edge_static_dim"])
         self.hidden_dim = int(cfg["hidden_dim"])
+        preprocessing = cfg["input_preprocessing"]
+        if preprocessing.get("rain_transform") != "log1p_train_standardized":
+            raise ValueError("rain_transform must be log1p_train_standardized")
+        if tuple(preprocessing.get("q_history_lags_hours", ())) != (1, 3):
+            raise ValueError("q_history_lags_hours must be [1, 3]")
+        self.static_z_clip = float(preprocessing["static_z_clip"])
+        if not 0 < self.static_z_clip <= 10:
+            raise ValueError("static_z_clip must be in (0, 10]")
         runtime = cfg.get("_runtime", {})
         normal = runtime.get("normalization")
         station_ids = tuple(runtime.get("station_ids", ()))
         if not isinstance(normal, Mapping) or not station_ids:
             raise ValueError("model runtime normalization/station catalogue missing")
 
-        self.register_buffer("rain_mean", _buffer(normal["rain_mean"]).reshape(()))
-        self.register_buffer("rain_scale", _buffer(normal["rain_scale"]).reshape(()))
+        self.register_buffer("log_rain_mean", _buffer(normal["log_rain_mean"]).reshape(()))
+        self.register_buffer("log_rain_scale", _buffer(normal["log_rain_scale"]).reshape(()))
         self.register_buffer("node_mean", _buffer(normal["node_static_mean"]).reshape(1, -1))
         self.register_buffer("node_scale", _buffer(normal["node_static_scale"]).reshape(1, -1))
+        self.register_buffer("edge_mean", _buffer(normal["edge_static_mean"]).reshape(1, -1))
+        self.register_buffer("edge_scale", _buffer(normal["edge_static_scale"]).reshape(1, -1))
         self.register_buffer("q_mean", _buffer(normal["q_target_mean"]).reshape(-1))
         self.register_buffer("q_scale", _buffer(normal["q_target_scale"]).reshape(-1))
 
@@ -188,21 +218,68 @@ class HydrologicModel(nn.Module):
                 static, rain, area,
                 seconds=float(self.cfg["solver"]["seconds_per_step"]),
             )
-        return self.runoff(torch.cat([rain_norm, static], dim=-1))
+        return self.runoff(
+            torch.cat([rain_norm, static], dim=-1),
+            area,
+            seconds=float(self.cfg["solver"]["seconds_per_step"]),
+        )
+
+    @staticmethod
+    def _latest_observation(
+        values: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        hours = values.shape[1]
+        positions = torch.arange(hours, device=values.device).view(1, hours, 1)
+        indices = torch.where(mask, positions, torch.zeros_like(positions)).amax(dim=1)
+        available = mask.any(dim=1)
+        latest = values.gather(1, indices.unsqueeze(1)).squeeze(1)
+        latest = torch.where(available, latest, torch.zeros_like(latest))
+        age = (hours - 1 - indices).to(values.dtype)
+        return latest, available, age
+
+    @staticmethod
+    def _lag_delta(
+        values: torch.Tensor,
+        mask: torch.Tensor,
+        latest_indices: torch.Tensor,
+        lag: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        lag_indices = (latest_indices - int(lag)).clamp_min(0)
+        latest = values.gather(1, latest_indices.unsqueeze(1)).squeeze(1)
+        lagged = values.gather(1, lag_indices.unsqueeze(1)).squeeze(1)
+        latest_ok = mask.gather(1, latest_indices.unsqueeze(1)).squeeze(1)
+        lagged_ok = mask.gather(1, lag_indices.unsqueeze(1)).squeeze(1)
+        available = latest_ok & lagged_ok & latest_indices.ge(int(lag))
+        delta = torch.where(available, latest - lagged, torch.zeros_like(latest))
+        return delta, available
 
     def forward(self, batch: HydrologicGraphBatch) -> dict[str, Any]:
         validate_hydrologic_batch(batch)
         history = batch.history_rain
         future = batch.future_rain
         rain = torch.cat([history, future], dim=1)
-        rain_norm = (rain - self.rain_mean.to(rain)) / self.rain_scale.to(rain)
-        static_norm = (batch.node_static - self.node_mean.to(batch.node_static)) / self.node_scale.to(batch.node_static)
+        rain_norm = (
+            torch.log1p(rain) - self.log_rain_mean.to(rain)
+        ) / self.log_rain_scale.to(rain)
+        static_norm = (
+            (batch.node_static - self.node_mean.to(batch.node_static))
+            / self.node_scale.to(batch.node_static)
+        ).clamp(-self.static_z_clip, self.static_z_clip)
+        edge_norm = (
+            (batch.edge_static - self.edge_mean.to(batch.edge_static))
+            / self.edge_scale.to(batch.edge_static)
+        ).clamp(-self.static_z_clip, self.static_z_clip)
         q_lat_all, runoff_diag = self._runoff(
             rain, rain_norm, static_norm, batch.incremental_area_km2
         )
 
         q_nodes_all, routing_diag = self.routing(
-            q_lat_all, batch.node_static, batch.edge_index, batch.edge_static
+            q_lat_all,
+            static_norm,
+            batch.edge_index,
+            batch.edge_static,
+            neural_edge_static=edge_norm,
         )
         origin_index = history.shape[1] - 1
         q_nodes = q_nodes_all[:, -self.horizon:]
@@ -213,22 +290,35 @@ class HydrologicModel(nn.Module):
         station_index = batch.obs_station_index.long()
         q_mean = self.q_mean[station_index].to(routed_q)
         q_scale = self.q_scale[station_index].to(routed_q)
-        q0_available = batch.q_mask[:, -1].bool()
-        observed_q0 = torch.where(q0_available, batch.q_history[:, -1], routed_q0)
+        observed_q0, q0_available, q0_age = self._latest_observation(
+            batch.q_history, batch.q_mask.bool()
+        )
+        history_hours = batch.q_history.shape[1]
+        latest_index = (history_hours - 1 - q0_age.long()).clamp(0, history_hours - 1)
+        q_delta_1h, q_delta_1h_available = self._lag_delta(
+            batch.q_history, batch.q_mask.bool(), latest_index, 1
+        )
+        q_delta_3h, q_delta_3h_available = self._lag_delta(
+            batch.q_history, batch.q_mask.bool(), latest_index, 3
+        )
+        observed_q0 = torch.where(q0_available, observed_q0, routed_q0)
         outlet_static = static_norm.index_select(0, obs_node)
         q, q_base, q_correction = self.output_head(
             routed_q, routed_q0, observed_q0, q0_available,
+            q0_age, q_delta_1h, q_delta_1h_available,
+            q_delta_3h, q_delta_3h_available,
             q_mean, q_scale, outlet_static,
         )
 
         slope, intercept, rating_available = self.rating.select(station_index, q)
-        z0_available = batch.z_mask[:, -1].bool()
-        z_available = z0_available & rating_available.view(1, -1)
+        z_anchor = batch.z_history.gather(1, latest_index.unsqueeze(1)).squeeze(1)
+        z0_available = batch.z_mask.bool().gather(1, latest_index.unsqueeze(1)).squeeze(1)
+        z_available = q0_available & z0_available & rating_available.view(1, -1)
         z_delta_candidate = slope.view(1, 1, -1) * (q - observed_q0.unsqueeze(1))
         z_delta = torch.where(z_available.unsqueeze(1), z_delta_candidate, torch.zeros_like(z_delta_candidate))
         z_abs = torch.where(
             z_available.unsqueeze(1),
-            batch.z_history[:, -1].unsqueeze(1) + z_delta,
+            z_anchor.unsqueeze(1) + z_delta,
             torch.zeros_like(z_delta),
         )
         z_raw = slope.view(1, 1, -1) * q + intercept.view(1, 1, -1)
@@ -252,5 +342,10 @@ class HydrologicModel(nn.Module):
                 "q_residual_base_m3s": q_base,
                 "q_output_correction_m3s": q_correction,
                 "q_origin_observed_available": q0_available,
+                "q_origin_observation_age_hours": q0_age,
+                "q_delta_1h_m3s": q_delta_1h,
+                "q_delta_1h_available": q_delta_1h_available,
+                "q_delta_3h_m3s": q_delta_3h,
+                "q_delta_3h_available": q_delta_3h_available,
             },
         }

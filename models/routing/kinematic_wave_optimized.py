@@ -235,6 +235,7 @@ class KinematicWaveGNN(nn.Module):
         edge_static: torch.Tensor,
         initial_edge_discharge: torch.Tensor | None = None,
         initial_edge_storage: torch.Tensor | None = None,
+        neural_edge_static: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         with torch.autocast(device_type=q_lat.device.type, enabled=False):
             q_lat = q_lat.float()
@@ -271,8 +272,14 @@ class KinematicWaveGNN(nn.Module):
             slope = slope_raw.clamp_min(minimum_slope)
             source, destination = edge_index
 
-            edge_ml = torch.sign(edge_static) * torch.log1p(edge_static.abs())
-            node_ml = torch.sign(node_static) * torch.log1p(node_static.abs())
+            edge_ml = (
+                torch.sign(edge_static) * torch.log1p(edge_static.abs())
+                if neural_edge_static is None
+                else neural_edge_static.float()
+            )
+            if edge_ml.shape != edge_static.shape or not torch.isfinite(edge_ml).all():
+                raise ValueError("neural_edge_static必须与edge_static同形且有限")
+            node_ml = node_static
             parameters = torch.cat(
                 [edge_ml, node_ml[source], node_ml[destination]], dim=-1
             )
