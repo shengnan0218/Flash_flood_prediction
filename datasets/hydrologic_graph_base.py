@@ -11,7 +11,10 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader, Dataset, Sampler
 
-from data.hydrologic_schema import HydrologicGraphBatch, validate_hydrologic_batch
+from data.hydrologic_schema import (
+    HydrologicGraphBatch,
+    validate_hydrologic_base_batch,
+)
 
 
 CONTRACT_NAME = "hydrologic-computational-graph-sparse-observation-v1"
@@ -361,7 +364,7 @@ def collate_hydrologic_graph_base(
     for name in ("sample_id", "event_id", "graph_id", "forecast_time"):
         kwargs[name] = tuple(getattr(item, name) for item in items)
     batch = HydrologicGraphBatch(**kwargs)
-    validate_hydrologic_batch(batch)
+    validate_hydrologic_base_batch(batch)
     return batch
 
 
