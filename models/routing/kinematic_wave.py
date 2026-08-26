@@ -428,7 +428,7 @@ class PureDirectedGNN(nn.Module):
                         self.msg(message_input).squeeze(-1)
                     )
                     messages = transfer_factor * q[:, node, None]
-                    q.index_add_(1, destination[edge_ids], messages)
+                    q = q.index_add(1, destination[edge_ids], messages)
             outputs.append(q)
         routed = torch.stack(outputs, dim=1)
         return routed, {
