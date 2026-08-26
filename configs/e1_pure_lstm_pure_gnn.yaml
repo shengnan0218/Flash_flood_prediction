@@ -1,0 +1,7 @@
+_base_: base.yaml
+runoff_mode: pure_lstm
+routing_mode: pure_gnn
+training:
+  checkpoint: outputs/e1_pure_lstm_pure_gnn_best.pt
+  final_checkpoint: outputs/e1_pure_lstm_pure_gnn_final.pt
+  log_csv: outputs/e1_pure_lstm_pure_gnn_train.csv

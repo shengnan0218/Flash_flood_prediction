@@ -1,9 +1,0 @@
-_base_: hunan_v9_base.yaml
-
-runoff_mode: pure_lstm
-routing_mode: pure_gnn
-
-training:
-  checkpoint: outputs/hunan_e1_v9_best.pt
-  final_checkpoint: outputs/hunan_e1_v9_final.pt
-  log_csv: outputs/hunan_e1_v9_train.csv

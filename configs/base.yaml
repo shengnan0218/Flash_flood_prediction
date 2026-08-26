@@ -1,36 +1,48 @@
+model: hydrologic_lstm_gnn_fc
 seed: 42
 runoff_mode: water_balance_lstm
 routing_mode: kinematic_wave_gnn
-history_length: 12
+history_length: 72
+observation_history_length: 24
 forecast_horizon: 6
-dynamic_dim: 4
-node_static_dim: 3
+node_static_dim: 10
 edge_static_dim: 2
 hidden_dim: 32
 device: auto
 gpu_id: 0
-batch_size: 4
+batch_size: 16
 gradient_accumulation_steps: 1
 amp: false
 gradient_checkpointing: false
 num_workers: 0
 pin_memory: false
-debug_mode: true
-debug_num_events: 16
+debug_mode: false
 debug_max_batches: 4
 data:
-  mode: synthetic
+  mode: hunan
   dataset_type: event
-  dataset_root: null
+  dataset_root: _model_dataset_v11_72h_event_balanced
   graph_id: null
-  target_variable: BOTH
-  normalize_dynamic: false
+  target_variable: Q
   strict_validation: true
-  use_observation_masks: false
+  use_observation_masks: true
   future_rainfall_mode: observed_hindcast
   train_split: TRAIN
   validation_split: VALIDATION
   test_split: TEST
+temporal:
+  rain_history_duration_seconds: 259200
+  observation_history_duration_seconds: 86400
+  forecast_duration_seconds: 21600
+  forcing_step_seconds: 3600
+  target_step_seconds: 3600
+output_head:
+  type: q0_anchored_bounded_residual_mlp
+  hidden_dim: 32
+  max_correction_scale_fraction: 0.5
+stage_output:
+  method: train_only_station_linear_rating
+  min_unique_train_pairs: 20
 physical_bounds:
   width: [2.0, 80.0]
   manning_n: [0.015, 0.12]
@@ -43,66 +55,29 @@ solver:
   minimum_slope: 1.0e-6
   minimum_length: 10.0
   seconds_per_step: 3600.0
-loss_weights: {discharge: 2.0, water_level: 1.0}
 loss:
-  # legacy完整保留原始 2*Q Huber + 1*Z Huber；multitask由新配置显式开启。
-  mode: legacy
-  # global保持既有TRAIN全局FLOW std；per_graph仅允许湖南multitask实验。
-  q_scale_mode: global
+  mode: q_only_high_flow
+  q_scale_mode: per_station
   q_scale_floor_m3s: 1.0
-  z_target_mode: absolute
-  delta_z_scale_mode: global
-  delta_z_scale_floor_m: 0.01
-  discharge_weight: 2.0
-  water_level_weight: 1.0
   q_point_weight: 1.0
-  q_peak_weight: 0.25
+  q_high_flow_weight: 0.25
   q_volume_weight: 0.25
-  z_level_weight: 1.0
-  z_slope_weight: 0.25
+  high_flow_lower_quantile: 0.80
+  high_flow_upper_quantile: 0.99
+  high_flow_max_multiplier: 3.0
 validation_selection:
   mode: val_loss
-  q_nse_weight: 0.35
-  q_kge_weight: 0.15
-  q_peak_weight: 0.20
-  q_volume_weight: 0.10
-  z_level_weight: 0.10
-  z_slope_weight: 0.10
-  efficiency_clip_min: -1.0
-  efficiency_clip_max: 1.0
-hyperparameter_optimization:
-  enabled: false
-  n_trials: 40
-  output_dir: outputs/hpo_e4_multitask_v1
-  sampler: {name: tpe, seed: 42}
-  pruner:
-    name: median
-    n_startup_trials: 5
-    n_warmup_steps: 10
-    interval_steps: 1
-  search_space:
-    learning_rate: {type: log_float, low: 1.0e-4, high: 2.0e-3}
-    weight_decay: {type: log_float, low: 1.0e-6, high: 1.0e-3}
-    hidden_dim: {type: categorical, choices: [32, 64, 96]}
-    q_peak_weight: {type: log_float, low: 0.05, high: 1.0}
-    q_volume_weight: {type: log_float, low: 0.05, high: 1.0}
-    z_slope_weight: {type: log_float, low: 0.05, high: 1.0}
 optimizer: {name: adamw, lr: 0.001, weight_decay: 1.0e-5}
 train_sampling:
-  enabled: false
-  response_strength: 1.0
-  response_cap: 4.0
-  minimum_weight: 0.25
-  maximum_weight: 4.0
+  enabled: true
+  mode: event_balanced_phase_stratified
+  origins_per_event: 8
+  phase_quota: 2
 training:
-  epochs: 5
-  patience: 5
-  early_stopping: true
+  epochs: 100
+  patience: 100
+  early_stopping: false
   gradient_clip: 1.0
-  checkpoint: outputs/best.pt
-  final_checkpoint: null
-  log_csv: outputs/train.csv
-transfer_learning:
-  strategy: observation_only
-  stages: [observation_only, observation_and_edge_parameters, full_finetune]
-  full_finetune_lr: 1.0e-5
+  checkpoint: outputs/e4_best.pt
+  final_checkpoint: outputs/e4_final.pt
+  log_csv: outputs/e4_train.csv

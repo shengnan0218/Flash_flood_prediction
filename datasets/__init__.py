@@ -10,6 +10,7 @@ from .hunan import (
 )
 from .continuous_sampling import HunanContinuousDataset
 from .normalization import FeatureStatistics, HunanScaler, NormalizationStats
+from .hydrologic_graph import HydrologicGraphDataset, build_hydrologic_graph_loader
 
 __all__ = [
     "SyntheticEventDataset",
@@ -25,4 +26,6 @@ __all__ = [
     "NormalizationStats",
     "NODE_STATIC_FEATURES",
     "EDGE_STATIC_MODEL_FEATURES",
+    "HydrologicGraphDataset",
+    "build_hydrologic_graph_loader",
 ]

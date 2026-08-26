@@ -1,0 +1,7 @@
+_base_: base.yaml
+runoff_mode: pure_lstm
+routing_mode: kinematic_wave_gnn
+training:
+  checkpoint: outputs/e3_pure_lstm_kinematic_wave_gnn_best.pt
+  final_checkpoint: outputs/e3_pure_lstm_kinematic_wave_gnn_final.pt
+  log_csv: outputs/e3_pure_lstm_kinematic_wave_gnn_train.csv

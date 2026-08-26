@@ -3,5 +3,6 @@ from .flood_multitask_loss import (
     LossTerm,
     water_level_first_differences,
 )
+from .hydrologic_loss import HydrologicLoss
 
-__all__ = ["FloodMultitaskLoss", "LossTerm", "water_level_first_differences"]
+__all__ = ["FloodMultitaskLoss", "HydrologicLoss", "LossTerm", "water_level_first_differences"]

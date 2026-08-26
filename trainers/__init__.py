@@ -1,1 +1,3 @@
-from .trainer import Trainer
+from .hydrologic_trainer import HydrologicTrainer
+
+__all__ = ["HydrologicTrainer"]
