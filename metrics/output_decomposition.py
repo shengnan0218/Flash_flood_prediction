@@ -114,7 +114,7 @@ def evaluate_output_decomposition(
 ) -> dict[str, Any]:
     """Evaluate persistence, routed base and final Q on one Q0-valid subset.
 
-    routed_base is exactly the output head's Q0-anchored physical base with
+    ``routed_base`` is exactly the output head's Q0-anchored physical base with
     the final non-negative clamp retained and the FC correction disabled.  The
     three methods therefore differ only in the information they add after Q0.
     """
@@ -165,11 +165,16 @@ def evaluate_output_decomposition(
             raise ValueError("obs_station_ids数量与Q observation维度不一致")
         for index, station_id in enumerate(station_ids):
             group = by_station.setdefault(station_id, _new_group())
+            station_target = target[:, :, index]
+            # Keep the batch axis explicit.  A bare ``q0[:, index]`` has
+            # shape [batch] and is incorrectly aligned against the forecast
+            # axis when ``batch != horizon``.
+            station_q0 = q0[:, index].unsqueeze(1).expand_as(station_target)
             _update_group(
                 group,
                 {name: value[:, :, index] for name, value in predictions.items()},
-                target[:, :, index],
-                q0[:, index],
+                station_target,
+                station_q0,
                 valid[:, :, index],
             )
 
