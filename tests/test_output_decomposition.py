@@ -5,6 +5,7 @@ import torch
 from torch import nn
 
 from metrics.output_decomposition import evaluate_output_decomposition
+from trainers.trainer import _is_cuda_out_of_memory
 
 
 class _Batch:
@@ -48,3 +49,8 @@ def test_decomposition_separates_full_route_and_gated_route(tmp_path: Path) -> N
     assert Path(result["files"]["summary"]).exists()
     assert Path(result["files"]["by_lead"]).exists()
     assert Path(result["files"]["by_station"]).exists()
+
+
+def test_oom_detection_does_not_depend_on_torch_root_alias() -> None:
+    assert _is_cuda_out_of_memory(RuntimeError("CUDA out of memory."))
+    assert not _is_cuda_out_of_memory(RuntimeError("unrelated routing failure"))

@@ -182,6 +182,16 @@ def test_muskingum_route_has_travel_time_prior_and_mass_closure() -> None:
     )
 
 
+def test_muskingum_rejects_unstable_positive_x_before_training() -> None:
+    cfg = config("water_balance_lstm", "muskingum_gnn")
+    cfg["muskingum_routing"] = dict(cfg["muskingum_routing"])
+    cfg["muskingum_routing"]["muskingum_x"] = 0.20
+    with pytest.raises(ValueError, match="上界与muskingum_x"):
+        MuskingumGraphRouter(
+            10, 2, 8, cfg["muskingum_routing"], seconds_per_step=3600.0
+        )
+
+
 def test_latest_available_q_and_trends_feed_output_head() -> None:
     model = HydrologicModel(config("pure_lstm", "pure_gnn")).eval()
     sample = batch()

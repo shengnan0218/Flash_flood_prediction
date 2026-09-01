@@ -104,6 +104,21 @@ class MuskingumGraphRouter(nn.Module):
                 "travel_time_bounds_hours下界必须满足Muskingum非负系数稳定条件："
                 f">={stability_minimum_hours:.6g} h"
             )
+        # For X>0, a fixed external time step also sets an upper K bound for
+        # non-negative C0.  Check the complete configured range at startup,
+        # rather than failing only when the first long reach is routed.
+        # X=0 is the linear-reservoir Muskingum special case and has no upper
+        # K bound, which makes it appropriate for the hourly forecasts here.
+        if self.muskingum_x > 0.0:
+            stability_maximum_hours = self.dt / (
+                2.0 * self.muskingum_x * 3600.0
+            )
+            if travel_bounds[1] > stability_maximum_hours:
+                raise ValueError(
+                    "travel_time_bounds_hours上界与muskingum_x/时间步不兼容；"
+                    f"X={self.muskingum_x:.6g}时必须<={stability_maximum_hours:.6g} h，"
+                    "或使用X=0的线性蓄水库Muskingum特例"
+                )
         self.velocity_low, self.velocity_high = velocity_bounds
         self.travel_time_low_h, self.travel_time_high_h = travel_bounds
         self.travel_time_network = EdgeTravelTimeNetwork(

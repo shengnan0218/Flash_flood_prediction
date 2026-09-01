@@ -57,6 +57,25 @@ _HYDROGRAPH_SUM_FIELDS = (
 )
 
 
+def _is_cuda_out_of_memory(error: RuntimeError) -> bool:
+    """Recognise CUDA OOM across supported PyTorch releases.
+
+    PyTorch 2.2 exposes ``torch.cuda.OutOfMemoryError`` but not the later
+    ``torch.OutOfMemoryError`` alias.  Referring to the latter directly in an
+    ``except`` clause can mask the original training error while Python tries
+    to match the clause.
+    """
+
+    error_types: list[type[BaseException]] = []
+    for owner in (torch, getattr(torch, "cuda", None)):
+        candidate = getattr(owner, "OutOfMemoryError", None)
+        if isinstance(candidate, type) and issubclass(candidate, BaseException):
+            error_types.append(candidate)
+    return bool(error_types and isinstance(error, tuple(error_types))) or (
+        "out of memory" in str(error).lower()
+    )
+
+
 def _empty_regression_sums() -> dict[str, float | int]:
     return {name: 0 if name == "count" else 0.0 for name in _REGRESSION_SUM_FIELDS}
 
@@ -379,7 +398,9 @@ class Trainer:
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 self.optimizer.zero_grad(set_to_none=True)
-            except torch.OutOfMemoryError as exc:
+            except RuntimeError as exc:
+                if not _is_cuda_out_of_memory(exc):
+                    raise
                 self.optimizer.zero_grad(set_to_none=True)
                 raise RuntimeError(
                     "CUDA显存不足：请降低batch_size、history_length或hidden_dim；"
