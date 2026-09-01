@@ -1,7 +1,7 @@
-model: hydrologic_lstm_gnn_fc
+model: hydrologic_lstm_graph_gate
 seed: 42
 runoff_mode: water_balance_lstm
-routing_mode: kinematic_wave_gnn
+routing_mode: muskingum_gnn
 history_length: 72
 observation_history_length: 24
 forecast_horizon: 6
@@ -40,25 +40,28 @@ temporal:
   forecast_duration_seconds: 21600
   forcing_step_seconds: 3600
   target_step_seconds: 3600
+water_balance:
+  max_unobserved_loss_fraction: 0.90
+  initial_unobserved_loss_fraction: 0.15
+muskingum_routing:
+  reference_slope_m_per_m: 0.01
+  reference_velocity_mps: 0.80
+  slope_velocity_exponent: 0.25
+  velocity_bounds_mps: [0.15, 2.50]
+  travel_time_bounds_hours: [0.625, 24.0]
+  muskingum_x: 0.20
+  max_log_travel_time_adjustment: 0.35
+  minimum_length_m: 10.0
+  minimum_slope_m_per_m: 1.0e-6
+solver:
+  seconds_per_step: 3600.0
 output_head:
-  type: q0_anchored_bounded_residual_mlp
+  type: q0_anchored_route_gate
   hidden_dim: 32
-  max_correction_scale_fraction: 0.5
+  initial_gate_fraction: 0.05
 stage_output:
   method: train_only_station_linear_rating
   min_unique_train_pairs: 20
-physical_bounds:
-  width: [2.0, 80.0]
-  manning_n: [0.015, 0.12]
-solver:
-  dx: 1000.0
-  cfl: 0.8
-  integration_scheme: backward_euler
-  implicit_iterations: 8
-  implicit_residual_tolerance: 1.0e-5
-  minimum_slope: 1.0e-6
-  minimum_length: 10.0
-  seconds_per_step: 3600.0
 loss:
   mode: q_only_high_flow
   q_scale_mode: per_station
@@ -70,7 +73,7 @@ loss:
   high_flow_upper_quantile: 0.99
   high_flow_max_multiplier: 3.0
 validation_selection:
-  mode: val_loss
+  mode: station_macro_persistence_skill
 optimizer: {name: adamw, lr: 0.001, weight_decay: 1.0e-5}
 train_sampling:
   enabled: true
@@ -78,10 +81,10 @@ train_sampling:
   origins_per_event: 8
   phase_quota: 2
 training:
-  epochs: 100
-  patience: 100
+  epochs: 30
+  patience: 30
   early_stopping: false
   gradient_clip: 1.0
-  checkpoint: outputs/e4_best.pt
-  final_checkpoint: outputs/e4_final.pt
-  log_csv: outputs/e4_train.csv
+  checkpoint: outputs/e4_water_balance_lstm_muskingum_gnn_best.pt
+  final_checkpoint: outputs/e4_water_balance_lstm_muskingum_gnn_final.pt
+  log_csv: outputs/e4_water_balance_lstm_muskingum_gnn_train.csv

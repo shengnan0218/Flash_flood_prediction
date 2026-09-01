@@ -133,9 +133,28 @@ def evaluate_station_aware(
         )
         dz_true = batch.z_target.detach().float().cpu().numpy()
         z_target_mask = batch.z_target_mask.detach().cpu().numpy().astype(bool)
-        z0 = batch.z_history[:, -1].detach().float().cpu().numpy()
-        z0_mask = batch.z_mask[:, -1].detach().cpu().numpy().astype(bool)
-        q0_mask = batch.q_mask[:, -1].detach().cpu().numpy().astype(bool)
+        # The model anchors Q and Z at the latest valid discharge observation,
+        # not necessarily the final history bin.  Reconstruct the same index
+        # here so stage coverage and extrapolation diagnostics stay truthful.
+        q0_age = (
+            output["diagnostics"]["q_origin_observation_age_hours"]
+            .detach().long()
+        )
+        latest_index = (
+            batch.z_history.shape[1] - 1 - q0_age
+        ).clamp(0, batch.z_history.shape[1] - 1)
+        z0 = (
+            batch.z_history.gather(1, latest_index.unsqueeze(1))
+            .squeeze(1).detach().float().cpu().numpy()
+        )
+        z0_mask = (
+            batch.z_mask.bool().gather(1, latest_index.unsqueeze(1))
+            .squeeze(1).detach().cpu().numpy().astype(bool)
+        )
+        q0_mask = (
+            output["diagnostics"]["q_origin_observed_available"]
+            .detach().cpu().numpy().astype(bool)
+        )
         z_abs_true = z0[:, None, :] + dz_true
         corrected_mask = z_target_mask & stage_available
         raw_mask = z_target_mask & raw_available & z0_mask[:, None, :]
@@ -483,14 +502,14 @@ def evaluate_station_aware(
         row for row in station_rows if int(row["IS_OUTLET_STATION"]) == 1
     ]
     summary = {
-        "model": "hydrologic_lstm_gnn_fc",
+        "model": "hydrologic_lstm_graph_gate",
         "supervised_forecast_target": "Q_ONLY",
         "stage_prediction_method": (
-            "Q-derived TRAIN-only station linear rating + final-history-bin Z residual correction"
+            "Q-derived TRAIN-only station linear rating anchored at the latest valid Q/Z origin"
         ),
         "history_anchor_semantics": (
-            "Q0/Z0 are retained observations in the final history hourly bin; "
-            "not guaranteed exact end-of-bin instantaneous values"
+            "Q0 is the latest valid Q observation in the history window; Z0 is "
+            "taken from that same hourly bin when observed"
         ),
         "future_z_observation_used": False,
         "checkpoint": str(Path(checkpoint).expanduser().resolve()),

@@ -11,8 +11,8 @@ from trainers.hydrologic_trainer import HydrologicTrainer
 
 def main() -> None:
     root = Path(__file__).resolve().parent
-    parser = argparse.ArgumentParser(description="Hunan LSTM-GNN-FC training")
-    parser.add_argument("--config", default=str(root / "configs/e4_water_balance_lstm_kinematic_wave_gnn.yaml"))
+    parser = argparse.ArgumentParser(description="Hunan LSTM-graph-routing-gate training")
+    parser.add_argument("--config", default=str(root / "configs/e4_water_balance_lstm_muskingum_gnn.yaml"))
     parser.add_argument("--dataset-root")
     parser.add_argument("--graph-id")
     parser.add_argument("--resume")

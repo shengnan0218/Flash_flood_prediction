@@ -109,8 +109,6 @@ def _forecast_skill(
         q_pred = output["q"].detach().float().cpu().numpy()
         q_true = batch.q_target.detach().float().cpu().numpy()
         q_mask = batch.q_target_mask.detach().cpu().numpy().astype(bool)
-        q_history = batch.q_history.detach().float().cpu().numpy()
-        q_history_mask = batch.q_mask.detach().cpu().numpy().astype(bool)
         batch_size, horizon, obs_count = q_pred.shape
         if q_true.shape != q_pred.shape or q_mask.shape != q_pred.shape:
             raise ValueError("hydrologic evaluation Q prediction/target/mask shape不一致")
@@ -124,8 +122,14 @@ def _forecast_skill(
         if len(stations) != obs_count:
             raise ValueError("hydrologic evaluation station count与Q tensor不一致")
         origin_hours = [_unix_hour(value) for value in forecast_times]
-        q0 = q_history[:, -1]
-        q0_mask = q_history_mask[:, -1]
+        # Use exactly the origin observation selected by the model (the latest
+        # valid Q in the history window), rather than assuming the final bin is
+        # observed.  This keeps forecast skill and the output gate comparable.
+        q0 = output["q0_analysis"].detach().float().cpu().numpy()
+        q0_mask = (
+            output["diagnostics"]["q_origin_observed_available"]
+            .detach().cpu().numpy().astype(bool)
+        )
         for b, h, o in np.argwhere(q_mask):
             observed_q0 = float(q0[b, o]) if q0_mask[b, o] else float("nan")
             true = float(q_true[b, h, o])
@@ -359,7 +363,7 @@ def evaluate_forecast(
         split=split,
     )
     summary = payload["summary"]
-    summary["model"] = "hydrologic_lstm_gnn_fc"
+    summary["model"] = "hydrologic_lstm_graph_gate"
     summary["history_design"] = {
         "rainfall_physical_warmup_hours": 72,
         "q0_anchor_history_hours": 24,

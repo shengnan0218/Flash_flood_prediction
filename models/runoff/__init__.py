@@ -1,3 +1,6 @@
-from .water_balance_continuous import ContinuousTimeWaterBalanceLSTM
+from .water_balance_continuous import (
+    ContinuousTimeWaterBalanceLSTM,
+    MassConservingRunoffLSTM,
+)
 
-__all__ = ["ContinuousTimeWaterBalanceLSTM"]
+__all__ = ["MassConservingRunoffLSTM", "ContinuousTimeWaterBalanceLSTM"]

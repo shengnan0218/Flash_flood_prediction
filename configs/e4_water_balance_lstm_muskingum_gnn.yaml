@@ -1,0 +1,7 @@
+_base_: base.yaml
+runoff_mode: water_balance_lstm
+routing_mode: muskingum_gnn
+training:
+  checkpoint: outputs/e4_water_balance_lstm_muskingum_gnn_best.pt
+  final_checkpoint: outputs/e4_water_balance_lstm_muskingum_gnn_final.pt
+  log_csv: outputs/e4_water_balance_lstm_muskingum_gnn_train.csv

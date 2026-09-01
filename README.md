@@ -1,16 +1,22 @@
 # Flash Flood Prediction
 
-面向湖南中小流域的 1–6 h 山洪流量预测项目。模型以计算单元降雨、节点静态属性和河网拓扑为输入，采用统一的：
+湖南中小流域 1–6 h 流量预报。项目使用同一份事件数据，比较普通与物理约束的产流、河网汇流模块。
 
 ```text
-产流 LSTM → 河网 GNN → 全连接输出层 → 未来 6 h 流量 Q
+72 h rainfall + node static
+            ↓
+       runoff LSTM
+            ↓
+      directed graph routing
+            ↓
+ Q0-anchored route reliability gate
+            ↓
+          Q(t+1…t+6)
 ```
 
-项目提供普通与物理约束产流、汇流模块的四组严格对照实验。
+Q0 只在最后一层作为观测锚点；不会修改 LSTM 隐状态、坡面蓄水或河道蓄水。
 
-## 1. 环境安装
-
-推荐使用 Python 3.11 和独立 Conda 环境：
+## Installation
 
 ```bash
 conda create -n flashflood python=3.11 -y
@@ -18,273 +24,152 @@ conda activate flashflood
 pip install -r requirements.txt
 ```
 
-主要依赖为 PyTorch 2.2+、NumPy、Pandas、PyYAML 和 pytest。GPU 训练时应安装与服务器 CUDA 版本匹配的 PyTorch。
+GPU 训练需要安装与服务器 CUDA 对应的 PyTorch。
 
-## 2. 数据目录
+## Data contract
 
-默认数据集目录为：
+默认数据集目录：
 
 ```text
 _model_dataset_v11_72h_event_balanced/
-├── metadata/
-│   └── dataset_contract.json
-├── graph/
-│   └── station_observation_mapping.csv
-├── samples/
-│   └── sample_index.csv
-└── tensors/
-    └── *.npz
+├── metadata/dataset_contract.json
+├── graph/station_observation_mapping.csv
+├── samples/sample_index.csv
+└── tensors/*.npz
 ```
 
-数据固定为：
+- 历史降雨：72 h；未来降雨：6 h；
+- Q/Z 观测历史：24 h；预测目标：未来 1–6 h Q；
+- 节点静态属性：10 项；边属性：河段长度、河段坡降；
+- TRAIN、VALIDATION、TEST 为既定事件划分；所有统计量只拟合于 TRAIN；
+- `observed_hindcast` 表示未来降雨使用观测雨量，因而评估的是产流—汇流结构的理想上限。
 
-- 降雨历史 72 h；
-- Q/Z 观测历史 24 h；
-- 未来降雨与预测目标 6 h；
-- 10 个节点静态属性；
-- 2 个边静态属性：河段长度和河段坡降；
-- TRAIN、VALIDATION、TEST 按事件划分。
-
-默认路径写在 `configs/base.yaml`。数据位于其他位置时，通过 `--dataset-root` 指定，无需修改配置：
+其他数据目录可用 `--dataset-root` 指定：
 
 ```bash
 python train_hunan.py \
-  --config configs/e4_water_balance_lstm_kinematic_wave_gnn.yaml \
+  --config configs/e4_water_balance_lstm_muskingum_gnn.yaml \
   --dataset-root /path/to/_model_dataset_v11_72h_event_balanced
 ```
 
-## 3. 模型组成
+## Model components
 
-### 3.1 产流模块
+### Runoff LSTM
 
-- `pure_lstm`：普通 LSTM 根据标准化降雨和节点静态属性预测单位面积径流深，再按节点增量面积换算为 m³/s；
-- `water_balance_lstm`：水量平衡 LSTM，将降雨划分到快、慢两个蓄水库，并通过连续时间退水率产生侧向流量。
+- `pure_lstm`：以标准化的 `log1p(rain)` 和静态属性预测单位面积径流深，再按增量面积换算为 m³/s。
+- `water_balance_lstm`：快、慢蓄水库均以 mm 表示；其控制量显式使用当前降雨、快慢蓄水和静态属性。每时步满足：
 
-72 h 历史降雨和未来 6 h 降雨连续输入产流模块，历史时段用于暖启动产流状态。
+\[
+P_t + S_{t-1} = Q_{lat,t} + L_t + S_t
+\]
 
-### 3.2 汇流模块
+其中 (L_t) 是有界的未观测损失/深层补给通量，不会把全部降雨强制转化为出口径流。
 
-- `pure_gnn`：按有向河网拓扑进行非物理消息传递；
-- `kinematic_wave_gnn`：采用可学习河宽和曼宁系数的隐式运动波求解器进行河道汇流。
+### Graph routing
 
-运动波模块使用原始河段长度和坡降求解物理方程，并使用标准化节点/边属性估计有效河宽和曼宁系数。普通 GNN 同样使用标准化静态属性，并根据 `log1p(Q)` 学习相对于上游流量的传递量。运动波模块逐时维持河道蓄量和质量平衡诊断。
+- `pure_gnn`：无物理约束的有向图消息传递对照。
+- `muskingum_gnn`：在河网拓扑上逐河段执行可微 Muskingum 路由。每条河段只有一个有效 travel-time 参数，它由河段长度、坡降和节点静态属性区域化，并且只允许相对物理先验作有界修正。
 
-### 3.3 全连接输出层
+该物理路由不学习河宽、河深或 Manning 糙率；它们无法由现有流量监督可靠反演。路由模块提供 travel-time 与逐时质量守恒诊断。
 
-输出层以路由流量变化为基础。当预报起点 Q0 有观测时，基准预测为：
+### Output gate
 
-```text
-Qbase(t) = Q0 + Qroute(t) - Qroute(0)
-```
+对有 Q0 观测的样本，最终输出为：
 
-小型 MLP 根据路由结果、最近有效 Q、观测时距、1 h/3 h 流量变化、站点流量尺度、预报时效和出口静态属性给出有界修正，最终输出非负 Q。预报起点 Q 缺失时使用 24 h 窗口内最近有效观测，并显式输入距预报起点的小时数。Q 观测不用于修改 LSTM 隐状态或河道蓄量。
+\[
+\hat Q_{t+h}=\max\left(0,Q_0+g_{t+h}(Q_{route,t+h}-Q_{route,t})\right),\quad g\in[0,1]
+\]
 
-水位 Z 不作为训练目标，由 TRAIN 数据拟合的固定站点线性 rating curve 从预测 Q 推导，用于评价与结果输出。
+小型 MLP 仅预测 (g)，没有自由加性残差。因此它只能在 persistence 与完整路由增量之间调节可信度，不能绕过产流—汇流主干重新生成流量。Q0 缺失时回退为路由流量。
 
-## 4. 四组实验
+Z 由 TRAIN-only 线性 rating curve 从 Q 派生，只用于报告。
 
-| 实验 | 产流模块 | 汇流模块 | 配置文件 |
+## Four experiments
+
+| Experiment | Runoff | Routing | Config |
 |---|---|---|---|
-| E1 | 普通 LSTM | 普通 GNN | `configs/e1_pure_lstm_pure_gnn.yaml` |
-| E2 | 水量平衡 LSTM | 普通 GNN | `configs/e2_water_balance_lstm_pure_gnn.yaml` |
-| E3 | 普通 LSTM | 运动波 GNN | `configs/e3_pure_lstm_kinematic_wave_gnn.yaml` |
-| E4 | 水量平衡 LSTM | 运动波 GNN | `configs/e4_water_balance_lstm_kinematic_wave_gnn.yaml` |
+| E1 | Pure LSTM | Pure graph GNN | `configs/e1_pure_lstm_pure_gnn.yaml` |
+| E2 | Mass-conserving LSTM | Pure graph GNN | `configs/e2_water_balance_lstm_pure_gnn.yaml` |
+| E3 | Pure LSTM | Muskingum graph routing | `configs/e3_pure_lstm_muskingum_gnn.yaml` |
+| E4 | Mass-conserving LSTM | Muskingum graph routing | `configs/e4_water_balance_lstm_muskingum_gnn.yaml` |
 
-四组实验共享数据、静态属性、输出层、损失、采样、优化器和评价流程，只改变 `runoff_mode` 与 `routing_mode`。
+四组共享数据、采样、损失、优化器、Q0 门控和训练预算；只改变产流和汇流模块是否采用物理约束。
 
-## 5. 训练
+## Training
 
-默认运行 E4：
-
-```bash
-python train_hunan.py
-```
-
-运行指定实验：
+默认训练 E4：
 
 ```bash
-python train_hunan.py --config configs/e1_pure_lstm_pure_gnn.yaml
-python train_hunan.py --config configs/e2_water_balance_lstm_pure_gnn.yaml
-python train_hunan.py --config configs/e3_pure_lstm_kinematic_wave_gnn.yaml
-python train_hunan.py --config configs/e4_water_balance_lstm_kinematic_wave_gnn.yaml
+python train_hunan.py --overwrite
 ```
 
-只训练一个指定河网：
+显式运行四组：
 
 ```bash
-python train_hunan.py \
-  --config configs/e4_water_balance_lstm_kinematic_wave_gnn.yaml \
-  --graph-id B001
+python train_hunan.py --config configs/e1_pure_lstm_pure_gnn.yaml --overwrite
+python train_hunan.py --config configs/e2_water_balance_lstm_pure_gnn.yaml --overwrite
+python train_hunan.py --config configs/e3_pure_lstm_muskingum_gnn.yaml --overwrite
+python train_hunan.py --config configs/e4_water_balance_lstm_muskingum_gnn.yaml --overwrite
 ```
 
-默认训练设置：
+训练预算固定为 30 epochs。checkpoint 不按 `val_loss` 选择，而按 VALIDATION 的 **station-macro median persistence skill** 选择；日志同时报告：
 
-- 100 epochs，不启用 early stopping；
-- AdamW，学习率 `1e-3`，weight decay `1e-5`；
-- batch size 16；
-- TRAIN 使用事件均衡、LOW/RISING/PEAK/RECESSION 阶段分层采样；
-- checkpoint 按 VALIDATION loss 最小值选择；
-- loss 为 Q point loss、TRAIN-only 高流量加权 loss 和 6 h volume loss。
+- 总体 Q NSE/KGE；
+- Q0 有效子集的 persistence skill 与 ΔQ NSE；
+- station-macro mean/median skill、优于 persistence 的站点比例；
+- 1–6 h 每个提前量的 persistence skill。
 
-每组实验会生成三个 checkpoint 和一个训练日志。例如 E4：
+旧 checkpoint 与本版本不兼容，必须从零训练。`--resume` 仅适用于同一版本、同一数据合同的 `*.last.pt`。
 
-```text
-outputs/e4_water_balance_lstm_kinematic_wave_gnn_best.pt
-outputs/e4_water_balance_lstm_kinematic_wave_gnn_best.last.pt
-outputs/e4_water_balance_lstm_kinematic_wave_gnn_final.pt
-outputs/e4_water_balance_lstm_kinematic_wave_gnn_train.csv
-```
+## Evaluation
 
-- `*_best.pt`：VALIDATION loss 最优模型；
-- `*.last.pt`：最新 epoch 的完整状态，用于续训；
-- `*_final.pt`：第 100 epoch 模型；
-- `*_train.csv`：逐 epoch 训练与验证指标。
-
-已有同名输出时程序默认拒绝覆盖。重新开始并覆盖旧输出：
-
-```bash
-python train_hunan.py \
-  --config configs/e4_water_balance_lstm_kinematic_wave_gnn.yaml \
-  --overwrite
-```
-
-从最新完整状态续训：
-
-```bash
-python train_hunan.py \
-  --config configs/e4_water_balance_lstm_kinematic_wave_gnn.yaml \
-  --resume outputs/e4_water_balance_lstm_kinematic_wave_gnn_best.last.pt
-```
-
-`--resume` 与 `--overwrite` 不能同时使用。
-
-## 6. 评价
-
-TEST 评价：
+先只在 VALIDATION 选模型：
 
 ```bash
 python evaluate.py \
-  --config configs/e4_water_balance_lstm_kinematic_wave_gnn.yaml \
-  --checkpoint outputs/e4_water_balance_lstm_kinematic_wave_gnn_best.pt \
-  --split TEST
-```
-
-VALIDATION 评价：
-
-```bash
-python evaluate.py \
-  --config configs/e4_water_balance_lstm_kinematic_wave_gnn.yaml \
-  --checkpoint outputs/e4_water_balance_lstm_kinematic_wave_gnn_best.pt \
+  --config configs/e4_water_balance_lstm_muskingum_gnn.yaml \
+  --checkpoint outputs/e4_water_balance_lstm_muskingum_gnn_best.pt \
   --split VALIDATION
 ```
 
-指定评价目录和顶层 JSON：
-
-```bash
-python evaluate.py \
-  --config configs/e4_water_balance_lstm_kinematic_wave_gnn.yaml \
-  --checkpoint outputs/e4_water_balance_lstm_kinematic_wave_gnn_best.pt \
-  --split TEST \
-  --output-dir outputs/e4_test_evaluation \
-  --output outputs/e4_test_result.json
-```
-
-评价结果包括：
-
-- 总体、站点和河网 Q 指标；
-- station/event 级指标；
-- 1–6 h lead-time 指标；
-- persistence 与 Delta-Q 对照；
-- 固定提前量事件洪峰、洪峰时刻和事件 NSE；
-- rating curve 推导水位及其覆盖率、外推范围审计。
-
-未指定 `--output-dir` 时，结果写入 checkpoint 同目录下的：
-
-```text
-<checkpoint_name>_<split>_evaluation/
-```
-
-### Q0—物理路由—最终输出三分解
-
-当需要判断误差来自物理产流/汇流主干还是最终 FC 输出层时，使用只读三分解评价。它不训练、不修改 checkpoint，也不写入数据集；三种预测严格在“Q0 与未来 Q target 均有效”的同一子集上比较：
-
-- `persistence`：Q0 在 1–6 h 内保持不变；
-- `routed_base`：`relu(Q0 + Qroute(t+h) - Qroute(t0))`，即关闭 FC 修正后的物理主干；
-- `final`：当前模型最终 Q 输出。
-
-例如评价一个中断训练后保存的最新 E4 checkpoint：
+使用三分解定位问题：
 
 ```bash
 python evaluate_decomposition.py \
-  --config configs/e4_water_balance_lstm_kinematic_wave_gnn.yaml \
-  --checkpoint outputs/e4_water_balance_lstm_kinematic_wave_gnn_best.last.pt \
+  --config configs/e4_water_balance_lstm_muskingum_gnn.yaml \
+  --checkpoint outputs/e4_water_balance_lstm_muskingum_gnn_best.pt \
   --split VALIDATION \
   --output-dir outputs/e4_validation_decomposition
 ```
 
-输出包括总体 JSON、分提前量 CSV 与分站点 CSV，均报告 Q NSE/RMSE/bias、相对 persistence skill 与 Delta-Q NSE。若 `routed_base` 已输给 persistence，则问题在产流—汇流主干；若 `routed_base` 较好而 `final` 变差，则问题在 FC 输出头。
+三分解固定在同一 Q0 有效子集上比较：
 
-## 7. 测试
+1. `persistence`：Q0 保持不变；
+2. `full_route`：完整应用物理路由产生的 ΔQ；
+3. `gated_route`：应用模型学习到的门控 ΔQ，即最终输出。
 
-运行全部测试：
+只有冻结 VALIDATION 最优实验后，才运行一次 TEST：
+
+```bash
+python evaluate.py \
+  --config configs/e4_water_balance_lstm_muskingum_gnn.yaml \
+  --checkpoint outputs/e4_water_balance_lstm_muskingum_gnn_best.pt \
+  --split TEST
+```
+
+## Pre-flight tests
 
 ```bash
 pytest -q
+pytest -q tests/test_hydrologic_model.py tests/test_output_decomposition.py
 ```
 
-只验证当前四组模型：
+模型测试覆盖：四组前向/反向、守恒产流的逐时水量闭合、零雨零产流、travel-time 随河长变化、Muskingum 连续性残差、Q0 门控和未来 Z 不泄漏。
 
-```bash
-pytest -q tests/test_hydrologic_model.py
-```
+## Normalization
 
-该测试覆盖四组模型的前向与反向传播、输出形状与有限性、Q0 输出锚定，以及未来 Z target 不进入预测过程。
-
-## 8. 项目结构
-
-```text
-configs/                         四组实验及共享配置
-data/                            batch 数据结构、设备和拓扑工具
-datasets/                        数据集读取、校验和事件均衡 sampler
-models/hydrologic_model.py       统一 LSTM–GNN–FC 模型
-models/runoff/                   普通/水量平衡产流实现
-models/routing/                  普通 GNN 与运动波 GNN
-losses/hydrologic_loss.py        Q-only 训练目标
-trainers/                        训练循环、checkpoint 和评价聚合
-metrics/                         站点、事件、时效及洪峰指标
-scripts/training.py              配置、数据、模型的统一装配入口
-scripts/rating.py                TRAIN-only 站点 rating curve 拟合
-train_hunan.py                   训练入口
-evaluate.py                      VALIDATION/TEST 评价入口
-tests/                           数据、物理模块和模型测试
-outputs/                         checkpoint、日志和评价结果
-```
-
-## 9. 主要配置项
-
-共享参数位于 `configs/base.yaml`，四组实验配置通过 `_base_` 继承。常用参数包括：
-
-| 配置项 | 含义 |
-|---|---|
-| `runoff_mode` | `pure_lstm` 或 `water_balance_lstm` |
-| `routing_mode` | `pure_gnn` 或 `kinematic_wave_gnn` |
-| `hidden_dim` | LSTM/GNN 隐藏维度 |
-| `input_preprocessing` | 降雨变换、静态属性裁剪和 Q 历史时距 |
-| `batch_size` | 同一 graph mini-batch 大小 |
-| `data.dataset_root` | 模型数据集目录 |
-| `data.future_rainfall_mode` | `observed_hindcast`、`zero` 或 `persistence` |
-| `physical_bounds` | 河宽与曼宁系数范围 |
-| `solver` | 运动波时间步、空间步长和隐式迭代设置 |
-| `loss` | Q 点、高流量和体积损失权重 |
-| `training` | epoch、输出路径和梯度裁剪 |
-
-修改实验参数时，应同时修改 `training.checkpoint`、`training.final_checkpoint` 和 `training.log_csv`，保证不同实验输出互不覆盖。
-
-### 输入标准化
-
-- 降雨：先执行 `log1p`，再使用 TRAIN 样本计算的均值和标准差进行标准化；
-- 节点静态属性：使用 TRAIN-only 均值和标准差标准化，并裁剪到 `[-5, 5]`；
-- GNN 神经网络边特征：使用 TRAIN-only 均值和标准差标准化，并裁剪到 `[-5, 5]`；
-- 运动波方程中的河段长度和坡降：保留原始物理量，不使用标准化值；
-- Q loss 与输出层：使用 TRAIN-only、per-station Q 均值和尺度；
-- 所有 normalization、洪水阈值和 rating curve 均只从 TRAIN 生成，评价阶段重新读取 TRAIN 作为统计参考，不使用 VALIDATION/TEST 拟合。
+- 降雨：`log1p` 后使用 TRAIN 均值/标准差；
+- 节点及神经网络边属性：TRAIN-only 标准化后裁剪至 `[-5, 5]`；
+- Muskingum 先验：原始河段长度和坡降，不使用标准化量；
+- Q loss、Q0 门控：TRAIN-only per-station Q 均值与尺度；
+- 高流量阈值、rating curve：仅由 TRAIN 拟合。

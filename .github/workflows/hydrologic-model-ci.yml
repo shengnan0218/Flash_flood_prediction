@@ -26,6 +26,7 @@ jobs:
           datasets/hydrologic_graph.py
           models/hydrologic_model.py
           models/runoff/water_balance_continuous.py
+          models/routing/muskingum.py
           models/routing/kinematic_wave.py
           models/routing/kinematic_wave_optimized.py
           losses/hydrologic_loss.py

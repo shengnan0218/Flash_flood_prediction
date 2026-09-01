@@ -102,11 +102,11 @@ def _fit_log_rain(dataset: HydrologicGraphDataset) -> dict[str, float | int]:
 
 def runtime_config(config_path: str | Path, *, dataset_root=None, graph_id=None):
     cfg = load_yaml(config_path)
-    if cfg.get("model") != "hydrologic_lstm_gnn_fc":
-        raise ValueError("only model=hydrologic_lstm_gnn_fc is supported")
+    if cfg.get("model") != "hydrologic_lstm_graph_gate":
+        raise ValueError("only model=hydrologic_lstm_graph_gate is supported")
     if cfg.get("runoff_mode") not in {"pure_lstm", "water_balance_lstm"}:
         raise ValueError("invalid runoff_mode")
-    if cfg.get("routing_mode") not in {"pure_gnn", "kinematic_wave_gnn"}:
+    if cfg.get("routing_mode") not in {"pure_gnn", "muskingum_gnn"}:
         raise ValueError("invalid routing_mode")
     if "state_correction" in cfg or "observation_encoder" in cfg:
         raise ValueError("state correction and observation encoders are removed")
@@ -175,7 +175,7 @@ def attach_runtime(cfg: dict[str, Any], dataset: HydrologicGraphDataset) -> None
             "station_ids": list(stations),
         },
         "supervised_target": "Q_ONLY",
-        "architecture": "runoff LSTM -> routing GNN -> residual FC",
+        "architecture": "runoff LSTM -> graph routing -> Q0 reliability gate",
         "state_correction": False,
     }
 
@@ -234,7 +234,12 @@ def validate_checkpoint(checkpoint: Mapping[str, Any], cfg: Mapping[str, Any], *
     saved = checkpoint.get("config")
     if not isinstance(saved, Mapping):
         raise ValueError("checkpoint config missing")
-    for key in ("model", "runoff_mode", "routing_mode", "history_length", "forecast_horizon", "node_static_dim", "edge_static_dim", "input_preprocessing", "output_head", "loss"):
+    for key in (
+        "model", "runoff_mode", "routing_mode", "history_length",
+        "forecast_horizon", "node_static_dim", "edge_static_dim",
+        "input_preprocessing", "water_balance", "muskingum_routing",
+        "output_head", "loss", "validation_selection",
+    ):
         if saved.get(key) != cfg.get(key):
             raise ValueError(f"checkpoint incompatible: {key}")
     if saved.get("_runtime", {}).get("data_contract", {}).get("artifact_sha256") != cfg.get("_runtime", {}).get("data_contract", {}).get("artifact_sha256"):

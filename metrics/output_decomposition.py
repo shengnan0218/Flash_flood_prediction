@@ -1,4 +1,4 @@
-"""Read-only Q0 / routed-base / final-output forecast decomposition."""
+"""Read-only persistence / full-route / gated-route Q decomposition."""
 from __future__ import annotations
 
 import json
@@ -12,11 +12,11 @@ import torch
 from metrics.flood_metrics import masked_regression_sums, regression_metrics
 
 
-METHODS = ("persistence", "routed_base", "final")
+METHODS = ("persistence", "full_route", "gated_route")
 METHOD_LABELS = {
     "persistence": "Q0 persistence",
-    "routed_base": "Q0 + routed Delta-Q (FC disabled)",
-    "final": "final Q output",
+    "full_route": "Q0 + full routed Delta-Q (gate = 1)",
+    "gated_route": "Q0 + learned gated routed Delta-Q",
 }
 
 
@@ -40,10 +40,7 @@ def _merge(destination: dict[str, float | int], source: dict[str, float | int]) 
 
 
 def _new_group() -> dict[str, dict[str, dict[str, float | int]]]:
-    return {
-        method: {"q": _empty_sums(), "delta_q": _empty_sums()}
-        for method in METHODS
-    }
+    return {method: {"q": _empty_sums(), "delta_q": _empty_sums()} for method in METHODS}
 
 
 def _update_group(
@@ -62,17 +59,14 @@ def _update_group(
 
 
 def _skill(sums: dict[str, float | int], persistence: dict[str, float | int]) -> float:
-    count = int(sums["count"])
-    model_sse = float(sums["squared_error"])
-    persistence_sse = float(persistence["squared_error"])
-    if count == 0 or persistence_sse <= 0.0:
+    baseline_sse = float(persistence["squared_error"])
+    if int(sums["count"]) == 0 or baseline_sse <= 0.0:
         return float("nan")
-    return 1.0 - model_sse / persistence_sse
+    return 1.0 - float(sums["squared_error"]) / baseline_sse
 
 
 def _report(
-    method: str,
-    group: dict[str, dict[str, dict[str, float | int]]],
+    method: str, group: dict[str, dict[str, dict[str, float | int]]]
 ) -> dict[str, float | int | str]:
     q = regression_metrics(group[method]["q"])
     delta = regression_metrics(group[method]["delta_q"])
@@ -85,9 +79,7 @@ def _report(
         "Q_BIAS": float(q["bias"]),
         "Q_NSE": float(q["nse"]),
         "Q_KGE": float(q["kge"]),
-        "SKILL_OVER_PERSISTENCE": _skill(
-            group[method]["q"], group["persistence"]["q"]
-        ),
+        "SKILL_OVER_PERSISTENCE": _skill(group[method]["q"], group["persistence"]["q"]),
         "DELTA_Q_RMSE": float(delta["rmse"]),
         "DELTA_Q_NSE": float(delta["nse"]),
     }
@@ -112,12 +104,8 @@ def evaluate_output_decomposition(
     split: str,
     checkpoint: str | Path,
 ) -> dict[str, Any]:
-    """Evaluate persistence, routed base and final Q on one Q0-valid subset.
+    """Evaluate Q0 persistence, full physical route, and learned route gate."""
 
-    ``routed_base`` is exactly the output head's Q0-anchored physical base with
-    the final non-negative clamp retained and the FC correction disabled.  The
-    three methods therefore differ only in the information they add after Q0.
-    """
     model = trainer.model
     device = trainer.device
     model.eval()
@@ -129,23 +117,22 @@ def evaluate_output_decomposition(
         batch = batch.to(device)
         output = model(batch)
         diagnostics = output.get("diagnostics", {})
-        base = diagnostics.get("q_residual_base_m3s")
-        if not isinstance(base, torch.Tensor):
+        route_delta = diagnostics.get("q_route_delta_m3s")
+        q0_available = diagnostics.get("q_origin_observed_available")
+        q0 = output.get("q0_analysis")
+        if not all(isinstance(value, torch.Tensor) for value in (route_delta, q0_available, q0)):
             raise KeyError(
-                "三分解评价需要diagnostics['q_residual_base_m3s']"
+                "三分解评价需要q_route_delta_m3s、q_origin_observed_available和q0_analysis"
             )
-        if base.shape != output["q"].shape:
-            raise ValueError("q_residual_base_m3s与最终Q预测形状不一致")
-
+        if route_delta.shape != output["q"].shape or q0.shape != output["q"].shape[:1] + output["q"].shape[2:]:
+            raise ValueError("route-delta/Q0/最终Q形状不一致")
         target = batch.q_target
-        q0 = batch.q_history[:, -1]
-        q0_mask = batch.q_mask[:, -1].bool()
-        valid = batch.q_target_mask.bool() & q0_mask.unsqueeze(1)
+        valid = batch.q_target_mask.bool() & q0_available.bool().unsqueeze(1)
         q0_expanded = q0.unsqueeze(1).expand_as(target)
         predictions = {
             "persistence": q0_expanded,
-            "routed_base": torch.relu(base),
-            "final": output["q"],
+            "full_route": torch.relu(q0_expanded + route_delta),
+            "gated_route": output["q"],
         }
         _update_group(overall, predictions, target, q0_expanded, valid)
 
@@ -166,9 +153,6 @@ def evaluate_output_decomposition(
         for index, station_id in enumerate(station_ids):
             group = by_station.setdefault(station_id, _new_group())
             station_target = target[:, :, index]
-            # Keep the batch axis explicit.  A bare ``q0[:, index]`` has
-            # shape [batch] and is incorrectly aligned against the forecast
-            # axis when ``batch != horizon``.
             station_q0 = q0[:, index].unsqueeze(1).expand_as(station_target)
             _update_group(
                 group,
@@ -180,7 +164,6 @@ def evaluate_output_decomposition(
 
     if not int(overall["persistence"]["q"]["count"]):
         raise ValueError("三分解评价没有Q0和Q target同时有效的样本")
-
     summary_methods = {method: _report(method, overall) for method in METHODS}
     lead_rows = [
         {"LEAD_HOUR": lead, **_report(method, group)}
@@ -192,7 +175,6 @@ def evaluate_output_decomposition(
         for station, group in sorted(by_station.items())
         for method in METHODS
     ]
-
     output_dir = Path(output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     split_name = str(split).lower()
@@ -204,12 +186,12 @@ def evaluate_output_decomposition(
     summary = {
         "split": str(split).upper(),
         "checkpoint": str(Path(checkpoint).expanduser().resolve()),
-        "q0_subset_definition": "Q target valid and final-history-bin Q0 observed",
+        "q0_subset_definition": "Q target valid and a Q history observation exists within the 24 h history",
         "methods": summary_methods,
         "interpretation": {
-            "persistence": "Q0 held unchanged through all forecast leads",
-            "routed_base": "relu(Q0 + routed_Q(t+h) - routed_Q(t0)); FC correction disabled",
-            "final": "current model output after the bounded FC correction",
+            "persistence": "hold latest observed Q0 through all forecast leads",
+            "full_route": "apply 100% of the routed Delta-Q after Q0",
+            "gated_route": "apply only the learned [0,1] fraction of routed Delta-Q",
         },
         "files": {
             "by_lead": str(lead_path),
@@ -218,8 +200,5 @@ def evaluate_output_decomposition(
         },
     }
     safe_summary = _json_safe(summary)
-    summary_path.write_text(
-        json.dumps(safe_summary, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    summary_path.write_text(json.dumps(safe_summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return safe_summary

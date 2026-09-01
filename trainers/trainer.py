@@ -367,7 +367,7 @@ class Trainer:
                     batch_count += 1
                     batch_times.append(time.perf_counter() - tick)
                     diagnostic = out.get("diagnostics", {}).get(
-                        "explicit_equivalent_substeps"
+                        "routing_explicit_equivalent_substeps"
                     )
                     if isinstance(diagnostic, torch.Tensor) and diagnostic.numel():
                         explicit_equivalent_substeps.append(
@@ -393,17 +393,13 @@ class Trainer:
             q_valid_count=q_valid_total,
             z_valid_count=z_valid_total,
         )
-        result.update(
-            {
-                "batch_seconds": sum(batch_times) / len(batch_times),
-                "wave_mean_explicit_equivalent_substeps": (
-                    sum(explicit_equivalent_substeps)
-                    / len(explicit_equivalent_substeps)
-                    if explicit_equivalent_substeps
-                    else float("nan")
-                ),
-            }
-        )
+        result["batch_seconds"] = sum(batch_times) / len(batch_times)
+        # Muskingum and pure-GNN routes have no explicit CFL substeps. Omit the
+        # field in those modes instead of emitting a misleading NaN.
+        if explicit_equivalent_substeps:
+            result["routing_mean_explicit_equivalent_substeps"] = (
+                sum(explicit_equivalent_substeps) / len(explicit_equivalent_substeps)
+            )
         return result
 
     @torch.no_grad()
@@ -923,7 +919,7 @@ class Trainer:
                 f"saved={saved_direction}, current={self.selection_direction}"
             )
         default_best = (
-            float("-inf") if self.selection_mode == "composite" else float("inf")
+            float("-inf") if self.selection_direction == "maximize" else float("inf")
         )
         fallback_best = self.last_metrics.get(
             self.selection_metric_name,
