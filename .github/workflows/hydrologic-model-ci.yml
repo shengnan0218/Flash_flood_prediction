@@ -33,5 +33,6 @@ jobs:
           trainers/hydrologic_trainer.py
           train_hunan.py
           evaluate.py
+          evaluate_decomposition.py
       - name: Run tests
         run: pytest -q
