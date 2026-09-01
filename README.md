@@ -204,6 +204,26 @@ python evaluate.py \
 <checkpoint_name>_<split>_evaluation/
 ```
 
+### Q0—物理路由—最终输出三分解
+
+当需要判断误差来自物理产流/汇流主干还是最终 FC 输出层时，使用只读三分解评价。它不训练、不修改 checkpoint，也不写入数据集；三种预测严格在“Q0 与未来 Q target 均有效”的同一子集上比较：
+
+- `persistence`：Q0 在 1–6 h 内保持不变；
+- `routed_base`：`relu(Q0 + Qroute(t+h) - Qroute(t0))`，即关闭 FC 修正后的物理主干；
+- `final`：当前模型最终 Q 输出。
+
+例如评价一个中断训练后保存的最新 E4 checkpoint：
+
+```bash
+python evaluate_decomposition.py \
+  --config configs/e4_water_balance_lstm_kinematic_wave_gnn.yaml \
+  --checkpoint outputs/e4_water_balance_lstm_kinematic_wave_gnn_best.last.pt \
+  --split VALIDATION \
+  --output-dir outputs/e4_validation_decomposition
+```
+
+输出包括总体 JSON、分提前量 CSV 与分站点 CSV，均报告 Q NSE/RMSE/bias、相对 persistence skill 与 Delta-Q NSE。若 `routed_base` 已输给 persistence，则问题在产流—汇流主干；若 `routed_base` 较好而 `final` 变差，则问题在 FC 输出头。
+
 ## 7. 测试
 
 运行全部测试：
